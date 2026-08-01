@@ -1,12 +1,6 @@
-# Octoglow
+![banner](/.github/banner.png)
 
-
-![onyourmarks](.github/d2.png)
-
-
-A compact, battery-powered smart desk clock that connects to Wi-Fi, syncs time automatically, and displays time, date, temperature, and atmospheric pressure  all in a custom 3D-printed case.
-
-Octoglow runs on an ESP32 and exposes all of its settings through a **web dashboard** 
+A compact smart desk clock firmware that connects to Wi-Fi, syncs time automatically, and displays time, date, temperature, and atmospheric pressure  all in one firmware
 
 ---
 
@@ -26,26 +20,93 @@ Octoglow runs on an ESP32 and exposes all of its settings through a **web dashbo
 
 ###  Tiles (display slots)
 
-Octoglow displays information in "tiles" that rotate one after another, each with its own display duration, all configurable from the dashboard (you can enable/disable each tile and reorder them via drag & drop):
+Octoglow displays information in "tiles" that rotate one after another, each with its own display duration, all configurable from the dashboard (you can enable/disable each tile and reorder them via drag & drop), Here is a list with all tiles:
 
-| Tile | Description |
-|---|---|
-| **Clock** | 12h/24h format, configurable |
-| **Date** | Multiple date formats available |
-| **Temperature** | Read from the BMP280 sensor, in °C or °F |
-| **Atmospheric Pressure** | Read from the BMP280 sensor (hPa) |
-| **Now Playing** | Shows the song currently playing on your PC (artist + title) |
-| **Weather** | Current weather for a city searched from the dashboard, with multi-language support |
-| **Currency Standards** | Live exchange rates |
-| **Memento** | A short, custom text entered manually from the dashboard (e.g. reminders) |
-| **Canvas** | Static 8×32 pixel drawing, hand-drawn on an interactive grid in the dashboard |
-| **Screen Saver** | Pixel-art animations for idle moments: Random, Pong, Fireworks, Equalizer |
-| **PC Notifications** | Windows notifications, sent live from your computer (see section below) |
-| **Stopwatch** | Started/stopped from the dashboard |
+1. Clock 
 
-All text-based tiles have an individually configurable scroll style  **Bounce** (back-and-forth) or **Wrap** (continuous scroll), with or without a visible icon.
+This tile shows the current time, synced automatically once the clock connects to the internet, so you never have to set it by hand.
 
-Some tiles (Notifications, ETS2, Stopwatch) can be set as **priority tiles**  they interrupt the normal rotation and appear immediately whenever they have something new to show.
+![Clocktile](.github/tiles/clock.png)
+
+2. Data 
+
+This tile shows the current date, pulled from the same internet time sync as the clock, so it always stays accurate.
+
+![Datatile](.github/tiles/data.png)
+
+3. Temperature
+
+This tile shows the ambient temperature at your clock's location, as long as you have a temperature sensor connected to the i2c rails.
+
+![Temptile](.github/tiles/Temp.png)
+
+4. Weather
+
+This tile fetches live weather data for your set location once you add an OpenWeatherMap API key. It scrolls through the current temperature (in Celsius or Fahrenheit, your choice), humidity percentage, and a short text description of the conditions, along with a matching weather icon.
+
+![WeatherTile](.github/tiles/meteo.png)
+
+5. Canvas 
+
+This tile turns the whole 8x32 LED matrix into a drawing surface, letting you sketch or design your own custom pixel art directly on the display.
+
+![CanvasTile](.github/tiles/canvas.png)
+
+6. ScreenSaver 
+
+This tile plays one of three animations when idle: a self-playing Pong match between two paddles, a fireworks show with launching rockets and bursting particles, or an audio equalizer style animation with bouncing bars. You can pick a specific one or let it choose randomly each time.
+
+![screenssavertile](.github/tiles/screensaver.png)
+
+7. Currency Standards
+
+This tile shows the exchange rate for a currency you select, and optionally compares it against a second currency. It also displays a trend arrow showing whether the rate has gone up, down, or stayed flat compared to a month ago.
+
+![curencytile](.github/tiles/curency.png)
+
+8. Atmospheric Pressure
+
+This tile shows the current atmospheric pressure in hPa, as long as your clock has a barometric pressure sensor connected to the i2c rails. It also shows a trend arrow based on how the pressure has changed over recent readings.
+
+![aptile](.github/tiles/ap.png)
+
+9. Memento
+
+This tile lets you create short personal notes or reminders that scroll across the display.
+
+![Memento?Nahbro](.github/tiles/memento.png)
+
+10. Now Playing (Requires Octoglow Watch Sender)
+
+This tile displays the artist and track title of whatever you're currently listening to on your device, sent live from the companion Watch Sender app.
+
+![HmmNowPlayingGuta?](.github/tiles/music.png)
+
+11. Notifications from PC (Requires Octoglow Watch Sender)
+
+This tile shows notifications received on your computer as they come in, forwarded through the Watch Sender app and scrolled across the display.
+
+![Ugotmailtile](.github/tiles/message.png)
+
+12. Ets2 Gauge (Requires Octoglow Watch Sender)
+
+This tile shows your real-time speed in km/h while driving in Euro Truck Simulator 2, streamed live from the game through the Watch Sender app.
+
+![Ets2tile](.github/tiles/ets2.png)
+
+13. Timer
+
+This tile runs a countdown timer that you can set to a custom duration or pick from preset values, showing the remaining time and alerting you with a sound once it hits zero.
+
+![tikitikitikitile](.github/tiles/timer.png)
+
+14. Stopwatch
+
+This tile lets you time things using your clock, with start, pause, and reset controls right from the interface.
+
+![alt text](.github/tiles/crono.png)
+
+
 
 ###  Brightness & Dimming
 
