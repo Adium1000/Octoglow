@@ -1,0 +1,1 @@
+! The content inside this folder is responsable for the OTA Updates

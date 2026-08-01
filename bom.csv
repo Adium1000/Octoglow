@@ -1,0 +1,11 @@
+﻿Item;Description;Qty;Unit Price ($);Total ($);URL;Running Total ($);
+LED Matrix 4x MAX7219;4-in-1 chained MAX7219 red LED matrix module;1;$6,98;$6,98;https://sigmanortec.ro/en/led-matrix-module-4x-max7219-red;$6,98;
+ESP32-C3 SuperMini;WiFi/BT microcontroller board 3.3V;1;$6,09;$6,09;https://sigmanortec.ro/en/esp32-c3-supermini-development-board-33v-wifi-bluetooth;$13,07;
+TTP223 Touch Sensor;Capacitive touch button module;1;$0,69;$0,69;https://sigmanortec.ro/en/capacitive-button-ttp223-touch;$13,76;
+TP4056 + Boost 5-24V;Battery charger with boost converter 5-24V;1;$1,75;$1,75;https://sigmanortec.ro/modul-incarcare-baterie-cu-ridicator-5-24v-tp4056;$15,51;
+IP2312 Charger USB-C 3A;Li-Ion charger 5V→4.2V CC/CV Type-C 3A QC;1;$2,75;$2,75;https://sigmanortec.ro/modul-incarcare-litiu-5v-la-42v-ip2312-cv-cc-type-c-3a-qc;$18,26;
+Mini Switch;Small slide switch, 2 positions;1;$0,22;$0,22;https://sigmanortec.ro/en/mini-switch-2-positions;$18,48;
+18650 2500mAh x2;Samsung 25R 18650 3.7V 2500mAh - set of 2;1;$15,55;$15,55;https://sigmanortec.ro/set-2-acumulator-li-ion-25r-18650-37v-2500mah-8c;$34,03;
+BMP280 Sensor 5V;Pressure and temperature sensor 5V;1;$2,03;$2,03;https://sigmanortec.ro/en/pressure-and-temperature-sensor-bmp280-5v;$36,06;
+3D Printing;Custom 3D printed case (Printing Legion);1;$12,00;$12,00;-;$48,06;
+TOTAL;;;;$48,06;;$48,06;
