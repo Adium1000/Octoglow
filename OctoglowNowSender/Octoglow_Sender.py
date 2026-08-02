@@ -5,6 +5,15 @@ Requirements (Windows, Python 3.9+):
     pip install winrt-Windows.Media.Control winrt-Windows.UI.Notifications.Management
     pip install pystray pillow
     pip install pywinstyles
+    pip install requests
+    pip install winrt-Windows.Media.Control winrt-Windows.Foundation
+    pip install winrt-Windows.UI.Notifications.Management
+    pip install winrt-Windows.UI.Notifications
+    pip install winrt-Windows.Foundation.Collections
+    pip install winrt-Windows.ApplicationModel   # optional, for the app name
+    pip install truck-telemetry   # for ETS2  also requires the scs-sdk-plugin installed in-game
+    pip install psutil            # for detecting the eurotrucks2.exe process
+    
     (optional, for ETS2 telemetry) pip install truck-telemetry psutil
 """
 
@@ -131,7 +140,7 @@ LANG = {
         "btn_stop": "Oprește",
         "btn_minimize": "Minimizează acum",
         "section_log": "JURNAL",
-        "log_starting": "Pornire — țintă",
+        "log_starting": "Pornire - țintă",
         "log_stopped": "Oprit.",
         "tray_show": "Arată",
         "tray_exit": "Ieșire",
@@ -157,7 +166,7 @@ LANG = {
         "btn_stop": "Stop",
         "btn_minimize": "Minimize now",
         "section_log": "LOG",
-        "log_starting": "Starting — target",
+        "log_starting": "Starting - target",
         "log_stopped": "Stopped.",
         "tray_show": "Show",
         "tray_exit": "Exit",
@@ -333,7 +342,7 @@ class SenderBackend:
                     self.log("[AUTH] Incorrect username or password.")
                     return False
                 else:
-                    self.log(f"[AUTH] Unexpected response: {r.status_code} — retry {attempt}/{retries}")
+                    self.log(f"[AUTH] Unexpected response: {r.status_code} - retry {attempt}/{retries}")
             except requests.exceptions.ConnectionError:
                 self.log(f"[AUTH] Cannot connect to {self.cfg['esp32_ip']} (attempt {attempt}/{retries})")
             except requests.exceptions.Timeout:
@@ -346,7 +355,7 @@ class SenderBackend:
 
     def _ensure_session(self, r: requests.Response) -> bool:
         if r.status_code == 401:
-            self.log("[AUTH] Session expired — re-logging in...")
+            self.log("[AUTH] Session expired - re-logging in...")
             return self._login(retries=3, delay=2.0)
         return True
 
@@ -398,7 +407,7 @@ class SenderBackend:
 
     def _build_notif_text(self, app: str, title: str, body: str) -> str:
         parts = [p for p in (app, title, body) if p]
-        text = " — ".join(parts) if parts else "(notification)"
+        text = " - ".join(parts) if parts else "(notification)"
         return self._truncate(self._sanitize(text))
 
     def enqueue_notification(self, app: str, title: str, body: str):
@@ -573,7 +582,7 @@ class SenderBackend:
         try:
             import truck_telemetry
         except ImportError:
-            self.log("[ETS2] 'truck_telemetry' not installed — ETS2 disabled.")
+            self.log("[ETS2] 'truck_telemetry' not installed - ETS2 disabled.")
             return
 
         connected = False
@@ -581,7 +590,7 @@ class SenderBackend:
         while not self.stop_event.is_set():
             if not self._is_ets2_running():
                 if connected:
-                    self.log("[ETS2] eurotrucks2.exe closed — disconnected.")
+                    self.log("[ETS2] eurotrucks2.exe closed - disconnected.")
                 connected = False
                 last_speed_sent = None
                 self.stop_event.wait(2)
