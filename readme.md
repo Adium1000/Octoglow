@@ -64,7 +64,7 @@ This tile shows the current atmospheric pressure in hPa, as long as your clock h
 
 ![aptile](.github/tiles/ap.png)
 
-![mementotile](.github/tiles/meteotile.png)
+![Memento](.github/tiles/mementotile.png)
 
 This tile lets you create short personal notes or reminders that scroll across the display.
 

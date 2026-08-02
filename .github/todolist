@@ -1,0 +1,34 @@
+Update uri pentru smart clock
+Page icon
+
+___
+
+
+Fixuri
+
+#1 UAC fix, sa nu fie necesar sa ne logam de fiecare data cand moare ceasul
+2 Fix icoana de luminozitate
+3. fix language piker on touch in sender
+4. Fix number font
+
+____
+
+
+Updates
+
+Language manager
+
+Limbă intrefata : Engleză Si Romana
+
+
+Tile manager Custom Fonts
+Tile Manager: Tile transition
+
+Help Manager
+
+Ui cons fix
+
+
+Smart House integration
+
+Reset & Restore & backup functions in about
