@@ -1,3 +1,12 @@
+                                                                                
+//    ▄▄▄▄                                            ▄▄▄▄                         
+//   ██▀▀██               ██                          ▀▀██                         
+//  ██    ██   ▄█████▄  ███████    ▄████▄    ▄███▄██    ██       ▄████▄  ██      ██
+//  ██    ██  ██▀    ▀    ██      ██▀  ▀██  ██▀  ▀██    ██      ██▀  ▀██ ▀█  ██  █▀
+//  ██    ██  ██          ██      ██    ██  ██    ██    ██      ██    ██  ██▄██▄██ 
+//   ██▄▄██   ▀██▄▄▄▄█    ██▄▄▄   ▀██▄▄██▀  ▀██▄▄███    ██▄▄▄   ▀██▄▄██▀  ▀██  ██▀ 
+//    ▀▀▀▀      ▀▀▀▀▀      ▀▀▀▀     ▀▀▀▀     ▄▀▀▀ ██     ▀▀▀▀     ▀▀▀▀     ▀▀  ▀▀  
+//                                          ▀████▀▀                                                                                                          
 #include <WiFi.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -1047,6 +1056,7 @@ void beepSwitch() {
   if (!buzzerOn) return;
   playPresetTone(eventSoundTile);
 }
+
 void beepTouch() {
   if (!buzzerOn) return;
   nbPlayPreset(eventSoundTouch);
@@ -1071,6 +1081,22 @@ const uint8_t CHAR_DEG[5]   = {0x06, 0x09, 0x09, 0x06, 0x00};
 const uint8_t CHAR_SPACE[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
 const uint8_t CHAR_COLON[2] = {0x36, 0x36};
 const uint8_t CHAR_DOT[1]   = {0x40};
+static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch) {
+  if (ch >= '0' && ch <= '9') {
+    const uint8_t* g = FONT[ch - '0'];
+    for (int i = 0; i < 5 && count < maxCount; i++) buf[count++] = g[i];
+    if (count < maxCount) buf[count++] = 0x00;
+  } else if (ch == ':') {
+    for (int i = 0; i < 2 && count < maxCount; i++) buf[count++] = CHAR_COLON[i];
+    if (count < maxCount) buf[count++] = 0x00;
+  } else {
+    uint8_t tmp[8];
+    uint8_t n = mx.getChar(ch, sizeof(tmp), tmp);
+    if (n == 0) return;
+    for (int i = 0; i < n && count < maxCount; i++) buf[count++] = tmp[i];
+    if (count < maxCount) buf[count++] = 0x00;
+  }
+}
 
 const uint8_t wifiLogo[8] = {
   0b00000010, 0b00001001, 0b00000101, 0b00110101,
@@ -1221,6 +1247,7 @@ void writeCharN(const uint8_t* ch, int n, int logicalCol) {
 void writeChar(const uint8_t* ch, int logicalCol) {
   writeCharN(ch, 5, logicalCol);
 }
+
 void writeGap(int logicalCol) {
   int physCol = 31 - logicalCol;
   if (physCol >= 0 && physCol < 32) mx.setColumn(physCol, 0x00);
@@ -1525,12 +1552,7 @@ static bool     currNeedsScroll = false;
 static int      currWrapPass = 0;
 
 static void currBufAppendMD(char ch) {
-  uint8_t tmp[8];
-  uint8_t n = mx.getChar(ch, sizeof(tmp), tmp);
-  if (n == 0) return;
-  for (int i = 0; i < n && currColCount < 126; i++)
-    currColBuf[currColCount++] = tmp[i];
-  if (currColCount < 127) currColBuf[currColCount++] = 0x00;
+  appendGlyphAuto(currColBuf, currColCount, 127, ch);
 }
 
 void currencyBuildBuffer() {
@@ -1912,6 +1934,7 @@ static int      npColCount  = 0;
 static int      npScrollPos = 0;
 static unsigned long npLastScrollMs = 0;
 
+
 void npBuildBuffer() {
 
   char cleanBuf[128];
@@ -1991,12 +2014,7 @@ void swBuildBuffer() {
   swFormatAdaptive(txt, sizeof(txt), swGetElapsedMs());
   swColCount = 0;
   for (int ci = 0; txt[ci] != '\0' && swColCount < 150; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(txt[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && swColCount < 160; i++)
-      swColBuf[swColCount++] = tmp[i];
-    if (swColCount < 160) swColBuf[swColCount++] = 0x00;
+    appendGlyphAuto(swColBuf, swColCount, 160, txt[ci]);
   }
   if (swColCount > 0) swColCount--;
 }
@@ -2167,12 +2185,7 @@ void timerBuildBuffer() {
   timerFormatText(txt, sizeof(txt));
   timerColCount = 0;
   for (int ci = 0; txt[ci] != '\0' && timerColCount < 150; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(txt[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && timerColCount < 160; i++)
-      timerColBuf[timerColCount++] = tmp[i];
-    if (timerColCount < 160) timerColBuf[timerColCount++] = 0x00;
+    appendGlyphAuto(timerColBuf, timerColCount, 160, txt[ci]);
   }
   if (timerColCount > 0) timerColCount--;
 }
@@ -2331,8 +2344,6 @@ bool timerPriorityTick() {
   return true;
 }
 
-// NOTIF DISPLAY
-
 void notifBuildBuffer() {
   char cleanBuf[204];
   sanitizeUtf8(notifBuf, cleanBuf, sizeof(cleanBuf));
@@ -2350,7 +2361,6 @@ void notifBuildBuffer() {
   }
   if (notifColCount > 0) notifColCount--;
 }
-
 void notifDrawAtPos(int pos) {
   mx.update(MD_MAX72XX::OFF);
   if (!hideIconNotif && !scrollIconInBuffer(scrollTypeNotif)) {
@@ -2397,12 +2407,7 @@ void mementoBuildBuffer() {
     scrollBufPrependIcon(mementoColBuf, mementoColCount, 512, mementoIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && mementoColCount < 500; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(cleanBuf[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && mementoColCount < 512; i++)
-      mementoColBuf[mementoColCount++] = tmp[i];
-    if (mementoColCount < 512) mementoColBuf[mementoColCount++] = 0x00;
+    appendGlyphAuto(mementoColBuf, mementoColCount, 512, cleanBuf[ci]);
   }
   if (mementoColCount > 0) mementoColCount--;
 }
@@ -2471,6 +2476,7 @@ static inline int canvasHexNibble(char c) {
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
 }
+
 bool canvasBitmapFromHex(const String& hex) {
   if ((int)hex.length() != CANVAS_COLS * 2) return false;
   uint8_t tmp[CANVAS_COLS];
@@ -2537,6 +2543,7 @@ static bool  pongRSlowTick;
 #define PONG_TARGET_HITS 12
 #define PONG_MAX_SPEED   1.15f
 #define PONG_CENTER_Y    2
+
 void ssPongInit() {
   pongBallX = pongPrevBallX = 16; pongBallY = pongPrevBallY = 3.5f;
   pongVX = (random(0, 2) ? 1.0f : -1.0f) * 0.55f;
@@ -2545,6 +2552,7 @@ void ssPongInit() {
   pongLPaddleY = pongRPaddleY = PONG_CENTER_Y;
   pongHits = 0; pongFlashL = pongFlashR = 0; pongRSlowTick = false;
 }
+// Functie: ssTickPong.
 bool ssTickPong() {
   unsigned long now = millis();
   if (now - ssFrameMs < SS_FRAME_INTERVAL) return false;
@@ -2633,6 +2641,7 @@ static void fwExplode(float x, float y, bool willow) {
     }
   }
 }
+
 bool ssTickFireworks() {
   unsigned long now = millis();
   if (now - ssFrameMs < SS_FRAME_INTERVAL) return false;
@@ -2795,7 +2804,6 @@ void resumeAfterNotif() {
   }
   finishP2CTransition();
 }
-
 bool notifTick() {
   if (!notifActive) return false;
   unsigned long now = millis();
@@ -3210,7 +3218,6 @@ void weatherDrawAtPos(int pos) {
   }
   mxCommit();
 }
-
 void weatherInit() {
 
   if (!weatherValid) {
@@ -3227,7 +3234,6 @@ void weatherInit() {
   wxState = NP_PAUSE_BEFORE_RIGHT;
   wxPauseStartMs = millis();
 }
-
 void weatherFetch() {
   if (strlen(weatherApiKey) == 0) return;
   if (WiFi.status() != WL_CONNECTED) return;
@@ -3365,6 +3371,7 @@ static const uint8_t TRANS_BAYER8[8][8] = {
   {15,47, 7,39,13,45, 5,37},
   {63,31,55,23,61,29,53,21}
 };
+
 
 void transCaptureCols(uint8_t *dst) {
   for (int c = 0; c < 32; c++) dst[c] = mx.getColumn(c);
@@ -3556,7 +3563,6 @@ void playTileTransition(uint8_t effect, const uint8_t *oldCols, const uint8_t *n
   }
 }
 
-
 uint8_t getCircuitTileTransition(uint8_t itemId) {
   switch (itemId) {
     case ITEM_HOUR:        return tileTransHour;
@@ -3573,14 +3579,9 @@ uint8_t getCircuitTileTransition(uint8_t itemId) {
   }
 }
 
-// TRANSITIONS:Circuit Tile-Priority Tile 
 static uint8_t gPreC2P[32];
 static uint8_t gPreP2C[32];
-
-// captures the screen before the Circuit - Priority transition
 void beginC2PCapture() { transCaptureCols(gPreC2P); }
-
-// plays the Circuit Tile -> Priority Tile transition
 void finishC2PTransition() {
   if (tileTransC2P == 0) return;
   uint8_t newCols[32];
@@ -3588,11 +3589,7 @@ void finishC2PTransition() {
   transWriteCols(gPreC2P);
   playTileTransition(tileTransC2P, gPreC2P, newCols);
 }
-
-// captures the screen before the Priority - Circuit transition
 void beginP2CCapture() { transCaptureCols(gPreP2C); }
-
-// plays the Priority Tile - Circuit Tile transition
 void finishP2CTransition() {
   if (tileTransP2C == 0) return;
   uint8_t newCols[32];
@@ -3601,7 +3598,6 @@ void finishP2CTransition() {
   playTileTransition(tileTransP2C, gPreP2C, newCols);
 }
 
-// draws the first frame of the current Circuit Tiles tile, without transition
 void drawCircuitTileFrame() {
   if (items[currentSlot].id == ITEM_NOW_PLAYING) {
     npInit();
@@ -3659,8 +3655,6 @@ void enterSlot() {
   transCaptureCols(transOldCols);
 
   uint8_t transEffect = getCircuitTileTransition(items[currentSlot].id);
-
-  // we draw the first frame only in the buffer, to avoid a brief glitch before the transition
   gSuppressHwFlash = (transEffect != 0);
   drawCircuitTileFrame();
   gSuppressHwFlash = false;
@@ -3719,7 +3713,6 @@ void retreatSlot() {
 }
 
 // SAVE / LOAD
-
 bool isValidCircuitItemId(uint8_t id) {
   switch (id) {
     case ITEM_HOUR: case ITEM_DATE: case ITEM_TEMP: case ITEM_NOW_PLAYING:
@@ -5255,6 +5248,58 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   .cvx-clear-btn:hover {
     background: color-mix(in srgb, var(--on-surf)8%, transparent)
   }
+
+  .toast-wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 24px;
+    display: flex;
+    justify-content: center;
+    z-index: 500;
+    pointer-events: none
+  }
+
+  .toast {
+    background: var(--surf-high);
+    color: var(--on-surf);
+    font-family: Google Sans, sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 10px 20px 10px 14px;
+    border-radius: 100px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
+    max-width: 90vw;
+    text-align: center;
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity .2s ease, transform .2s ease;
+    display: flex;
+    align-items: center;
+    gap: 10px
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0)
+  }
+
+  .toast-icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--pri);
+    color: #381e72;
+    display: flex;
+    align-items: center;
+    justify-content: center
+  }
+
+  .toast-icon svg {
+    width: 14px;
+    height: 14px
+  }
 </style>
 
 <body>
@@ -5601,7 +5646,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=wlist id=nlist>
         <div class=scan-hint><span class=spin-ring></span>Se cauta retele…</div>
       </div>
-      <div class=msg id=wifi-msg></div>
+
       <div class=md-scrim id=md-scrim onclick=closeDialog()></div>
       <div class=md-dialog id=conn-dlg>
         <div class=mdd-head>
@@ -6142,6 +6187,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     </div>
     <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeLangPicker()>Anuleaza</button></div>
   </div>
+  <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
     var apSsidCache = ``,
       selSSID = ``,
@@ -6841,8 +6887,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function showMsg(t, c) {
-      var m = document.getElementById(`wifi-msg`);
-      m.textContent = t, m.className = `msg ` + c, m.style.display = `block`
+      showToast(t)
     }
 
     function setChips(ssid, isAp) {
@@ -7676,7 +7721,31 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       if (vl) vl.textContent = v + `s`
     }
 
+    var toastTimer = null;
+
+    function showToast(msg) {
+      var el = document.getElementById(`toast-el`);
+      var txt = document.getElementById(`toast-txt`);
+      if (!el || !txt) return;
+      if (toastTimer) clearTimeout(toastTimer);
+      txt.textContent = msg;
+      el.classList.add(`show`);
+      toastTimer = setTimeout(function() {
+        el.classList.remove(`show`)
+      }, 2600)
+    }
+
+    function countEnabledCircuitTiles() {
+      return items.filter(function(it) {
+        return it.enabled && !(it.id === 3 && npIsPriority())
+      }).length
+    }
+
     function toggleTile(idx) {
+      if (items[idx].enabled && countEnabledCircuitTiles() <= 1 && !(items[idx].id === 3 && npIsPriority())) {
+        showToast(`Trebuie sa existe cel putin un Tile pornit`);
+        return
+      }
       items[idx].enabled = !items[idx].enabled;
       var cb = document.getElementById(`tsw` + idx);
       if (cb) cb.checked = items[idx].enabled;
@@ -9995,11 +10064,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 // SERVER HANDLERS
 // AUTH HANDLERS
 
+// Handler HTTP: raspunde cu starea curenta (JSON) pentru Auth.
 void handleAuthState() {
   server.send(200, "application/json",
     String("{\"configured\":") + (authConfigured ? "true" : "false") + "}");
 }
 
+// Handler HTTP pentru ruta /authSetup din portalul web.
 void handleAuthSetup() {
   if (authConfigured) { server.send(403, "text/plain", "Cont deja existent"); return; }
   if (!server.hasArg("user") || !server.hasArg("pass")) {
@@ -10020,6 +10091,7 @@ void handleAuthSetup() {
   server.sendHeader("Set-Cookie", String("sc_tok=") + newTok + "; Path=/; HttpOnly");
   server.send(200, "application/json", String("{\"ok\":true,\"user\":\"") + u + "\"}");
 }
+
 
 void handleLogin() {
   if (!authConfigured) { server.send(403, "text/plain", "Niciun cont configurat"); return; }
@@ -10348,15 +10420,56 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     }
   }
 
-  .err-msg {
-    background: var(--err-con);
-    color: var(--err);
-    border-radius: 8px;
-    padding: 10px 14px;
+  .toast-wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 24px;
+    display: flex;
+    justify-content: center;
+    z-index: 500;
+    pointer-events: none
+  }
+
+  .toast {
+    background: var(--surf-high);
+    color: var(--on-surf);
+    font-family: "Google Sans", sans-serif;
     font-size: 13px;
-    margin-top: 10px;
-    width: 100%;
-    display: none
+    font-weight: 500;
+    padding: 10px 20px 10px 14px;
+    border-radius: 100px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
+    max-width: 90vw;
+    text-align: center;
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity .2s ease, transform .2s ease;
+    display: flex;
+    align-items: center;
+    gap: 10px
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0)
+  }
+
+  .toast-icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--err);
+    color: var(--err-con);
+    display: flex;
+    align-items: center;
+    justify-content: center
+  }
+
+  .toast-icon svg {
+    width: 14px;
+    height: 14px
   }
 
   @keyframes fade-in {
@@ -10386,9 +10499,9 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     <div id=auth-form style="width:100%;display:none">
       <div class=tf id=tf-user><label>Utilizator</label><input id=inp-user type=text autocomplete=username placeholder="ex: admin" maxlength=32></div>
       <div class=tf><label>Parola</label><input id=inp-pass type=password autocomplete=current-password placeholder="Parola" maxlength=64></div><button class=mbtn id=auth-btn onclick=doAuth()>Continua</button>
-      <div class=err-msg id=err-msg></div>
     </div>
   </div>
+  <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewBox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
     var isSetup = false;
 
@@ -10422,7 +10535,6 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
       var u = document.getElementById('inp-user').value.trim();
       var p = document.getElementById('inp-pass').value;
       var btn = document.getElementById('auth-btn');
-      var err = document.getElementById('err-msg');
       if (isSetup && u.length < 1) {
         showErr('Introdu un username.');
         return
@@ -10459,10 +10571,18 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
       })
     }
 
+    var toastTimer = null;
+
     function showErr(msg) {
-      var e = document.getElementById('err-msg');
-      e.textContent = msg;
-      e.style.display = 'block'
+      var el = document.getElementById('toast-el');
+      var txt = document.getElementById('toast-txt');
+      if (!el || !txt) return;
+      if (toastTimer) clearTimeout(toastTimer);
+      txt.textContent = msg;
+      el.classList.add('show');
+      toastTimer = setTimeout(function() {
+        el.classList.remove('show')
+      }, 2600)
     }
     var authUser = '';
     init()
@@ -11324,11 +11444,13 @@ void handleTimerSett() {
   server.send(200, "text/plain", "OK");
 }
 
+
 void handleTimerStart() {
   if (!checkAuth()) return;
   timerStart();
   server.send(200, "text/plain", "OK");
 }
+
 
 void handleTimerPause() {
   if (!checkAuth()) return;
@@ -11353,6 +11475,7 @@ void handleTimerState() {
                 ",\"text\":\"" + String(txt) + "\"}";
   server.send(200, "application/json", json);
 }
+
 
 void handlePriorityOrder() {
   if (!checkAuth()) return;
