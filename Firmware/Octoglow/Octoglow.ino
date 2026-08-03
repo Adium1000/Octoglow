@@ -525,6 +525,8 @@ bool          inScrollAnim     = false;
 bool          inFadeOut        = false;
 bool          inFadeIn         = false;
 int           lastTemp         = -999;
+unsigned long lastTempSampleMs = 0;
+#define TEMP_SAMPLE_INTERVAL_MS 5000UL
 
 unsigned long gLastStaticDrawMs = 0;
 bool          gStaticDrawDone   = false;
@@ -1372,6 +1374,16 @@ static inline const uint8_t* pressureIconForTrend() {
   if (pressureTrend > 0) return pressureIconUp;
   if (pressureTrend < 0) return pressureIconDown;
   return pressureIconFlat;
+}
+
+void tempSampleTick() {
+  unsigned long now = millis();
+  if (lastTempSampleMs != 0 && (now - lastTempSampleMs) < TEMP_SAMPLE_INTERVAL_MS) return;
+  lastTempSampleMs = now;
+  float tf = bmp.readTemperature();
+  if (tf >= -40 && tf <= 85) {
+    lastTemp = (int)round(tf);
+  }
 }
 
 void pressureSampleTick() {
@@ -4360,11 +4372,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   }
 
   .ip-val {
-    color: var(--blue);
-    letter-spacing: .5px;
-    font-family: Roboto Mono, monospace;
-    font-size: 13px;
-    font-weight: 500
+    color: var(--on-surf);
+    font-weight: 400
   }
 
   .copy-btn {
@@ -5256,7 +5265,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=content><span id=h-ip style=display:none></span>
       <div class=sl>Conexiune</div>
       <div class=card>
-        <div onclick="go('s-wifi')" class=li>
+        <div onclick="go('s-wifi')" class=li style="border-bottom:none">
           <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
             </svg></div>
@@ -5309,7 +5318,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         </div>
         <div onclick="go('s-bright')" class=li style="border-bottom:none">
           <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c.39.39 1.03.39 1.41 0l1.06-1.06c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.38.39-.38 1.03 0 1.41z" />
+              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c-.39.39-1.03.39-1.41 0-.39-.39-.39-1.02 0-1.41l1.06-1.06c.39-.39 1.03-.39 1.41 0 .39.39.39 1.02 0 1.41L5.99 19.41z" />
             </svg></div>
           <div class=li-body>
             <div class=li-head>Luminozitate</div>
@@ -5392,22 +5401,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div style="color:var(--on-surf-var);font-size:13px;margin-top:4px;letter-spacing:.3px">Firmware pentru ceas inteligent ESP32</div>
       <div class=sl style="width:100%;text-align:left;margin-top:24px">Info</div>
       <div class=card style="width:100%;text-align:left">
-        <div class="li static">
+        <div class="li static" style="border-bottom:none">
           <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.9 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.66-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z" />
             </svg></div>
           <div class=li-body>
             <div class=li-head>Adresa IP</div>
             <div class="li-sub ip-val" id=about-ip>-</div>
-          </div>
-        </div>
-        <div class="li static">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Version</div>
-            <div class=li-sub id=about-version>-</div>
           </div>
         </div>
         <div class="li static" style="border-bottom:none">
@@ -5420,9 +5420,24 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           </div>
         </div>
       </div>
-      <div class=sl style="width:100%;text-align:left;margin-top:24px">Software</div>
+      <div class=sl style="width:100%;text-align:left">User</div>
       <div class=card style="width:100%;text-align:left">
-        <div class="li static">
+        <div onclick="openUserAccountDlg()" class=li style="border-bottom:none">
+          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>User Account</div>
+            <div class=li-sub>Schimba utilizatorul sau parola</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+      </div>
+      <div class=sl style="width:100%;text-align:left">Software</div>
+      <div class=card style="width:100%;text-align:left">
+        <div class="li static" style="border-bottom:none">
           <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
             </svg></div>
@@ -5438,21 +5453,6 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           <div class=li-body>
             <div class=li-head>Software Updates</div>
             <div class=li-sub>Verifica daca exista o versiune noua</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl style="width:100%;text-align:left">User</div>
-      <div class=card style="width:100%;text-align:left">
-        <div onclick="openUserAccountDlg()" class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>User Account</div>
-            <div class=li-sub>Schimba utilizatorul sau parola</div>
           </div>
           <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
@@ -5515,7 +5515,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=card>
         <div class="li static">
           <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c.39.39 1.03.39 1.41 0l1.06-1.06c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.38.39-.38 1.03 0 1.41z" />
+              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c-.39.39-1.03.39-1.41 0-.39-.39-.39-1.02 0-1.41l1.06-1.06c.39-.39 1.03-.39 1.41 0 .39.39.39 1.02 0 1.41L5.99 19.41z" />
             </svg></div>
           <div class=li-body>
             <div class=li-head id=bright-screen-lbl>Nivel 4</div>
@@ -5643,7 +5643,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   <div class=md-scrim id=discon-scrim onclick=closeDisconDialog()></div>
   <div class=md-dialog id=discon-dlg>
     <div class=mdd-head>
-      <div class=mdd-icon style="background:var(--err-con);color:var(--err)"><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
           <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
         </svg></div>
       <div class=mdd-title id=discon-ssid-name>Comutare in modul AP</div>
@@ -5651,7 +5651,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=mdd-body>
       <div style="color:var(--on-surf-var);font-size:14px;padding:4px 0 8px">Doresti sa opresti conexiunea WiFi si sa pornesti modul Access Point?</div>
     </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDisconDialog()>Anuleaza</button><button class="mbtn" style="background:var(--err-con);color:var(--err);flex:1;justify-content:center;align-items:center;gap:6px;height:40px;padding:0 20px;font-family:Google Sans,sans-serif;font-size:14px;font-weight:500;display:inline-flex;border:none;border-radius:100px;cursor:pointer" onclick=doDisconnect()>Confirma</button></div>
+    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDisconDialog()>Anuleaza</button><button class="mbtn mbtn-fill" onclick=doDisconnect()>Confirma</button></div>
   </div>
   <div class=md-scrim id=switch-wifi-scrim onclick=closeSwitchWifiDialog()></div>
   <div class=md-dialog id=switch-wifi-dlg>
@@ -5705,9 +5705,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
               <option value=1>Wrap</option>
               <option value=2>Bounce + Icon</option>
               <option value=3>Wrap + Icon</option>
-            </select><button class="np-gear-btn" onclick="event.stopPropagation();go('s-scrolltype')" title="Configureaza scroll individual per tile"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            </select><span class=chevron onclick="event.stopPropagation();go('s-scrolltype')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></button></div>
+              </svg></span></div>
         </div>
         <div class="li" style="border-bottom:none" onclick="go('s-tiletransition')">
           <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
@@ -5728,9 +5728,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
               <option value=7>Expand Left</option>
               <option value=8>Expand Right</option>
               <option value=9>Expand Centre</option>
-            </select><button class="np-gear-btn" onclick="event.stopPropagation();go('s-tiletransition')" title="Configureaza tranzitia individual per tile"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            </select><span class=chevron onclick="event.stopPropagation();go('s-tiletransition')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></button></div>
+              </svg></span></div>
         </div>
       </div>
       <div class=sl>Circuit Tiles</div>
@@ -6150,6 +6150,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       items = [],
       npM = 0,
       tempUnitV = 0,
+      lastTempV = -999,
+      wxValidV = !1,
+      wxTempV = -999,
+      wxHumidityV = -1,
+      wxDescV = ``,
       pressureHpaV = 0,
       pressureTrendV = 0,
       currencyBaseV = `EUR`,
@@ -7152,7 +7157,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         var pressureGearHtml = isPressure ? `<button class=\"np-gear-btn\" onclick=\"openPressureSettingsDlg(event)\" title=\"Setari Presiune\">` + gearSvg + `</button>` : ``;
         var ssGearHtml = isScreensaver ? `<button class=\"np-gear-btn\" onclick=\"openSsSettingsDlg(event)\" title=\"Setari Screen Saver\">` + gearSvg + `</button>` : ``;
         var currencyGearHtml = isCurrency ? `<button class=\"np-gear-btn\" onclick=\"openCurrencySettingsDlg(event)\" title=\"Setari Currency Standards\">` + gearSvg + `</button>` : ``;
-        d.innerHTML = `<span class="drag-handle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class="lic ` + ILCLS[item.id] + `">` + ISVG[item.id] + `</div><div class="tile-body"><div class="tile-head">` + NAMES[item.id] + `</div>` + (isNp ? `<div class="tile-sub" id="nptxt-` + idx + `">Astept date de la PC...</div>` : isWx ? `<div class="tile-sub" id="wxtxt-` + idx + `">` + (wxCityLabel || `Se incarca...`) + `</div>` : isCanvas ? `<div class="tile-sub">Desen personalizat 8×32</div>` : isMemoTile ? `<div class="tile-sub" id="memotxt-` + idx + `">` + (memoText || `Niciun text configurat`) + `</div>` : isHour ? `<div class="tile-sub" id="hourtxt-` + idx + `">` + hourPreviewText() + `</div>` : isDate ? `<div class="tile-sub" id="datetxt-` + idx + `">` + datePreviewText() + `</div>` : isTemp ? `<div class="tile-sub" id="temptxt-` + idx + `">` + tempPreviewText() + `</div>` : isPressure ? `<div class="tile-sub" id="pressuretxt-` + idx + `">` + pressurePreviewText() + `</div>` : isScreensaver ? `<div class="tile-sub" id="sstxt-` + idx + `">` + ssAnimPreviewText() + `</div>` : isCurrency ? `<div class="tile-sub" id="currencytxt-` + idx + `">` + currencyPreviewText() + `</div>` : ``) + `</div>` + tempGearHtml + hourGearHtml + dateGearHtml + npGearHtml + wxGearHtml + memoGearHtml + canvasGearHtml + pressureGearHtml + ssGearHtml + currencyGearHtml + swHtml;
+        d.innerHTML = `<span class="drag-handle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class="lic ` + ILCLS[item.id] + `">` + ISVG[item.id] + `</div><div class="tile-body"><div class="tile-head">` + NAMES[item.id] + `</div>` + (isNp ? `<div class="tile-sub" id="nptxt-` + idx + `">Astept date de la PC...</div>` : isWx ? `<div class="tile-sub" id="wxtxt-` + idx + `">` + wxPreviewText() + `</div>` : isCanvas ? `<div class="tile-sub">Desen personalizat 8×32</div>` : isMemoTile ? `<div class="tile-sub" id="memotxt-` + idx + `">` + (memoText || `Niciun text configurat`) + `</div>` : isHour ? `<div class="tile-sub" id="hourtxt-` + idx + `">` + hourPreviewText() + `</div>` : isDate ? `<div class="tile-sub" id="datetxt-` + idx + `">` + datePreviewText() + `</div>` : isTemp ? `<div class="tile-sub" id="temptxt-` + idx + `">` + tempPreviewText() + `</div>` : isPressure ? `<div class="tile-sub" id="pressuretxt-` + idx + `">` + pressurePreviewText() + `</div>` : isScreensaver ? `<div class="tile-sub" id="sstxt-` + idx + `">` + ssAnimPreviewText() + `</div>` : isCurrency ? `<div class="tile-sub" id="currencytxt-` + idx + `">` + currencyPreviewText() + `</div>` : ``) + `</div>` + tempGearHtml + hourGearHtml + dateGearHtml + npGearHtml + wxGearHtml + memoGearHtml + canvasGearHtml + pressureGearHtml + ssGearHtml + currencyGearHtml + swHtml;
         var container = document.createElement(`div`);
         container.style.position = `relative`;
         container.dataset.idx = String(idx);
@@ -7256,8 +7261,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           gearSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87a.49.49 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z\"/></svg>`,
           icon = isNowPlaying ? ISVG[3] : isEts2 ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm12 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-1-9.5h2.5l2.07 2.5H17V9z"/></svg>` : isStopwatch ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>` : `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`,
           cls = isNowPlaying ? `lc-amb` : isEts2 ? `lc-blu` : isStopwatch ? `lc-grn` : `lc-pur`,
-          name = isNowPlaying ? `Now Playing` : isEts2 ? `Euro Truck Simulator 2` : isStopwatch ? `Stopwatch` : `Notificari PC`,
-          subHtml = isNowPlaying ? `<div class=\"tile-sub\" id=\"nptxt-p` + idx + `\">Astept date de la PC...</div>` : isStopwatch ? `<div class=\"tile-sub\" id=\"sw-sub\">` + (swRunning ? `Ruleaza - ` + (swLastText || `00:00:00:00`) : `Oprit`) + `</div>` : `<div class=\"tile-sub\" id=\"` + (isEts2 ? `ets2-sub` : `notif-sub`) + `\">` + (isEts2 ? `Inactiv` : `Afisare instantanee, intrerup bucla normala`) + `</div>`,
+          name = isNowPlaying ? `Now Playing` : isEts2 ? `Euro Truck Simulator 2` : isStopwatch ? `Stopwatch` : `Notificari`,
+          subHtml = isNowPlaying ? `<div class=\"tile-sub\" id=\"nptxt-p` + idx + `\">Astept date de la PC...</div>` : isStopwatch ? `<div class=\"tile-sub\" id=\"sw-sub\">` + (swRunning ? `Ruleaza - ` + (swLastText || `00:00:00:00`) : `Oprit`) + `</div>` : `<div class=\"tile-sub\" id=\"` + (isEts2 ? `ets2-sub` : `notif-sub`) + `\">` + (isEts2 ? `Inactiv` : `Afiseaza notificarile trimise de Now Sender`) + `</div>`,
           gearHtml = isNowPlaying ? `<button class=\"np-gear-btn\" onclick=\"openNpSettingsDlg(event)\" title=\"Setari Now Playing\">` + gearSvg + `</button>` : ``,
           swHtml = isNowPlaying ? `<div class=\"sw\" onclick=\"toggleTile(` + npIdx + `)\"><input type=\"checkbox\" id=\"npPrioCb` + idx + `\"` + (npIdx >= 0 && items[npIdx].enabled ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>` : isStopwatch ? `<button class=\"np-gear-btn sw-toggle-btn` + (swRunning ? ` playing` : ``) + `\" id=\"sw-toggle-btn\" onclick=\"toggleStopwatch()\" title=\"Start / Stop\">` + (swRunning ? `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M6 19h4V5H6v14zm8-14v14h4V5h-4z\"/></svg>` : `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M8 5v14l11-7z\"/></svg>`) + `</button>` : `<div class=\"sw\" onclick=\"` + (isEts2 ? `toggleEts2()` : `toggleNotif()`) + `\"><input type=\"checkbox\" id=\"` + (isEts2 ? `ets2-cb` : `notif-cb`) + `\"` + ((isEts2 ? ets2En : notifEn) ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>`,
           d = document.createElement(`div`);
@@ -7356,7 +7361,16 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function hourPreviewText() {
-      return hourFormatV === 1 ? `Format 12h (1:45)` : `Format 24h (13:45)`
+      var d = new Date(),
+        h = d.getHours(),
+        m = d.getMinutes(),
+        mm = (m < 10 ? `0` : ``) + m;
+      if (hourFormatV === 1) {
+        var h12 = h % 12;
+        if (h12 === 0) h12 = 12;
+        return h12 + `:` + mm
+      }
+      return (h < 10 ? `0` : ``) + h + `:` + mm
     }
 
     function datePreviewText() {
@@ -7365,7 +7379,15 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function tempPreviewText() {
-      return tempUnitV === 1 ? `Fahrenheit (°F)` : `Celsius (°C)`
+      if (lastTempV < -60 || lastTempV > 100) return `--°` + (tempUnitV === 1 ? `F` : `C`);
+      var d = tempUnitV === 1 ? Math.round(lastTempV * 9 / 5 + 32) : lastTempV;
+      return d + `°` + (tempUnitV === 1 ? `F` : `C`)
+    }
+
+    function wxPreviewText() {
+      if (!wxValidV) return wxCityLabel || `Se incarca...`;
+      var d = tempUnitV === 1 ? Math.round(wxTempV * 9 / 5 + 32) : Math.round(wxTempV);
+      return d + `°` + (tempUnitV === 1 ? `F` : `C`) + `  ` + wxHumidityV + `%  ` + wxDescV
     }
 
     function pressureTrendArrow() {
@@ -7546,6 +7568,12 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     function refreshTempTilePreview() {
       document.querySelectorAll(`[id^=temptxt-]`).forEach(function(el) {
         el.textContent = tempPreviewText()
+      })
+    }
+
+    function refreshWeatherTilePreview() {
+      document.querySelectorAll(`[id^=wxtxt-]`).forEach(function(el) {
+        el.textContent = wxPreviewText()
       })
     }
 
@@ -7861,7 +7889,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }).then(function(s) {
         var all = document.querySelectorAll(`[id^=nptxt-]`);
         all.forEach(function(el) {
-          el.textContent = s.active ? `▶  ` + s.text : `Astept date de la PC…`
+          el.textContent = s.active ? s.text : `Astept date de la PC…`
         });
         s.tempunit !== void 0 && (tempUnitV = s.tempunit, [`tempUnitC`, `tempUnitF`, `wxTempUnitC`, `wxTempUnitF`].forEach(function(bid, bi) {
           var b = document.getElementById(bid);
@@ -7877,7 +7905,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         }), refreshHourTilePreview()), s.dateformat !== void 0 && (dateFormatV = s.dateformat, [`dateFmt0`, `dateFmt1`, `dateFmt2`, `dateFmt3`].forEach(function(b, i) {
           var el = document.getElementById(b);
           el && (el.className = `sb` + (i === dateFormatV ? ` on` : ``))
-        }), refreshDateTilePreview())
+        }), refreshDateTilePreview()), s.lastTemp !== void 0 && (lastTempV = s.lastTemp, refreshTempTilePreview()), s.wxValid !== void 0 && (wxValidV = s.wxValid, wxTempV = s.wxTemp, wxHumidityV = s.wxHumidity, wxDescV = s.wxDesc, refreshWeatherTilePreview())
       }).catch(function() {}), setTimeout(pollNP, 3e3)
     }
 
@@ -9050,6 +9078,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         }
       });
       // Top bar elevation on scroll
+      function loadHomeState() {
       fetch(`/state`).then(function(r) {
         return r.json()
       }).then(function(s) {
@@ -9082,6 +9111,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           _hap.textContent = s.ap ? `Activ - ` + s.apSsid : `SSID: ` + s.apSsid
         };
         items = s.items;
+        if (s.lastTemp !== void 0) {
+          lastTempV = s.lastTemp
+        }
         if (s.wxCity) {
           wxCityLabel = s.wxCity + (s.wxHasKey ? ` - API OK` : `  (fara cheie API)`);
         }
@@ -9209,6 +9241,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         if (s.touchTapAction !== void 0) touchTapAction = s.touchTapAction;
         if (s.touchDoubleTapAction !== void 0) touchDoubleTapAction = s.touchDoubleTapAction;
       }).catch(function() {
+        if (stateLoadAttempt < 4) {
+          stateLoadAttempt++;
+          setTimeout(loadHomeState, 500 * stateLoadAttempt);
+          return
+        }
         items = [{
           id: 0,
           enabled: !0,
@@ -9238,7 +9275,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           enabled: !1,
           dur: 8
         }], bOn = !0, buildGrid()
-      }), pollNP(), pollEts2(), pollSwState(), window.addEventListener(`scroll`, function() {
+      })
+      }
+      var stateLoadAttempt = 0;
+      loadHomeState();
+      pollNP(), pollEts2(), pollSwState(), setInterval(refreshHourTilePreview, 1e3), window.addEventListener(`scroll`, function() {
         document.querySelectorAll(`.top-bar`).forEach(function(b) {
           b.classList.toggle(`raised`, window.scrollY > 4)
         })
@@ -10707,6 +10748,7 @@ void handleState() {
                 ",\"apSsid\":\"" + getApSsid() + "\"" +
                 ",\"version\":\"" + FW_VERSION + "\"" +
                 ",\"uptime\":" + String(millis() / 1000) +
+                ",\"lastTemp\":" + String(lastTemp) +
                 ",\"items\":[";
   for (int i = 0; i < NUM_ITEMS; i++) {
     if (i > 0) json += ",";
@@ -11031,7 +11073,12 @@ void handleNpState() {
                 ",\"text\":\"" + String(nowPlayingBuf) + "\"" +
                 ",\"npmode\":" + String(npDisplayMode) +
                 ",\"hourformat\":" + String(hourFormat) +
-                ",\"dateformat\":" + String(dateFormat) + "}";
+                ",\"dateformat\":" + String(dateFormat) +
+                ",\"lastTemp\":" + String(lastTemp) +
+                ",\"wxValid\":" + String(weatherValid ? "true" : "false") +
+                ",\"wxTemp\":" + String(weatherTempC, 1) +
+                ",\"wxHumidity\":" + String(weatherHumidity) +
+                ",\"wxDesc\":\"" + String(weatherDesc) + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -11780,7 +11827,8 @@ void setup() {
   Wire.begin(BMP_SDA, BMP_SCL);
   mx.begin();
   P.begin();
-  if (!bmp.begin(0x76)) {
+  bool bmpFound = bmp.begin(0x76) || bmp.begin(0x77);
+  if (!bmpFound) {
     Serial.println("BMP280 negasit!");
   } else {
     bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
@@ -11789,6 +11837,7 @@ void setup() {
                     Adafruit_BMP280::FILTER_X16,
                     Adafruit_BMP280::STANDBY_MS_500);
     delay(50);
+    tempSampleTick();
     pressureSampleTick();
   }
   loadSettings();
@@ -12314,6 +12363,7 @@ void loop() {
     nowMs = millis();
   }
 
+  tempSampleTick();
   pressureSampleTick();
 
   nowMs = millis();

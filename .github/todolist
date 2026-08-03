@@ -10,7 +10,8 @@ Fixuri
 2 Fix icoana de luminozitate
 3. fix language piker on touch in sender
 4. Fix number font
-
+5. fix animation tranzion on single circuit tile on
+6. fix non circuit tiles on 
 ____
 
 
@@ -22,7 +23,6 @@ Limbă intrefata : Engleză Si Romana
 
 
 Tile manager Custom Fonts
-Tile Manager: Tile transition
 
 Help Manager
 

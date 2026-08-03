@@ -1,6 +1,6 @@
 ![banner](/.github/banner.png)
 
-A compact smart desk clock firmware that connects to Wi-Fi, syncs time automatically, and displays time, date, temperature, and atmospheric pressure  all in one firmware
+A compact smart desk clock firmware that connects to Wi-Fi, syncs time automatically, and displays time, date, temperature, and atmospheric pressure  all in one firmware.
 
 
 ## Table of Contents
