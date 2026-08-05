@@ -224,7 +224,7 @@ First, you will need to get you Octoglow's IP adress and insert it in the `IP Ad
 
 ! Warning : Your octoglow IP adress may change after a while, your IP adress will change so you need to reserve IP address
 
-## By tapping the touch sensor on your Octoglow (Not implemented yeet :3)
+## By tapping the touch sensor on your Octoglow 
 
 - If you did not unasign the "show IP adress" in the touch sensor options it should show your IP , but your IP adress will change so you need to reserve IP address
 
@@ -247,5 +247,15 @@ The ETS2 tile shows your truck's current speed on the clock, but it needs one ex
 4. Launch ETS2. On first launch you may see a confirmation message that the SDK was enabled  click OK.
 
 > If you don't see the confirmation message, make sure the DLL sits directly in `bin\win_x64\plugins\`, not in a subfolder.
+
+
+## Photos of Octoglow in action
+
+![oct1](.github/OctoglowInAction/IMG_0079.png)
+![oct2](.github/OctoglowInAction/IMG_0080.png)
+
+![Want to share your Octoglow here?](Not yeet)
+
+
 
 Made with 🖤 by Adrian

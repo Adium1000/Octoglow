@@ -53,7 +53,7 @@ void loadSettings();
 void advanceSlot();
 void retreatSlot();
 int  prevActiveSlot(int from);
-void enterSlot();
+void enterSlot(bool playTransition = true);
 void drawCircuitTileFrame();
 void resumeCircuitTileFromPriority();
 void beginC2PCapture();
@@ -64,6 +64,8 @@ void registerTouchTap();
 void checkPendingTap();
 void executeTouchAction(uint8_t action);
 void toggleScreenPower();
+bool ipTick();
+void startIpShowFromTouch();
 void npInit();
 void rebuildNowPlayingBuf();
 int  nextActiveSlot(int from);
@@ -562,6 +564,7 @@ bool     hideIconNotif         = false;
 bool     hideIconNowPlaying    = false;
 bool     hideIconPressure      = false;
 bool     hideIconCurrency      = false;
+bool     hideIconIp            = false;
 
 uint8_t  scrollType            = 0;
 
@@ -575,6 +578,7 @@ uint8_t  scrollTypePressure     = 0;
 uint8_t  scrollTypeCurrency     = 0;
 uint8_t  scrollTypeStopwatch    = 0;
 uint8_t  scrollTypeTimer        = 0;
+uint8_t  scrollTypeIp           = 0;
 
 // TILE TRANSITION 
 uint8_t  tileTransGlobal       = 0;
@@ -592,6 +596,7 @@ uint8_t  tileTransNotif        = 0;
 uint8_t  tileTransEts2         = 0;
 uint8_t  tileTransSw           = 0;
 uint8_t  tileTransTmr          = 0;
+uint8_t  tileTransIp           = 0;
 uint8_t  tileTransC2P          = 0; // Circuit Tile -> Priority Tile
 uint8_t  tileTransP2C          = 0; // Priority Tile -> Circuit Tile
 
@@ -606,6 +611,18 @@ const uint8_t notifIcon[8] = {
   0b10011001,
   0b10000001,
   0b01111110,
+  0b00000000
+};
+
+// SHOW IP ADDRESS (Touch Sensor Action)
+const uint8_t ipIcon[8] = {
+  0b00000001,
+  0b00000011,
+  0b00001011,
+  0b00011011,
+  0b01011011,
+  0b11011011,
+  0b11011011,
   0b00000000
 };
 
@@ -891,6 +908,17 @@ static int      wxColCount  = 0;
 static int      wxScrollPos = 0;
 static unsigned long wxLastScrollMs = 0;
 
+// SHOW IP ADDRESS (Touch Sensor Action)
+char          ipBuf[24]          = "";
+bool          ipShowActive       = false;
+NpState       ipState            = NP_SHOW_START;
+unsigned long ipPauseMs          = 0;
+static uint8_t  ipColBuf[128];
+static int      ipColCount       = 0;
+static int      ipScrollPos      = 0;
+static unsigned long ipLastScrollMs = 0;
+static int      ipWrapPass       = 0;
+
 bool          provisionMode    = false;
 bool          buzzerOn         = true;
 uint8_t       buzzerVolume     = 80;
@@ -906,7 +934,7 @@ bool          wifiWasConnected    = true;
 bool          touchActive      = false;
 unsigned long touchStartMs     = 0;
 bool          touchShortFired  = false;
-uint8_t       touchTapAction       = 0;
+uint8_t       touchTapAction       = 8; // default: Show IP Address
 uint8_t       touchDoubleTapAction = 0;
 bool          tapPending           = false;
 unsigned long lastTapReleaseMs     = 0;
@@ -2901,6 +2929,175 @@ bool notifTick() {
   return true;
 }
 
+// SHOW IP ADDRESS (Touch Sensor Action)
+
+void ipBuildBuffer() {
+  char cleanBuf[24];
+  sanitizeUtf8(ipBuf, cleanBuf, sizeof(cleanBuf));
+  ipColCount = 0;
+  if (scrollIconInBuffer(scrollTypeIp) && !hideIconIp) {
+    scrollBufPrependIcon(ipColBuf, ipColCount, 128, ipIcon, NP_ICON_COLS);
+  }
+  for (int ci = 0; cleanBuf[ci] != '\0' && ipColCount < 120; ci++) {
+    uint8_t tmp[8];
+    uint8_t n = mx.getChar(cleanBuf[ci], sizeof(tmp), tmp);
+    if (n == 0) continue;
+    for (int i = 0; i < n && ipColCount < 128; i++)
+      ipColBuf[ipColCount++] = tmp[i];
+    if (ipColCount < 128) ipColBuf[ipColCount++] = 0x00;
+  }
+  if (ipColCount > 0) ipColCount--;
+}
+
+void ipDrawAtPos(int pos) {
+  mx.update(MD_MAX72XX::OFF);
+  if (!hideIconIp && !scrollIconInBuffer(scrollTypeIp)) {
+
+    for (int col = 0; col < NP_ICON_COLS; col++) {
+      uint8_t colVal = 0;
+      for (int row = 0; row < 8; row++) {
+        if (ipIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+      }
+      mx.setColumn(31 - col, colVal);
+    }
+    mx.setColumn(31 - NP_ICON_COLS, 0x00);
+  }
+
+  bool fullWidth = hideIconIp || scrollIconInBuffer(scrollTypeIp);
+  int textOffset = fullWidth ? 0 : (NP_ICON_COLS + NP_SEP_COLS);
+  int textCols   = fullWidth ? 32 : NP_TEXT_COLS;
+  for (int col = 0; col < textCols; col++) {
+    int src = pos + col;
+    uint8_t val = (src >= 0 && src < ipColCount) ? ipColBuf[src] : 0x00;
+    mx.setColumn(31 - (textOffset + col), val);
+  }
+  mxCommit();
+}
+
+void ipInit() {
+  mx.update(MD_MAX72XX::OFF);
+  for (int c = 0; c < NP_DISPLAY_COLS; c++) mx.setColumn(c, 0x00);
+  mxCommit();
+  ipBuildBuffer();
+  ipScrollPos = 0;
+  ipWrapPass = 0;
+  ipDrawAtPos(0);
+  ipState    = NP_PAUSE_BEFORE_RIGHT;
+  ipPauseMs  = millis();
+}
+
+bool ipTick() {
+  if (!ipShowActive) return false;
+  unsigned long now = millis();
+  switch (ipState) {
+    case NP_SHOW_START:
+      break;
+    case NP_PAUSE_BEFORE_RIGHT:
+      if (now - ipPauseMs >= NP_PAUSE_MS) {
+        if (scrollIsWrap(scrollTypeIp)) {
+          ipWrapPass = 0;
+          ipScrollPos = 0;
+          ipState = NP_SCROLL_WRAP;
+        } else {
+          ipState = NP_SCROLL_RIGHT;
+        }
+        ipLastScrollMs = now;
+      }
+      break;
+    case NP_SCROLL_WRAP: {
+      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        ipLastScrollMs = now;
+        ipScrollPos++;
+        if (ipScrollPos >= ipColCount) {
+          ipWrapPass++;
+          if (ipWrapPass >= SCROLL_WRAP_PASSES) {
+
+            ipShowActive = false;
+            ipBuf[0] = '\0';
+            resumeAfterNotif();
+            return false;
+          }
+          ipScrollPos = -((hideIconIp || scrollIconInBuffer(scrollTypeIp)) ? 32 : NP_TEXT_COLS);
+        }
+        ipDrawAtPos(ipScrollPos);
+      }
+      break;
+    }
+    case NP_SCROLL_RIGHT: {
+      int maxPos = ipColCount - ((hideIconIp || scrollIconInBuffer(scrollTypeIp)) ? 32 : NP_TEXT_COLS);
+      if (maxPos <= 0) {
+        ipState = NP_PAUSE_SHORT;
+        ipPauseMs = now;
+        break;
+      }
+      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        ipLastScrollMs = now;
+        ipScrollPos++;
+        ipDrawAtPos(ipScrollPos);
+        if (ipScrollPos >= maxPos) {
+          ipScrollPos = maxPos;
+          ipState = NP_PAUSE_AFTER_RIGHT;
+          ipPauseMs = now;
+        }
+      }
+      break;
+    }
+    case NP_PAUSE_AFTER_RIGHT:
+      if (now - ipPauseMs >= NP_PAUSE_MS) {
+        ipState = NP_SCROLL_LEFT;
+        ipLastScrollMs = now;
+      }
+      break;
+    case NP_SCROLL_LEFT:
+      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        ipLastScrollMs = now;
+        ipScrollPos--;
+        if (ipScrollPos <= 0) {
+          ipScrollPos = 0;
+          ipDrawAtPos(0);
+          ipState = NP_PAUSE_BEFORE_NEXT;
+          ipPauseMs = now;
+        } else {
+          ipDrawAtPos(ipScrollPos);
+        }
+      }
+      break;
+    case NP_PAUSE_BEFORE_NEXT:
+      if (now - ipPauseMs >= NP_PAUSE_MS) {
+
+        ipShowActive = false;
+        ipBuf[0] = '\0';
+        resumeAfterNotif();
+        return false;
+      }
+      break;
+    case NP_PAUSE_SHORT:
+      if (now - ipPauseMs >= 4000UL) {
+        ipShowActive = false;
+        ipBuf[0] = '\0';
+        resumeAfterNotif();
+        return false;
+      }
+      break;
+  }
+  return true;
+}
+
+// starts the "Show IP Address" one-shot display; it interrupts whatever is
+// currently on screen (normal circuit tile OR any other priority tile) —
+// the underlying state of other features (stopwatch running, timer, etc.)
+// is left untouched and simply resumes visually once the IP display ends.
+void startIpShowFromTouch() {
+  if (ipShowActive) return; // already showing; ignore a re-trigger mid-animation
+
+  String localIp = provisionMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  localIp.toCharArray(ipBuf, sizeof(ipBuf));
+  ipShowActive = true;
+  beginC2PCapture();
+  ipInit();
+  finishC2PTransition();
+}
+
 // NOW PLAYING (Priority Tiles)
 
 bool npPriorityTick() {
@@ -3650,11 +3847,11 @@ void drawCircuitTileFrame() {
   }
 }
 
-void enterSlot() {
+void enterSlot(bool playTransition) {
   uint8_t transOldCols[32];
   transCaptureCols(transOldCols);
 
-  uint8_t transEffect = getCircuitTileTransition(items[currentSlot].id);
+  uint8_t transEffect = playTransition ? getCircuitTileTransition(items[currentSlot].id) : 0;
   gSuppressHwFlash = (transEffect != 0);
   drawCircuitTileFrame();
   gSuppressHwFlash = false;
@@ -3688,9 +3885,10 @@ void advanceSlot() {
 
   int next = nextActiveSlot(currentSlot);
   if (next == -1) return;
+  bool sameTile = (next == currentSlot);
   currentSlot = next;
   slotStartMs = millis();
-  enterSlot();
+  enterSlot(!sameTile);
 }
 
 void retreatSlot() {
@@ -3707,9 +3905,10 @@ void retreatSlot() {
 
   int prev = prevActiveSlot(currentSlot);
   if (prev == -1) return;
+  bool sameTile = (prev == currentSlot);
   currentSlot = prev;
   slotStartMs = millis();
-  enterSlot();
+  enterSlot(!sameTile);
 }
 
 // SAVE / LOAD
@@ -3765,7 +3964,7 @@ void loadSettings() {
   if (strlen(eventSoundEts2) == 0) strcpy(eventSoundEts2, "urgent");
   prefs.getString("evSndTouch", eventSoundTouch, sizeof(eventSoundTouch));
   if (strlen(eventSoundTouch) == 0) strcpy(eventSoundTouch, "soft");
-  touchTapAction       = prefs.getUChar("touchTap", 0);
+  touchTapAction       = prefs.getUChar("touchTap", 8);
   touchDoubleTapAction = prefs.getUChar("touchDbl", 0);
   npDisplayMode = prefs.getUChar("npmode", 0);
   ssAnimSelected = prefs.getUChar("ssAnim", SS_ANIM_RANDOM);
@@ -3803,6 +4002,7 @@ void loadSettings() {
   hideIconNowPlaying = prefs.getBool("hideIconNp",    hideTileIcons);
   hideIconPressure   = prefs.getBool("hideIconPress", hideTileIcons);
   hideIconCurrency   = prefs.getBool("hideIconCurr",  hideTileIcons);
+  hideIconIp         = prefs.getBool("hideIconIp",    hideTileIcons);
   scrollType     = prefs.getUChar("scrollType", 0);
   scrollTypeDate       = prefs.getUChar("scrollTypeDate",   scrollType);
   scrollTypeTemp       = prefs.getUChar("scrollTypeTemp",   scrollType);
@@ -3814,6 +4014,7 @@ void loadSettings() {
   scrollTypeCurrency   = prefs.getUChar("scrollTypeCurr",   0);
   scrollTypeStopwatch  = prefs.getUChar("scrollTypeSw",     scrollType);
   scrollTypeTimer      = prefs.getUChar("scrollTypeTmr",    0);
+  scrollTypeIp         = prefs.getUChar("scrollTypeIp",     scrollType);
   tileTransGlobal = prefs.getUChar("trGlobal", 0);
   tileTransHour   = prefs.getUChar("trHour",   tileTransGlobal);
   tileTransDate   = prefs.getUChar("trDate",   tileTransGlobal);
@@ -3829,6 +4030,7 @@ void loadSettings() {
   tileTransEts2   = prefs.getUChar("trEts2",   tileTransGlobal);
   tileTransSw     = prefs.getUChar("trSw",     tileTransGlobal);
   tileTransTmr    = prefs.getUChar("trTmr",    tileTransGlobal);
+  tileTransIp     = prefs.getUChar("trIp",     tileTransGlobal);
   tileTransC2P    = prefs.getUChar("trC2P",    tileTransGlobal);
   tileTransP2C    = prefs.getUChar("trP2C",    tileTransGlobal);
   prefs.getString("evSndTimer", eventSoundTimer, sizeof(eventSoundTimer));
@@ -3897,6 +4099,7 @@ void saveSettings() {
   prefs.putBool("hideIconNp",    hideIconNowPlaying);
   prefs.putBool("hideIconPress", hideIconPressure);
   prefs.putBool("hideIconCurr",  hideIconCurrency);
+  prefs.putBool("hideIconIp",    hideIconIp);
   prefs.putUChar("scrollType", scrollType);
   prefs.putUChar("scrollTypeDate",  scrollTypeDate);
   prefs.putUChar("scrollTypeTemp",  scrollTypeTemp);
@@ -3908,6 +4111,7 @@ void saveSettings() {
   prefs.putUChar("scrollTypeCurr",  scrollTypeCurrency);
   prefs.putUChar("scrollTypeSw",    scrollTypeStopwatch);
   prefs.putUChar("scrollTypeTmr",   scrollTypeTimer);
+  prefs.putUChar("scrollTypeIp",    scrollTypeIp);
   prefs.putUChar("trGlobal", tileTransGlobal);
   prefs.putUChar("trHour",   tileTransHour);
   prefs.putUChar("trDate",   tileTransDate);
@@ -3923,6 +4127,7 @@ void saveSettings() {
   prefs.putUChar("trEts2",   tileTransEts2);
   prefs.putUChar("trSw",     tileTransSw);
   prefs.putUChar("trTmr",    tileTransTmr);
+  prefs.putUChar("trIp",     tileTransIp);
   prefs.putUChar("trC2P",    tileTransC2P);
   prefs.putUChar("trP2C",    tileTransP2C);
   prefs.putString("evSndTimer", eventSoundTimer);
@@ -6141,8 +6346,10 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=content>
       <div class=sl>Circuit Tiles</div>
       <div class=card id=transition-circuit-list></div>
+      <!--
       <div class=sl>Priority Tiles</div>
       <div class=card id=transition-priority-list></div>
+      -->
       <div class=sl>Tranzitii Speciale</div>
       <div class=card id=transition-special-list></div>
     </div>
@@ -6229,7 +6436,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         notif: !1,
         nowplaying: !1,
         pressure: !1,
-        currency: !1
+        currency: !1,
+        ip: !1
       },
       scrollTypeV = 0,
       indivScroll = {
@@ -6241,7 +6449,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         nowplaying: 0,
         pressure: 0,
         stopwatch: 0,
-        currency: 0
+        currency: 0,
+        ip: 0
       },
       SCROLL_TYPE_OPTIONS = [{
         v: 0,
@@ -6282,7 +6491,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       evSndNotif = `soft`,
       evSndEts2 = `urgent`,
       evSndTouch = `soft`,
-      touchTapAction = 0,
+      touchTapAction = 8,
       touchDoubleTapAction = 0,
       TOUCH_ACTIONS = [{
         id: 0,
@@ -6308,6 +6517,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }, {
         id: 7,
         name: `Restart ESP32`
+      }, {
+        id: 8,
+        name: `Show IP Address`
       }],
       EVENT_SOUND_OPTIONS = [{
         id: `none`,
@@ -6425,6 +6637,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       cls: `lc-grn`,
       hasIcon: !1,
       svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>`
+    }, {
+      key: `ip`,
+      label: `Show IP Address`,
+      cls: `lc-blu`,
+      svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
     }];
     var fwVersion = `0.1`,
       bootUptimeSec = 0,
@@ -7791,7 +8008,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function saveSettings() {
-      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency;
+      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0);
       items.forEach(function(it, i) {
         p += `&id` + i + `=` + it.id + `&en` + i + `=` + (it.enabled ? 1 : 0) + `&dur` + i + `=` + it.dur
       }), fetch(`/settings`, {
@@ -9231,6 +9448,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           indivHideIcons.nowplaying = s.hideIconNowPlaying;
           indivHideIcons.pressure = s.hideIconPressure;
           indivHideIcons.currency = s.hideIconCurrency !== void 0 ? s.hideIconCurrency : !1;
+          indivHideIcons.ip = s.hideIconIp !== void 0 ? s.hideIconIp : !1;
           refreshHideIconSwitches()
         }
         if (s.scrollType !== void 0) {
@@ -9247,6 +9465,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           indivScroll.pressure = s.scrollTypePressure;
           indivScroll.stopwatch = s.scrollTypeStopwatch !== void 0 ? s.scrollTypeStopwatch : 0;
           indivScroll.currency = s.scrollTypeCurrency !== void 0 ? s.scrollTypeCurrency : 0;
+          indivScroll.ip = s.scrollTypeIp !== void 0 ? s.scrollTypeIp : 0;
           refreshScrollTypeSelects()
         }
         if (s.notifEnabled !== void 0) {
@@ -9576,7 +9795,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         });
       };
       saveSettings = function() {
-        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0);
+        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0);
         items.forEach(function(it, i) {
           p += "&id" + i + "=" + it.id + "&en" + i + "=" + (it.enabled ? 1 : 0) + "&dur" + i + "=" + it.dur;
         });
@@ -9851,7 +10070,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         ets2: 0,
         stopwatch: 0,
         timer: 0,
-        nowplaying: 0
+        nowplaying: 0,
+        ip: 0
       };
       var transC2P = 0,
         transP2C = 0;
@@ -9975,6 +10195,15 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           row.innerHTML = transRowHtml(meta.cls, meta.svg, meta.name, sel);
           c.appendChild(row);
         });
+        // Show IP Address is treated as a priority tile for transitions,
+        // but it is a one-shot touch action, not part of the reorderable list.
+        if (indivTransPriority.ip === undefined) indivTransPriority.ip = tileTransitionGlobal;
+        var ipRow = document.createElement("div");
+        ipRow.className = "li static";
+        ipRow.style.borderBottom = "none";
+        var ipSel = transSelectHtml("transp-ip", indivTransPriority.ip, "setIndividualPriorityTransition('ip',this.value)");
+        ipRow.innerHTML = transRowHtml("lc-blu", '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>', "Show IP Address", ipSel);
+        c.appendChild(ipRow);
       }
 
       function buildTransitionSpecialList() {
@@ -10002,7 +10231,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
       function buildTileTransitionScreen() {
         buildTransitionCircuitList();
-        buildTransitionPriorityList();
+        // buildTransitionPriorityList(); // Priority Tiles category removed from Tile Transition UI (kept for later restore)
         buildTransitionSpecialList();
       }
       var _origGo2 = go;
@@ -10013,7 +10242,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       };
 
       function saveTransitionSettings() {
-        var p = "tileTransGlobal=" + tileTransitionGlobal + "&tileTransHour=" + (indivTransCircuit[0] || 0) + "&tileTransDate=" + (indivTransCircuit[1] || 0) + "&tileTransTemp=" + (indivTransCircuit[2] || 0) + "&tileTransNp=" + (indivTransCircuit[3] !== undefined ? indivTransCircuit[3] : indivTransPriority.nowplaying || 0) + "&tileTransWx=" + (indivTransCircuit[4] || 0) + "&tileTransRem=" + (indivTransCircuit[5] || 0) + "&tileTransCanvas=" + (indivTransCircuit[6] || 0) + "&tileTransPress=" + (indivTransCircuit[8] || 0) + "&tileTransSs=" + (indivTransCircuit[9] || 0) + "&tileTransCurr=" + (indivTransCircuit[11] || 0) + "&tileTransNotif=" + (indivTransPriority.notif || 0) + "&tileTransEts2=" + (indivTransPriority.ets2 || 0) + "&tileTransSw=" + (indivTransPriority.stopwatch || 0) + "&tileTransTmr=" + (indivTransPriority.timer || 0) + "&tileTransC2P=" + transC2P + "&tileTransP2C=" + transP2C;
+        var p = "tileTransGlobal=" + tileTransitionGlobal + "&tileTransHour=" + (indivTransCircuit[0] || 0) + "&tileTransDate=" + (indivTransCircuit[1] || 0) + "&tileTransTemp=" + (indivTransCircuit[2] || 0) + "&tileTransNp=" + (indivTransCircuit[3] !== undefined ? indivTransCircuit[3] : indivTransPriority.nowplaying || 0) + "&tileTransWx=" + (indivTransCircuit[4] || 0) + "&tileTransRem=" + (indivTransCircuit[5] || 0) + "&tileTransCanvas=" + (indivTransCircuit[6] || 0) + "&tileTransPress=" + (indivTransCircuit[8] || 0) + "&tileTransSs=" + (indivTransCircuit[9] || 0) + "&tileTransCurr=" + (indivTransCircuit[11] || 0) + "&tileTransNotif=" + (indivTransPriority.notif || 0) + "&tileTransEts2=" + (indivTransPriority.ets2 || 0) + "&tileTransSw=" + (indivTransPriority.stopwatch || 0) + "&tileTransTmr=" + (indivTransPriority.timer || 0) + "&tileTransIp=" + (indivTransPriority.ip || 0) + "&tileTransC2P=" + transC2P + "&tileTransP2C=" + transP2C;
         fetch("/settings", {
           method: "POST",
           headers: {
@@ -10050,6 +10279,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           if (s.tileTransEts2 !== undefined) indivTransPriority.ets2 = s.tileTransEts2;
           if (s.tileTransSw !== undefined) indivTransPriority.stopwatch = s.tileTransSw;
           if (s.tileTransTmr !== undefined) indivTransPriority.timer = s.tileTransTmr;
+          if (s.tileTransIp !== undefined) indivTransPriority.ip = s.tileTransIp;
           if (s.tileTransC2P !== undefined) transC2P = s.tileTransC2P;
           if (s.tileTransP2C !== undefined) transP2C = s.tileTransP2C;
           applyTileTransitionGlobal();
@@ -10064,13 +10294,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 // SERVER HANDLERS
 // AUTH HANDLERS
 
-// Handler HTTP: raspunde cu starea curenta (JSON) pentru Auth.
+// Handler HTTP: curent (JSON) for Auth.
 void handleAuthState() {
   server.send(200, "application/json",
     String("{\"configured\":") + (authConfigured ? "true" : "false") + "}");
 }
 
-// Handler HTTP pentru ruta /authSetup din portalul web.
+// Handler HTTP route /authSetup on web.
 void handleAuthSetup() {
   if (authConfigured) { server.send(403, "text/plain", "Cont deja existent"); return; }
   if (!server.hasArg("user") || !server.hasArg("pass")) {
@@ -10652,6 +10882,7 @@ void handleSettings() {
   if (server.hasArg("hideIconNowPlaying")) { bool v = (server.arg("hideIconNowPlaying") == "1"); if (v != hideIconNowPlaying) hideIconTouched = true; hideIconNowPlaying = v; }
   if (server.hasArg("hideIconPressure"))   { bool v = (server.arg("hideIconPressure")   == "1"); if (v != hideIconPressure)   hideIconTouched = true; hideIconPressure   = v; }
   if (server.hasArg("hideIconCurrency"))   { bool v = (server.arg("hideIconCurrency")   == "1"); if (v != hideIconCurrency)   hideIconTouched = true; hideIconCurrency   = v; }
+  if (server.hasArg("hideIconIp"))         { bool v = (server.arg("hideIconIp")         == "1"); if (v != hideIconIp)         hideIconTouched = true; hideIconIp         = v; }
   bool scrollTypeTouched = hideIconTouched;
   if (server.hasArg("scrollType")) {
     int st = server.arg("scrollType").toInt();
@@ -10708,10 +10939,16 @@ void handleSettings() {
     int st = server.arg("scrollTypeCurrency").toInt();
     if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeCurrency) scrollTypeTouched = true; scrollTypeCurrency = (uint8_t)st; }
   }
+  if (server.hasArg("scrollTypeIp")) {
+    int st = server.arg("scrollTypeIp").toInt();
+    if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeIp) scrollTypeTouched = true; scrollTypeIp = (uint8_t)st; }
+  }
   if (scrollTypeTouched) {
 
     if (notifActive) {
       notifBuildBuffer();
+    } else if (ipShowActive) {
+      ipBuildBuffer();
     } else if (swRunning) {
       swInit();
     } else {
@@ -10744,6 +10981,7 @@ void handleSettings() {
   if (server.hasArg("tileTransEts2"))   { int t = server.arg("tileTransEts2").toInt();   if (t >= 0 && t <= 9) tileTransEts2   = (uint8_t)t; }
   if (server.hasArg("tileTransSw"))     { int t = server.arg("tileTransSw").toInt();     if (t >= 0 && t <= 9) tileTransSw     = (uint8_t)t; }
   if (server.hasArg("tileTransTmr"))    { int t = server.arg("tileTransTmr").toInt();    if (t >= 0 && t <= 9) tileTransTmr    = (uint8_t)t; }
+  if (server.hasArg("tileTransIp"))     { int t = server.arg("tileTransIp").toInt();     if (t >= 0 && t <= 9) tileTransIp     = (uint8_t)t; }
   if (server.hasArg("tileTransC2P"))    { int t = server.arg("tileTransC2P").toInt();    if (t >= 0 && t <= 9) tileTransC2P    = (uint8_t)t; }
   if (server.hasArg("tileTransP2C"))    { int t = server.arg("tileTransP2C").toInt();    if (t >= 0 && t <= 9) tileTransP2C    = (uint8_t)t; }
 
@@ -10842,10 +11080,10 @@ void handleEventSoundSett() {
 void handleTouchSett() {
   if (!checkAuth()) return;
   if (server.hasArg("tap")) {
-    touchTapAction = (uint8_t)constrain(server.arg("tap").toInt(), 0, 7);
+    touchTapAction = (uint8_t)constrain(server.arg("tap").toInt(), 0, 8);
   }
   if (server.hasArg("dbl")) {
-    touchDoubleTapAction = (uint8_t)constrain(server.arg("dbl").toInt(), 0, 7);
+    touchDoubleTapAction = (uint8_t)constrain(server.arg("dbl").toInt(), 0, 8);
   }
   saveSettings();
   server.send(200, "text/plain", "OK");
@@ -10908,6 +11146,7 @@ void handleState() {
           ",\"hideIconNowPlaying\":" + String(hideIconNowPlaying ? "true" : "false") +
           ",\"hideIconPressure\":" + String(hideIconPressure ? "true" : "false") +
           ",\"hideIconCurrency\":" + String(hideIconCurrency ? "true" : "false") +
+          ",\"hideIconIp\":" + String(hideIconIp ? "true" : "false") +
           ",\"scrollType\":" + String(scrollType) +
           ",\"scrollTypeDate\":" + String(scrollTypeDate) +
           ",\"scrollTypeTemp\":" + String(scrollTypeTemp) +
@@ -10919,6 +11158,7 @@ void handleState() {
           ",\"scrollTypeStopwatch\":" + String(scrollTypeStopwatch) +
           ",\"scrollTypeCurrency\":" + String(scrollTypeCurrency) +
           ",\"scrollTypeTimer\":" + String(scrollTypeTimer) +
+          ",\"scrollTypeIp\":" + String(scrollTypeIp) +
           ",\"tileTransGlobal\":" + String(tileTransGlobal) +
           ",\"tileTransHour\":" + String(tileTransHour) +
           ",\"tileTransDate\":" + String(tileTransDate) +
@@ -10934,6 +11174,7 @@ void handleState() {
           ",\"tileTransEts2\":" + String(tileTransEts2) +
           ",\"tileTransSw\":" + String(tileTransSw) +
           ",\"tileTransTmr\":" + String(tileTransTmr) +
+          ",\"tileTransIp\":" + String(tileTransIp) +
           ",\"tileTransC2P\":" + String(tileTransC2P) +
           ",\"tileTransP2C\":" + String(tileTransP2C) +
           ",\"timerDurationSec\":" + String(timerDurationSec) +
@@ -11883,6 +12124,9 @@ void executeTouchAction(uint8_t action) {
     case 7:
       ESP.restart();
       break;
+    case 8:
+      startIpShowFromTouch();
+      break;
     default:
       break;
   }
@@ -12041,6 +12285,15 @@ void loop() {
       if (provisionMode) return;
       return;
     }
+  }
+
+  // Show IP Address (touch action) takes precedence over everything else; it is a
+  // short, user-triggered, one-shot display and is not part of the reorderable
+  // Priority Tiles order.
+  if (ipTick()) {
+    server.handleClient();
+    if (provisionMode) return;
+    return;
   }
 
   // Priority Tiles: the first active tile in the configured order interrupts the normal loop

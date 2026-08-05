@@ -22,11 +22,30 @@ Fix applied: now, if /state fails, the page automatically retries up to 4 times 
 
 ![roadmapthumb](roadmaps/roadmap2.png)
 
-Devlog 3 : Text engine fixes 
-Fixed the difference betwwen timer, stopwatch, memento , curency
-Acum v a trebuii să ai cel putin un tile pornit la circuir
+# Devlog 3: Text Engine Fixes
 
-Toasts
+1. Tile Font Inconsistency
+Before this fix, the timer, stopwatch, memento, and currency tiles used a different numeric font than the rest of the tiles, something I hadn't noticed until now. As of this update, all tiles now display using the same font.
 
+Before
 
+![bef](<roadmaps/Fix (1).jpeg>)
 
+After
+
+![bef](<roadmaps/Fix (2).jpeg>)
+
+2. Toasts
+In previous versions, when logging into the interface, we had no dedicated way to communicate short lived pieces of information, so these messages were scattered around and didn't look good. Starting with this update, the web interface now has the ability to display toasts (a feature I mainly integrated to warn the user that they cannot have 0 active circuit tiles, and that at least one tile of that kind needs to be turned on for the firmware to work correctly. However, I saw an opportunity in this, so I integrated it in other places as well).
+
+Places where we now have toasts:
+Failed Login
+Successful Wifi Connection
+Circuit Tile Exception
+AP Mode Switch
+
+![roadmapthumb](roadmaps/roadmap3.png)
+
+# 4.
+fix animation tranzion on single circuit tile on
+Add to touch actions on touch show ip adress

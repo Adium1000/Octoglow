@@ -1,0 +1,46 @@
+Welcome to my todo list
+
+
+1. UAC fix, sa nu fie necesar sa ne logam de fiecare data cand moare ceasul
+
+~~2 Fix icoana de luminozitate~~(2.8.26)
+
+3. fix language piker on touch in sender
+
+~~4. Fix number font~~ (3.8.26)
+
+~~5. fix animation tranzion on single circuit tile on~~
+
+~~6. fix non circuit tiles on~~ (3.8.26)
+
+~~7. Ui cons fix~~ (2.8.26)
+
+~~8. Page icon~~
+
+~~9. Add ASCII art~~
+
+~~10. Add to touch actions on touch show ip adress~~
+
+11. Smart House integration
+
+12. Help Manager
+
+13. Limbă intrefata : Engleză Si Romana
+
+14. Reset & Restore & backup functions in about
+
+15. Tile manager Custom Fonts
+
+16. Custom accent color
+
+17. Scrolling freeze bugs
+
+18. AP scrolling Ip adress
+
+19. AP settings one time show
+
+20. AP set time witout  and date witout internet conexion
+
+21. UAC redesign
+
+22. Fix Now Playing number font
