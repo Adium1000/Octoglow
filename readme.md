@@ -254,7 +254,7 @@ The ETS2 tile shows your truck's current speed on the clock, but it needs one ex
 ![oct1](.github/OctoglowInAction/IMG_0079.png)
 ![oct2](.github/OctoglowInAction/IMG_0080.png)
 
-![Want to share your Octoglow here?](Not yeet)
+![Want to share your Octoglow here?](adrian.tomoiaga12345@gmail.com)
 
 
 

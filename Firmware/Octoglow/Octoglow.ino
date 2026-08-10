@@ -1973,13 +1973,7 @@ void npBuildBuffer() {
     scrollBufPrependIcon(npColBuf, npColCount, 512, musicIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && npColCount < 500; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(cleanBuf[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && npColCount < 512; i++)
-      npColBuf[npColCount++] = tmp[i];
-
-    if (npColCount < 512) npColBuf[npColCount++] = 0x00;
+    appendGlyphAuto(npColBuf, npColCount, 512, cleanBuf[ci]);
   }
 
   if (npColCount > 0) npColCount--;
@@ -10537,23 +10531,11 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     border-radius: 28px;
     padding: 40px 28px 32px;
     width: 100%;
-    max-width: 360px;
+    max-width: 460px;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 0
-  }
-
-  .auth-logo {
-    width: 72px;
-    height: 72px;
-    border-radius: 50%;
-    background: var(--pri-con);
-    color: var(--pri);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 20px
   }
 
   .auth-title {
@@ -10562,14 +10544,48 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     color: var(--on-surf);
     font-weight: 500;
     margin-bottom: 4px;
-    text-align: center
+    padding-bottom: 12px;
+    text-align: center;
+    line-height: 1.3
   }
 
-  .auth-sub {
-    font-size: 13px;
-    color: var(--on-surf-var);
-    margin-bottom: 28px;
-    text-align: center
+  .wave-hand {
+    display: inline-block;
+    vertical-align: -4px;
+    margin-left: 6px;
+    transform-origin: 50% 82%;
+    animation: wave-once 1.4s ease-in-out infinite
+  }
+
+  @keyframes wave-once {
+    0% {
+      transform: rotate(0deg)
+    }
+
+    10% {
+      transform: rotate(14deg)
+    }
+
+    20% {
+      transform: rotate(-8deg)
+    }
+
+    30% {
+      transform: rotate(14deg)
+    }
+
+    40% {
+      transform: rotate(-4deg)
+    }
+
+    50% {
+      transform: rotate(10deg)
+    }
+
+    60%,
+    100% {
+      transform: rotate(0deg)
+    }
   }
 
   .tf {
@@ -10630,6 +10646,69 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
   }
 
   .mbtn:disabled {
+    opacity: .38;
+    pointer-events: none
+  }
+
+  .auth-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    width: 100%
+  }
+
+  .auth-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1 1 220px;
+    min-width: 220px
+  }
+
+  .auth-avatar {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: var(--pri-con);
+    color: var(--pri);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: Google Sans, sans-serif;
+    font-size: 19px;
+    font-weight: 500;
+    text-transform: uppercase
+  }
+
+  .auth-fields {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column
+  }
+
+  .auth-arrow-btn {
+    cursor: pointer;
+    border: none;
+    border-radius: 50%;
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+    background: var(--pri);
+    color: var(--on-pri);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity .15s, transform .1s
+  }
+
+  .auth-arrow-btn:active {
+    transform: scale(.97)
+  }
+
+  .auth-arrow-btn:disabled {
     opacity: .38;
     pointer-events: none
   }
@@ -10717,47 +10796,116 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
   .auth-card {
     animation: .3s cubic-bezier(.2, 0, 0, 1) fade-in
   }
+
+  @media (max-width: 480px) {
+    body {
+      padding: 16px
+    }
+
+    .auth-card {
+      padding: 32px 20px 24px;
+      border-radius: 24px
+    }
+
+    .auth-title {
+      font-size: 20px;
+      padding-bottom: 0
+    }
+
+    .auth-row {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 2px
+    }
+
+    .auth-main {
+      width: 100%;
+      min-width: 0
+    }
+
+    .auth-fields {
+      width: 100%
+    }
+
+    .auth-arrow-btn {
+      align-self: flex-end
+    }
+  }
 </style>
 
 <body>
   <div class=auth-card id=auth-card>
-    <div class=auth-logo><svg viewBox="0 0 24 24" fill=currentColor width=36 height=36>
-        <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z" />
-      </svg></div>
     <div class=auth-title id=auth-title>Octoglow</div>
-    <div class=auth-sub id=auth-sub>Se verifica...</div>
     <div id=auth-form style="width:100%;display:none">
-      <div class=tf id=tf-user><label>Utilizator</label><input id=inp-user type=text autocomplete=username placeholder="ex: admin" maxlength=32></div>
-      <div class=tf><label>Parola</label><input id=inp-pass type=password autocomplete=current-password placeholder="Parola" maxlength=64></div><button class=mbtn id=auth-btn onclick=doAuth()>Continua</button>
+      <div class=auth-row>
+        <div class=auth-main>
+          <div class=auth-avatar id=auth-avatar><svg viewBox="0 0 24 24" fill=currentColor width=28 height=28>
+              <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z" />
+            </svg></div>
+          <div class=auth-fields>
+            <div class=tf id=tf-user><label>Utilizator</label><input id=inp-user type=text autocomplete=username placeholder="ex: admin" maxlength=32 oninput=updateAvatarInitials()></div>
+            <div class=tf><label>Parola</label><input id=inp-pass type=password autocomplete=current-password placeholder="Parola" maxlength=64></div>
+          </div>
+        </div>
+        <button class=auth-arrow-btn id=auth-btn onclick=doAuth()><svg viewBox="0 0 24 24" fill=currentColor width=20 height=20>
+            <path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11H4z" />
+          </svg></button>
+      </div>
     </div>
   </div>
   <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewBox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
     var isSetup = false;
 
+    var AVATAR_ICON_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>';
+
+    function roUpper(ch) {
+      var map = {
+        'ă': 'Ă',
+        'â': 'Â',
+        'î': 'Î',
+        'ș': 'Ș',
+        'ş': 'Ș',
+        'ț': 'Ț',
+        'ţ': 'Ț'
+      };
+      return map[ch] || ch.toUpperCase()
+    }
+
+    function getInitials(name) {
+      var parts = (name || '').trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) return '';
+      if (parts.length === 1) return roUpper(parts[0].charAt(0));
+      return roUpper(parts[0].charAt(0)) + roUpper(parts[1].charAt(0))
+    }
+
+    function updateAvatarInitials() {
+      var el = document.getElementById('auth-avatar');
+      var inp = document.getElementById('inp-user');
+      if (!el || !inp) return;
+      var initials = getInitials(inp.value);
+      el.innerHTML = initials ? initials : AVATAR_ICON_SVG
+    }
+
     function init() {
       fetch('/authstate').then(function(r) {
         return r.json()
       }).then(function(d) {
         isSetup = !d.configured;
-        var sub = document.getElementById('auth-sub');
         var form = document.getElementById('auth-form');
         var title = document.getElementById('auth-title');
         if (isSetup) {
-          title.textContent = 'Bun venit!';
-          sub.textContent = 'Creeaza un cont pentru a proteja dashboard-ul.';
-          document.getElementById('tf-user').style.display = '';
-          document.getElementById('auth-btn').textContent = 'Creeaza cont'
+          title.textContent = 'Welcome, Setup an Account';
+          document.getElementById('tf-user').style.display = ''
         } else {
-          title.textContent = 'Octoglow';
-          sub.textContent = 'Autentifica-te pentru a continua.';
-          document.getElementById('tf-user').style.display = '';
-          document.getElementById('auth-btn').textContent = 'Autentificare'
+          title.innerHTML = 'Welcome back to Octoglow! <svg class="wave-hand" xmlns="http://www.w3.org/2000/svg" height="22px" viewBox="0 -960 960 960" width="22px" fill="currentColor"><path d="M880-759q0-51-35-86t-86-35v-60q75 0 128 53t53 128h-60ZM240-40q-83 0-141.5-58.5T40-240h60q0 58 41 99t99 41v60Zm162 0q-30 0-56-13.5T303-92L48-465l24-23q19-19 45-22t47 12l116 81v-383q0-17 11.5-28.5T320-840q17 0 28.5 11.5T360-800v537L212-367l157 229q5 8 14 13t19 5h278q33 0 56.5-23.5T760-200v-560q0-17 11.5-28.5T800-800q17 0 28.5 11.5T840-760v560q0 66-47 113T680-40H402Zm38-440v-400q0-17 11.5-28.5T480-920q17 0 28.5 11.5T520-880v400h-80Zm160 0v-360q0-17 11.5-28.5T640-880q17 0 28.5 11.5T680-840v360h-80ZM486-300Z"/></svg>';
+          document.getElementById('tf-user').style.display = ''
         }
         form.style.display = '';
+        updateAvatarInitials();
         document.getElementById('inp-user').focus()
       }).catch(function() {
-        document.getElementById('auth-sub').textContent = 'Eroare conexiune. Reincearca.'
+        showErr('Eroare conexiune. Reincearca.')
       })
     }
 
@@ -10773,7 +10921,7 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
         showErr('Parola trebuie sa aiba cel putin 4 caractere.');
         return
       }
-      var origLabel = btn.textContent;
+      var origLabel = btn.innerHTML;
       btn.disabled = true;
       btn.innerHTML = '<span class="btn-spin"></span>';
       var url = isSetup ? '/authsetup' : '/login';

@@ -43,4 +43,8 @@ Welcome to my todo list
 
 21. UAC redesign
 
-22. Fix Now Playing number font
+~~22. Fix Now Playing number font~~
+
+23. Looking for something else
+
+~~24. Login page redesign~~

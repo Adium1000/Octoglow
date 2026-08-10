@@ -46,6 +46,35 @@ AP Mode Switch
 
 ![roadmapthumb](roadmaps/roadmap3.png)
 
-# 4.
-fix animation tranzion on single circuit tile on
-Add to touch actions on touch show ip adress
+# 4. Fixed tile engine + Easy Discover Utility
+### Animation transition fix
+
+Fixed the animation transition on single circuit tiles for a smoother and more consistent visual experience.
+
+### Show IP address through Touch actions
+
+You can now assign `Show IP Address` to `On Touch` or any other supported Touch event from the Touch Options menu.
+
+When triggered, Octoglow will display its current IP address directly on the device. This can be especially useful when using a hotspot for synchronization, or when you want to connect to Octoglow without having to dig through your router settings to find its address.
+
+It makes accessing the interface and setting up synchronization a little easier and more convenient.
+
+## README Updates
+
+### Photos of Octoglow in Action
+
+A new section has been added to the README: **Photos of Octoglow in Action**.
+
+This section is intended as a community gallery where you can share photos of your own Octoglow device. The goal is to build a diverse collection of setups that shows the different ways Octoglow can be used, customized, and built into your own projects.
+
+Whether you went for a clean setup, something completely custom, or found a use case we never thought of, feel free to share it.
+
+And yes, ideally with Octoglow actually being the star of the show. Although I have a feeling some of you might have other plans.
+
+# 5. UAC Redesign + NowPlaying Number Font Fix
+
+## Redesigned the old UAC
+Gave the old UAC (login/setup screen) a visual refresh to make it feel more modern and pleasant to use. The layout is now more minimal overall, with less clutter and less text on screen. One of the nicer additions is an automatic guest avatar that generates your initials from the username you type, instead of showing a generic placeholder icon the whole time. Spacing and alignment were also cleaned up so the screen looks tidier on both small and large displays.
+
+## Fixed NowPlaying numeric font
+Noticed that the NowPlaying tile was rendering its numbers with a different font than every other tile in the UI, which made it stand out in a bad way. Tracked it down and fixed it so NowPlaying now uses the same numeric font as the rest of the tiles, keeping everything visually consistent.
