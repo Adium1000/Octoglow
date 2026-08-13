@@ -128,7 +128,7 @@ uint8_t  dimLevel  = 1;
 #define DOUBLE_TAP_WINDOW_MS 500
 
 // BUZZER
-#define BUZZER_PIN 7
+#define BUZZER_PIN 12
 
 // AP CONFIG
 #define AP_SSID "Adrian's Octoglow"
@@ -1018,6 +1018,51 @@ static void nbPlayPreset(const char* id) {
     for (int i = 0; i < 4; i++) { nbEnqueue(notes[i], 140); nbEnqueue(0, 10); }
   } else if (strcmp(id, "pingpong") == 0) {
     for (int i = 0; i < 4; i++) { nbEnqueue(i % 2 == 0 ? 1200 : 800, 55); nbEnqueue(0, 10); }
+  } else if (strcmp(id, "sos") == 0) {
+    for (int i = 0; i < 3; i++) { nbEnqueue(1500, 60); nbEnqueue(0, 60); }
+    nbEnqueue(0, 80);
+    for (int i = 0; i < 3; i++) { nbEnqueue(1500, 180); nbEnqueue(0, 60); }
+    nbEnqueue(0, 80);
+    for (int i = 0; i < 3; i++) { nbEnqueue(1500, 60); nbEnqueue(0, 60); }
+  } else if (strcmp(id, "siren") == 0) {
+    for (int f = 400; f <= 1800; f += 70) nbEnqueue(f, 18);
+    for (int f = 1800; f >= 400; f -= 70) nbEnqueue(f, 18);
+  } else if (strcmp(id, "klaxon") == 0) {
+    for (int i = 0; i < 6; i++) { nbEnqueue(i % 2 == 0 ? 1000 : 1400, 45); nbEnqueue(0, 10); }
+  } else if (strcmp(id, "laser") == 0) {
+    for (int f = 2500; f >= 300; f -= 100) nbEnqueue(f, 10);
+  } else if (strcmp(id, "robot") == 0) {
+    int notes[5] = {900, 1300, 700, 1600, 1000};
+    for (int i = 0; i < 5; i++) { nbEnqueue(notes[i], 40); nbEnqueue(0, 15); }
+  } else if (strcmp(id, "fanfare") == 0) {
+    nbEnqueue(523, 90);  nbEnqueue(0, 10);
+    nbEnqueue(659, 90);  nbEnqueue(0, 10);
+    nbEnqueue(784, 90);  nbEnqueue(0, 10);
+    nbEnqueue(1046, 220);
+  } else if (strcmp(id, "powerdown") == 0) {
+    for (int f = 1200; f >= 200; f -= 50) nbEnqueue(f, 14);
+  } else if (strcmp(id, "powerup") == 0) {
+    for (int f = 200; f <= 1200; f += 50) nbEnqueue(f, 14);
+  } else if (strcmp(id, "heartbeat") == 0) {
+    nbEnqueue(150, 80); nbEnqueue(0, 40); nbEnqueue(150, 60); nbEnqueue(0, 220);
+    nbEnqueue(150, 80); nbEnqueue(0, 40); nbEnqueue(150, 60);
+  } else if (strcmp(id, "scifi") == 0) {
+    for (int i = 0; i < 2; i++) {
+      for (int f = 600; f <= 1600; f += 80) nbEnqueue(f, 12);
+      for (int f = 1600; f >= 600; f -= 80) nbEnqueue(f, 12);
+    }
+  } else if (strcmp(id, "arcade") == 0) {
+    int notes[4] = {800, 1000, 1200, 1600};
+    for (int i = 0; i < 4; i++) { nbEnqueue(notes[i], 45); nbEnqueue(0, 8); }
+  } else if (strcmp(id, "zen") == 0) {
+    nbEnqueue(220, 400);
+  } else if (strcmp(id, "bubble") == 0) {
+    int notes[5] = {600, 900, 1200, 1500, 1800};
+    for (int i = 0; i < 5; i++) { nbEnqueue(notes[i], 30); nbEnqueue(0, 10); }
+  } else if (strcmp(id, "whistle") == 0) {
+    for (int f = 800; f <= 2000; f += 40) nbEnqueue(f, 12);
+  } else if (strcmp(id, "boldalert") == 0) {
+    for (int i = 0; i < 4; i++) { nbEnqueue(300, 70); nbEnqueue(0, 10); nbEnqueue(1200, 70); nbEnqueue(0, 10); }
   } else {
     nbEnqueue(1000, 80);
   }
@@ -1074,6 +1119,56 @@ void playPresetTone(const char* id) {
     for (int i = 0; i < 4; i++) {
       tone(BUZZER_PIN, i % 2 == 0 ? 1200 : 800, 55);
       delay(65);
+    }
+  } else if (strcmp(id, "sos") == 0) {
+    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 60); delay(75); }
+    delay(80);
+    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 180); delay(200); }
+    delay(80);
+    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 60); delay(75); }
+  } else if (strcmp(id, "siren") == 0) {
+    for (int f = 400; f <= 1800; f += 70) { tone(BUZZER_PIN, f, 18); delay(15); }
+    for (int f = 1800; f >= 400; f -= 70) { tone(BUZZER_PIN, f, 18); delay(15); }
+  } else if (strcmp(id, "klaxon") == 0) {
+    for (int i = 0; i < 6; i++) { tone(BUZZER_PIN, i % 2 == 0 ? 1000 : 1400, 45); delay(55); }
+  } else if (strcmp(id, "laser") == 0) {
+    for (int f = 2500; f >= 300; f -= 100) { tone(BUZZER_PIN, f, 10); delay(8); }
+  } else if (strcmp(id, "robot") == 0) {
+    int notes[5] = {900, 1300, 700, 1600, 1000};
+    for (int i = 0; i < 5; i++) { tone(BUZZER_PIN, notes[i], 40); delay(55); }
+  } else if (strcmp(id, "fanfare") == 0) {
+    tone(BUZZER_PIN, 523, 90);   delay(100);
+    tone(BUZZER_PIN, 659, 90);   delay(100);
+    tone(BUZZER_PIN, 784, 90);   delay(100);
+    tone(BUZZER_PIN, 1046, 220); delay(220);
+  } else if (strcmp(id, "powerdown") == 0) {
+    for (int f = 1200; f >= 200; f -= 50) { tone(BUZZER_PIN, f, 14); delay(11); }
+  } else if (strcmp(id, "powerup") == 0) {
+    for (int f = 200; f <= 1200; f += 50) { tone(BUZZER_PIN, f, 14); delay(11); }
+  } else if (strcmp(id, "heartbeat") == 0) {
+    tone(BUZZER_PIN, 150, 80); delay(120);
+    tone(BUZZER_PIN, 150, 60); delay(280);
+    tone(BUZZER_PIN, 150, 80); delay(120);
+    tone(BUZZER_PIN, 150, 60); delay(60);
+  } else if (strcmp(id, "scifi") == 0) {
+    for (int i = 0; i < 2; i++) {
+      for (int f = 600; f <= 1600; f += 80) { tone(BUZZER_PIN, f, 12); delay(10); }
+      for (int f = 1600; f >= 600; f -= 80) { tone(BUZZER_PIN, f, 12); delay(10); }
+    }
+  } else if (strcmp(id, "arcade") == 0) {
+    int notes[4] = {800, 1000, 1200, 1600};
+    for (int i = 0; i < 4; i++) { tone(BUZZER_PIN, notes[i], 45); delay(53); }
+  } else if (strcmp(id, "zen") == 0) {
+    tone(BUZZER_PIN, 220, 400); delay(400);
+  } else if (strcmp(id, "bubble") == 0) {
+    int notes[5] = {600, 900, 1200, 1500, 1800};
+    for (int i = 0; i < 5; i++) { tone(BUZZER_PIN, notes[i], 30); delay(40); }
+  } else if (strcmp(id, "whistle") == 0) {
+    for (int f = 800; f <= 2000; f += 40) { tone(BUZZER_PIN, f, 12); delay(9); }
+  } else if (strcmp(id, "boldalert") == 0) {
+    for (int i = 0; i < 4; i++) {
+      tone(BUZZER_PIN, 300, 70);  delay(80);
+      tone(BUZZER_PIN, 1200, 70); delay(80);
     }
   } else {
     tone(BUZZER_PIN, 1000, 80); delay(80);
@@ -4222,7 +4317,43 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     --amber-con: #3b2a00;
     --amber: #ffdf99;
     --grn-con: #003824;
-    --grn: #6dd7a1
+    --grn: #6dd7a1;
+    --pri-txt: var(--pri)
+  }
+
+  body.light {
+    --bg: #fef7ff;
+    --on-bg: #1d1b20;
+    --surf: #fef7ff;
+    --on-surf: #1d1b20;
+    --surf-var: #e7e0eb;
+    --on-surf-var: #49454f;
+    --surf-low: #f7f2fa;
+    --surf-con: #f3edf7;
+    --surf-high: #ece6f0;
+    --surf-highest: #e6e0e9;
+    --outline: #79747e;
+    --outline-var: #cac4d0;
+    --inv-surf: #313033;
+    --inv-on-surf: #f4eff4;
+    --err: #ba1a1a;
+    --err-con: #ffdad6;
+    --blue-con: #d5e3ff;
+    --blue: #0d2247;
+    --teal-con: #a1f2de;
+    --teal: #003731;
+    --amber-con: #ffe08c;
+    --amber: #3b2a00;
+    --grn-con: #a1f2c6;
+    --grn: #003824
+  }
+
+  body.light .sl {
+    color: var(--pri-con)
+  }
+
+  body.light {
+    --pri-txt: var(--pri-con)
   }
 
   * {
@@ -4277,7 +4408,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   }
 
   .top-bar.raised {
-    background: var(--surf-high);
+    background: color-mix(in srgb, var(--surf-high) 90%, var(--pri) 10%);
     box-shadow: 0 1px 0 var(--outline-var)
   }
 
@@ -4510,7 +4641,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
   .li-body {
     flex: 1;
-    min-width: 0
+    min-width: 0;
+    text-align: left
   }
 
   .li-head {
@@ -4680,8 +4812,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   }
 
   .mbtn-ton {
-    background: var(--sec-con);
-    color: var(--on-sec-con)
+    background: var(--pri-con);
+    color: var(--on-pri-con)
   }
 
   .wlist {
@@ -5499,9 +5631,146 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     width: 14px;
     height: 14px
   }
+
+  .accent-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 18px 16px
+  }
+
+  .accent-swatch {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    position: relative;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .1);
+    transition: transform .12s
+  }
+
+  .accent-swatch:active {
+    transform: scale(.92)
+  }
+
+  .accent-swatch:before {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    border: 2px solid var(--on-surf);
+    opacity: 0;
+    transition: opacity .12s
+  }
+
+  .accent-swatch.sel:before {
+    opacity: 1
+  }
+
+  .accent-swatch svg {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 20px;
+    height: 20px;
+    opacity: 0;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .4))
+  }
+
+  .accent-swatch.sel svg {
+    opacity: 1
+  }
+
+  .accent-custom-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--outline-var);
+    transition: background .12s;
+    position: relative
+  }
+
+  .accent-custom-row:hover {
+    background: color-mix(in srgb, var(--on-surf) 6%, transparent)
+  }
+
+  .accent-custom-swatch {
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    position: relative;
+    overflow: hidden;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15);
+    transition: box-shadow .12s
+  }
+
+  .accent-custom-swatch.sel {
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15), 0 0 0 3px var(--surf-low), 0 0 0 5px var(--on-surf)
+  }
+
+  .accent-custom-swatch input[type=color] {
+    position: absolute;
+    inset: -8px;
+    width: calc(100% + 16px);
+    height: calc(100% + 16px);
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    background: 0 0
+  }
+
+  .accent-custom-body {
+    flex: 1;
+    min-width: 0;
+    text-align: left
+  }
+
+  .accent-custom-title {
+    color: var(--on-surf);
+    font-family: Google Sans, sans-serif;
+    font-size: 16px
+  }
+
+  .accent-custom-sub {
+    color: var(--on-surf-var);
+    font-size: 13px;
+    margin-top: 2px
+  }
+
+  .accent-custom-check {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .12s
+  }
+
+  .accent-custom-check svg {
+    width: 20px;
+    height: 20px;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .4))
+  }
+
+  .accent-custom-swatch.sel .accent-custom-check {
+    opacity: 1
+  }
 </style>
 
 <body>
+  <script>
+    (function() {
+      try {
+        var v = localStorage.getItem(`darkMode`);
+        if (v === `0`) document.body.classList.add(`light`)
+      } catch (e) {}
+    })()
+  </script>
   <div class="screen active" id=s-home>
     <div class=top-bar id=home-bar style="flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:40px 16px 28px;gap:0">
       <div class=home-title id=home-title>Octoglow</div><span id=home-sub style=display:none></span>
@@ -5627,18 +5896,18 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     </div>
     <div class=content style="display:flex;flex-direction:column;align-items:center;text-align:center">
       <div style="width:84px;height:84px;margin:24px 0 16px"><svg viewBox="0 0 256 256" width="84" height="84">
-          <circle cx="128" cy="128" r="128" fill="#EADDFF" opacity="0.137" />
-          <circle cx="128" cy="128" r="107.52" fill="#EADDFF" opacity="0.255" />
-          <circle cx="128" cy="128" r="92.16" fill="#EADDFF" opacity="0.392" />
-          <circle cx="128.00" cy="25.60" r="11.52" fill="#6750A4" />
-          <circle cx="200.41" cy="55.59" r="11.52" fill="#6750A4" />
-          <circle cx="230.40" cy="128.00" r="11.52" fill="#6750A4" />
-          <circle cx="200.41" cy="200.41" r="11.52" fill="#6750A4" />
-          <circle cx="128.00" cy="230.40" r="11.52" fill="#6750A4" />
-          <circle cx="55.59" cy="200.41" r="11.52" fill="#6750A4" />
-          <circle cx="25.60" cy="128.00" r="11.52" fill="#6750A4" />
-          <circle cx="55.59" cy="55.59" r="11.52" fill="#6750A4" />
-          <circle cx="128" cy="128" r="71.68" fill="#6750A4" />
+          <circle cx="128" cy="128" r="128" fill="var(--on-pri-con)" opacity="0.137" />
+          <circle cx="128" cy="128" r="107.52" fill="var(--on-pri-con)" opacity="0.255" />
+          <circle cx="128" cy="128" r="92.16" fill="var(--on-pri-con)" opacity="0.392" />
+          <circle cx="128.00" cy="25.60" r="11.52" fill="var(--pri-con)" />
+          <circle cx="200.41" cy="55.59" r="11.52" fill="var(--pri-con)" />
+          <circle cx="230.40" cy="128.00" r="11.52" fill="var(--pri-con)" />
+          <circle cx="200.41" cy="200.41" r="11.52" fill="var(--pri-con)" />
+          <circle cx="128.00" cy="230.40" r="11.52" fill="var(--pri-con)" />
+          <circle cx="55.59" cy="200.41" r="11.52" fill="var(--pri-con)" />
+          <circle cx="25.60" cy="128.00" r="11.52" fill="var(--pri-con)" />
+          <circle cx="55.59" cy="55.59" r="11.52" fill="var(--pri-con)" />
+          <circle cx="128" cy="128" r="71.68" fill="var(--pri-con)" />
           <circle cx="99.328" cy="99.328" r="23.04" fill="#FFFFFF" />
         </svg></div>
       <div style="font-family:Google Sans,sans-serif;font-size:28px;color:var(--on-surf);font-weight:500">Octoglow</div>
@@ -5678,6 +5947,30 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
         </div>
+        <div onclick="go('s-accent-color')" class=li style="border-bottom:none">
+          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10c1.38 0 2.5-1.12 2.5-2.5 0-.61-.23-1.2-.64-1.67-.08-.1-.13-.21-.13-.33 0-.28.22-.5.5-.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 8 6.5 8 8 8.67 8 9.5 7.33 11 6.5 11zm3-4C8.67 7 8 6.33 8 5.5S8.67 4 9.5 4s1.5.67 1.5 1.5S10.33 7 9.5 7zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 4 14.5 4s1.5.67 1.5 1.5S15.33 7 14.5 7zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 8 17.5 8s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Accent Color</div>
+            <div class=li-sub>Personalizeaza culoarea de accent</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+        <div class="li static" style="border-bottom:none">
+          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Dark Mode</div>
+            <div class=li-sub>Tema intunecata a interfetei</div>
+          </div>
+          <div class=li-trail>
+            <div class=sw onclick=toggleDarkMode()><input type=checkbox id=dark-mode-cb checked><span class=sw-track></span><span class=sw-thumb></span></div>
+          </div>
+        </div>
       </div>
       <div class=sl style="width:100%;text-align:left">Software</div>
       <div class=card style="width:100%;text-align:left">
@@ -5701,6 +5994,40 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class=screen id=s-accent-color>
+    <div class=top-bar><button onclick="go('s-about')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+        </svg></button>
+      <div class=bar-text>
+        <div class=bar-title>Accent Color</div>
+      </div>
+    </div>
+    <div class=content>
+      <div class=sl>Preseturi</div>
+      <div class=card>
+        <div class=accent-grid id=accent-preset-grid></div>
+      </div>
+      <div class=sl>Personalizat</div>
+      <div class=card>
+        <div class=accent-custom-row>
+          <div class=accent-custom-swatch id=accent-custom-swatch-wrap><input type=color id=accent-custom-input oninput="onAccentCustomPick(this.value)" value=#d0bcff><div class=accent-custom-check id=accent-custom-check></div></div>
+          <div class=accent-custom-body>
+            <div class=accent-custom-title>Culoare personalizata</div>
+            <div class=accent-custom-sub>Alege orice culoare din paleta</div>
+          </div>
+        </div>
+        <div onclick=resetAccentColor() class=li style="border-bottom:none">
+          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M12 5V2L8 6l4 4V7c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Reseteaza la implicit</div>
+            <div class=li-sub>Revino la culoarea originala</div>
+          </div>
         </div>
       </div>
     </div>
@@ -6566,6 +6893,51 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }, {
         id: `pingpong`,
         name: `Ping Pong`
+      }, {
+        id: `sos`,
+        name: `SOS`
+      }, {
+        id: `siren`,
+        name: `Siren`
+      }, {
+        id: `klaxon`,
+        name: `Klaxon`
+      }, {
+        id: `laser`,
+        name: `Laser Zap`
+      }, {
+        id: `robot`,
+        name: `Robot Blips`
+      }, {
+        id: `fanfare`,
+        name: `Fanfare`
+      }, {
+        id: `powerdown`,
+        name: `Power Down`
+      }, {
+        id: `powerup`,
+        name: `Power Up`
+      }, {
+        id: `heartbeat`,
+        name: `Heartbeat`
+      }, {
+        id: `scifi`,
+        name: `Sci-Fi`
+      }, {
+        id: `arcade`,
+        name: `Arcade`
+      }, {
+        id: `zen`,
+        name: `Zen Gong`
+      }, {
+        id: `bubble`,
+        name: `Bubbles`
+      }, {
+        id: `whistle`,
+        name: `Whistle`
+      }, {
+        id: `boldalert`,
+        name: `Bold Alert`
       }],
       priorityItems = [{
         id: `notif`,
@@ -6805,7 +7177,191 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       })
     }
 
+    var ACCENT_DEFAULT_HEX = `#d0bcff`;
+    var ACCENT_PRESETS = [`#d0bcff`, `#aac7ff`, `#6cf9d8`, `#6dd7a1`, `#c4e17f`, `#ffdf99`, `#ffb787`, `#ffb4ab`, `#ffb1c8`, `#b8c4ff`];
+    var ACCENT_CHECK_SVG = `<svg viewbox="0 0 24 24" fill=currentColor><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`;
+
+    function hexToHsl(hex) {
+      hex = hex.replace(`#`, ``);
+      if (hex.length === 3) hex = hex.split(``).map(function(c) {
+        return c + c
+      }).join(``);
+      var r = parseInt(hex.substr(0, 2), 16) / 255,
+        g = parseInt(hex.substr(2, 2), 16) / 255,
+        b = parseInt(hex.substr(4, 2), 16) / 255;
+      var max = Math.max(r, g, b),
+        min = Math.min(r, g, b);
+      var h = 0,
+        s = 0,
+        l = (max + min) / 2;
+      if (max !== min) {
+        var d = max - min;
+        s = l > .5 ? d / (2 - max - min) : d / (max + min);
+        if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60
+      }
+      return {
+        h: h,
+        s: s * 100,
+        l: l * 100
+      }
+    }
+
+    function hslToHex(h, s, l) {
+      h = ((h % 360) + 360) % 360;
+      s /= 100;
+      l /= 100;
+      var c = (1 - Math.abs(2 * l - 1)) * s,
+        x = c * (1 - Math.abs((h / 60) % 2 - 1)),
+        m = l - c / 2,
+        r = 0,
+        g = 0,
+        b = 0;
+      if (h < 60) {
+        r = c;
+        g = x
+      } else if (h < 120) {
+        r = x;
+        g = c
+      } else if (h < 180) {
+        g = c;
+        b = x
+      } else if (h < 240) {
+        g = x;
+        b = c
+      } else if (h < 300) {
+        r = x;
+        b = c
+      } else {
+        r = c;
+        b = x
+      }
+      var toHex = function(v) {
+        var n = Math.round((v + m) * 255);
+        n = Math.max(0, Math.min(255, n));
+        var s2 = n.toString(16);
+        return s2.length === 1 ? `0` + s2 : s2
+      };
+      return `#` + toHex(r) + toHex(g) + toHex(b)
+    }
+
+    function tonalFromHex(hex) {
+      var hsl = hexToHsl(hex);
+      var h = hsl.h;
+      return {
+        pri: hslToHex(h, 78, 85),
+        onPri: hslToHex(h, 42, 22),
+        priCon: hslToHex(h, 38, 35),
+        onPriCon: hslToHex(h, 62, 92)
+      }
+    }
+
+    var accentCurrentHex = ACCENT_DEFAULT_HEX;
+
+    function applyAccentColor(hex, persist) {
+      var t = tonalFromHex(hex);
+      var root = document.documentElement.style;
+      root.setProperty(`--pri`, t.pri);
+      root.setProperty(`--on-pri`, t.onPri);
+      root.setProperty(`--pri-con`, t.priCon);
+      root.setProperty(`--on-pri-con`, t.onPriCon);
+      accentCurrentHex = hex;
+      var customInput = document.getElementById(`accent-custom-input`);
+      if (customInput) customInput.value = hex;
+      buildAccentPresetGrid();
+      updateAccentCustomSel();
+      if (persist !== !1) {
+        try {
+          localStorage.setItem(`accentColor`, hex)
+        } catch (e) {}
+      }
+    }
+
+    function buildAccentPresetGrid() {
+      var g = document.getElementById(`accent-preset-grid`);
+      if (!g) return;
+      g.innerHTML = ``;
+      ACCENT_PRESETS.forEach(function(hex) {
+        var t = tonalFromHex(hex);
+        var isSel = accentCurrentHex.toLowerCase() === hex.toLowerCase();
+        var d = document.createElement(`div`);
+        d.className = `accent-swatch` + (isSel ? ` sel` : ``);
+        d.style.background = t.pri;
+        d.style.color = t.onPri;
+        d.onclick = function() {
+          applyAccentColor(hex)
+        };
+        if (isSel) d.innerHTML = ACCENT_CHECK_SVG;
+        g.appendChild(d)
+      })
+    }
+
+    function updateAccentCustomSel() {
+      var wrap = document.getElementById(`accent-custom-swatch-wrap`);
+      var chk = document.getElementById(`accent-custom-check`);
+      if (!wrap) return;
+      var isCustom = !ACCENT_PRESETS.some(function(h) {
+        return h.toLowerCase() === accentCurrentHex.toLowerCase()
+      });
+      wrap.classList.toggle(`sel`, isCustom);
+      if (chk) {
+        var t = tonalFromHex(accentCurrentHex);
+        chk.style.color = t.onPri;
+        chk.innerHTML = isCustom ? ACCENT_CHECK_SVG : ``
+      }
+    }
+
+    function onAccentCustomPick(hex) {
+      applyAccentColor(hex)
+    }
+
+    function resetAccentColor() {
+      applyAccentColor(ACCENT_DEFAULT_HEX)
+    }
+
+    function loadAccentColor() {
+      var saved = null;
+      try {
+        saved = localStorage.getItem(`accentColor`)
+      } catch (e) {}
+      applyAccentColor(saved || ACCENT_DEFAULT_HEX, !1)
+    }
+
+    var darkModeOn = !0;
+
+    function applyDarkMode(on, persist) {
+      darkModeOn = on;
+      document.body.classList.toggle(`light`, !on);
+      var cb = document.getElementById(`dark-mode-cb`);
+      if (cb) cb.checked = on;
+      if (persist !== !1) {
+        try {
+          localStorage.setItem(`darkMode`, on ? `1` : `0`)
+        } catch (e) {}
+      }
+    }
+
+    function toggleDarkMode() {
+      applyDarkMode(!darkModeOn)
+    }
+
+    function loadDarkMode() {
+      var saved = null;
+      try {
+        saved = localStorage.getItem(`darkMode`)
+      } catch (e) {}
+      applyDarkMode(saved === null ? !0 : saved === `1`, !1)
+    }
+
     function go(id) {
+      if (id === `s-accent-color`) {
+        var customInput = document.getElementById(`accent-custom-input`);
+        if (customInput) customInput.value = accentCurrentHex;
+        buildAccentPresetGrid();
+        updateAccentCustomSel()
+      }
       if (id === `s-bright`) {
         var sl = document.getElementById(`bright-slider`);
         if (sl) sl.value = brightLevel;
@@ -6918,7 +7474,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       var d = document.createElement(`div`);
       d.className = `li` + (isCur ? ` cur-net` : ``);
       d.dataset.ssid = n.ssid;
-      d.innerHTML = `<div class="lic lc-pur">` + wifiSvg + `</div><div class="li-body"><div class="li-head" style="` + (isCur ? `color:var(--pri)` : ``) + `">` + n.ssid + `</div><div class="li-sub">` + authTxt + `</div></div><div class="li-trail">` + lockSvg + `</div>`;
+      d.innerHTML = `<div class="lic lc-pur">` + wifiSvg + `</div><div class="li-body"><div class="li-head" style="` + (isCur ? `color:var(--pri-txt)` : ``) + `">` + n.ssid + `</div><div class="li-sub">` + authTxt + `</div></div><div class="li-trail">` + lockSvg + `</div>`;
       d.onclick = function() {
         if (isCur) {
           openDisconDialog(n.ssid);
@@ -6962,7 +7518,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           var bars = rssi2b(n.rssi);
           existing.querySelector(`.lic`).innerHTML = wifiSvgForBars(bars);
           var head = existing.querySelector(`.li-head`);
-          if (head) head.style.color = isCur ? `var(--pri)` : ``;
+          if (head) head.style.color = isCur ? `var(--pri-txt)` : ``;
           var newParent = nl;
           var items = newParent.querySelectorAll(`.li[data-ssid]`);
           if (items[i] && items[i] !== existing) {
@@ -9343,6 +9899,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
     bindDimScheduleInputs();
     window.onload = function() {
+      loadDarkMode();
+      loadAccentColor();
       fetch(`/whoami`).then(function(r) {
         if (r.status === 401) {
           window.location.href = `/`;

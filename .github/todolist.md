@@ -21,17 +21,17 @@ Welcome to my todo list
 
 ~~10. Add to touch actions on touch show ip adress~~
 
-11. Smart House integration
+11. Smart House integration (Shittest Software ever) *Delayed
 
 12. Help Manager
 
-13. Limbă intrefata : Engleză Si Romana
+! 13. Limbă intrefata : Engleză Si Romana
 
-14. Reset & Restore & backup functions in about
+! 14. Reset & Restore & backup functions in about
 
 15. Tile manager Custom Fonts
 
-16. Custom accent color
+~~16. Custom accent color~~
 
 17. Scrolling freeze bugs
 
@@ -41,7 +41,7 @@ Welcome to my todo list
 
 20. AP set time witout  and date witout internet conexion
 
-21. UAC redesign
+~~21. UAC redesign~~
 
 ~~22. Fix Now Playing number font~~
 

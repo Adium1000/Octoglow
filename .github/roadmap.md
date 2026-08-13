@@ -78,3 +78,52 @@ Gave the old UAC (login/setup screen) a visual refresh to make it feel more mode
 
 ## Fixed NowPlaying numeric font
 Noticed that the NowPlaying tile was rendering its numbers with a different font than every other tile in the UI, which made it stand out in a bad way. Tracked it down and fixed it so NowPlaying now uses the same numeric font as the rest of the tiles, keeping everything visually consistent.
+
+# 6. Accent Color + 15 New Buzzer tones 
+
+# Accent Color
+
+Now you can change the accent color of the dashboard from the default pink up to any color, (except white and black because they are not colors and they will broke the dashboard) Also there are some prests that I find them looking cool and also an option to custum hex , and restore
+
+And added light mode, if you'd like to use your monitor as a flashlight
+
+# Buzzer Tones
+
+Added a few new buzzer tones, they are pretty basic
+Here Is the full list of buzzer tones 
+
+- Calm
+- Loud
+- Urgent
+- Soft
+- Double Beep
+- Triple Beep
+- Chime
+- Bell
+- Doorbell
+- Xylophone
+- Harp Glissando
+- Marimba
+- Crystal Sparkle
+- Gentle Wave
+- Lullaby
+- Ping Pong
+- SOS
+- Siren
+- Klaxon
+- Klaxon
+- Laser Zap
+- Robot Blips
+- Fanfare 
+- Power Down
+- Power Up
+- Heartbeat
+- Sci-Fi
+- Arcade
+- Zen Gong
+- Bubbles
+- Whistle
+- Bold Alert
+
+
+![dd](roadmaps/roadmap4.png)
