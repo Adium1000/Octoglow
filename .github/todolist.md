@@ -1,7 +1,7 @@
 Welcome to my todo list
 
 
-1. UAC fix, sa nu fie necesar sa ne logam de fiecare data cand moare ceasul
+~~1. UAC fix, sa nu fie necesar sa ne logam de fiecare data cand moare ceasul~~ 
 
 ~~2 Fix icoana de luminozitate~~(2.8.26)
 
@@ -21,19 +21,19 @@ Welcome to my todo list
 
 ~~10. Add to touch actions on touch show ip adress~~
 
-11. Smart House integration (Shittest Software ever) *Delayed
+~~11. Smart House integration~~ (Bullshit, after reading some docs it is not worth it)
 
-12. Help Manager
+~~12. Help Manager~~
 
-! 13. Limbă intrefata : Engleză Si Romana
+ 13. Limbă intrefata : Engleză Si Romana
 
-! 14. Reset & Restore & backup functions in about
+ 14. Reset & Restore & backup functions in about
 
-15. Tile manager Custom Fonts
+ 15. Tile manager Custom Fonts
 
 ~~16. Custom accent color~~
 
-17. Scrolling freeze bugs
+~~17. Scrolling freeze bugs~~
 
 18. AP scrolling Ip adress
 
@@ -45,6 +45,24 @@ Welcome to my todo list
 
 ~~22. Fix Now Playing number font~~
 
-23. Looking for something else
+~~23. Looking for something else!~~
 
 ~~24. Login page redesign~~
+
+~~25. Notification tile font issue~~
+
+~~26. IP adress Scroling font issue~~
+
+~~27. Data formatting DD/MM/YYY~~
+
+~~28.Design Flow in tile manager settings~~
+
+Revnote
+
+This is NOT a Hardware project, this is a firmware intended for a hardware project, so you should not care about the following elements 
+
+BOM
+Schematics
+and Cad files
+
+This are not what i did track here on macondo (Psh anyway some of you don t even know how to read so this will be ignored 99% of the times )

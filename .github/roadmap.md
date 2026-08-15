@@ -127,3 +127,15 @@ Here Is the full list of buzzer tones
 
 
 ![dd](roadmaps/roadmap4.png)
+
+
+7.
+Notification tile font issue
+IP adress Scroling font issue
+Connection Issue Popup
+No ReLogin cache issue
+Locking for something else
+Scrolling freeze bugs
+Help Manager
+Data formatting DD/MM/YYY
+Design Flow in tile manager settings

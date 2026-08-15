@@ -20,6 +20,7 @@
 #include <Update.h>
 #include <StreamString.h>
 #include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 
 // FIRMWARE VERSION
 #define FW_VERSION "0.3"
@@ -378,53 +379,13 @@ static char authUser[33]       = "";
 static char authPassHash[65]   = "";
 static bool authConfigured     = false;
 
-#define MAX_SESSIONS 4
-static char sessionTokens[MAX_SESSIONS][33];
-static uint8_t sessionCount = 0;
+// Cat timp ramane valabil cookie-ul de sesiune (secunde). 30 zile.
+#define SESSION_TTL_SECONDS (30UL * 24UL * 3600UL)
+// Prag folosit ca sa stim daca ceasul (NTP) e deja sincronizat la bord.
+// (orice data reala de dupa 2023 e mai mare decat asta; time(nullptr) inainte
+// de sincronizare NTP intoarce valori foarte mici, aproape de epoch 0)
+#define TIME_LOOKS_VALID(t) ((t) > 1700000000UL)
 
-static void initSessionPool() {
-  for (int i = 0; i < MAX_SESSIONS; i++) sessionTokens[i][0] = '\0';
-  sessionCount = 0;
-}
-
-static void addSession(const char* tok) {
-  if (sessionCount < MAX_SESSIONS) {
-    strncpy(sessionTokens[sessionCount], tok, 32);
-    sessionTokens[sessionCount][32] = '\0';
-    sessionCount++;
-  } else {
-
-    for (int i = 0; i < MAX_SESSIONS - 1; i++) {
-      strncpy(sessionTokens[i], sessionTokens[i + 1], 32);
-      sessionTokens[i][32] = '\0';
-    }
-    strncpy(sessionTokens[MAX_SESSIONS - 1], tok, 32);
-    sessionTokens[MAX_SESSIONS - 1][32] = '\0';
-  }
-}
-static void removeSession(const char* tok) {
-  for (int i = 0; i < MAX_SESSIONS; i++) {
-    if (strncmp(sessionTokens[i], tok, 32) == 0) {
-
-      for (int j = i; j < MAX_SESSIONS - 1; j++) {
-        strncpy(sessionTokens[j], sessionTokens[j + 1], 32);
-        sessionTokens[j][32] = '\0';
-      }
-      sessionTokens[MAX_SESSIONS - 1][0] = '\0';
-      if (sessionCount > 0) sessionCount--;
-      return;
-    }
-  }
-}
-
-static bool isValidSession(const char* tok) {
-  if (tok == nullptr || tok[0] == '\0') return false;
-  for (int i = 0; i < MAX_SESSIONS; i++) {
-    if (sessionTokens[i][0] != '\0' && strncmp(sessionTokens[i], tok, 32) == 0)
-      return true;
-  }
-  return false;
-}
 static void sha256hex(const char* input, char outHex[65]) {
   uint8_t digest[32];
   mbedtls_sha256_context ctx;
@@ -437,12 +398,90 @@ static void sha256hex(const char* input, char outHex[65]) {
   outHex[64] = '\0';
 }
 
-static void genToken(char out[33]) {
-  for (int i = 0; i < 16; i++) {
-    uint8_t b = (uint8_t)(esp_random() & 0xFF);
-    sprintf(out + i * 2, "%02x", b);
+// HMAC-SHA256(payload) folosind authPassHash-ul curent ca si cheie.
+// Nu se stocheaza nimic in plus pe ESP - cheia e deja cea salvata la login.
+static void hmacHex(const char* payload, char outHex[65]) {
+  uint8_t digest[32];
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, info, 1 /* HMAC */);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)authPassHash, strlen(authPassHash));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char*)payload, strlen(payload));
+  mbedtls_md_hmac_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(outHex + i * 2, "%02x", digest[i]);
+  outHex[64] = '\0';
+}
+
+// Comparatie in timp constant, ca sa nu scurgem informatie prin timing.
+static bool constTimeEq(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  if (la != lb) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < la; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+static void userToHex(const char* user, char* out) {
+  size_t n = strlen(user);
+  for (size_t i = 0; i < n; i++) sprintf(out + i * 2, "%02x", (uint8_t)user[i]);
+  out[n * 2] = '\0';
+}
+
+// Construieste un token de sesiune STATELESS: userHex.expiry.hmac
+// ESP-ul nu retine nimic despre sesiuni active - orice token se poate
+// re-verifica oricand (inclusiv dupa un reboot) doar cu authPassHash-ul
+// curent, care e deja incarcat din NVS la boot in loadAuth().
+static String makeSessionToken(const char* user) {
+  char userHex[70];
+  userToHex(user, userHex);
+  time_t now = time(nullptr);
+  unsigned long expiry = (unsigned long)now + SESSION_TTL_SECONDS;
+  char payload[140];
+  snprintf(payload, sizeof(payload), "%s.%lu", userHex, expiry);
+  char sig[65];
+  hmacHex(payload, sig);
+  return String(payload) + "." + String(sig);
+}
+
+// Verifica un token din cookie fara nicio stare pe ESP.
+// Intoarce numele userului daca e valid, altfel sir gol.
+static String verifySessionToken(const String& tok) {
+  if (!authConfigured || tok.length() == 0) return "";
+
+  int d1 = tok.indexOf('.');
+  int d2 = (d1 < 0) ? -1 : tok.indexOf('.', d1 + 1);
+  if (d1 < 0 || d2 < 0) return "";
+
+  String userHex   = tok.substring(0, d1);
+  String expiryStr = tok.substring(d1 + 1, d2);
+  String sig        = tok.substring(d2 + 1);
+  if (userHex.length() == 0 || expiryStr.length() == 0 || sig.length() != 64) return "";
+
+  // Fara ceas real (NTP nesincronizat) nu putem verifica expirarea in siguranta.
+  time_t now = time(nullptr);
+  if (!TIME_LOOKS_VALID(now)) return "";
+
+  unsigned long expiry = strtoul(expiryStr.c_str(), nullptr, 10);
+  if ((unsigned long)now > expiry) return "";
+
+  char payload[140];
+  snprintf(payload, sizeof(payload), "%s.%s", userHex.c_str(), expiryStr.c_str());
+  char expectedSig[65];
+  hmacHex(payload, expectedSig);
+  if (!constTimeEq(sig.c_str(), expectedSig)) return "";
+
+  // Decodifica userHex -> text si confirma ca e chiar contul configurat acum
+  // (daca userul/parola s-au schimbat intre timp, cheia HMAC s-a schimbat si
+  // deja am fi picat mai sus la verificarea semnaturii - asta e doar un dublu-check).
+  String user;
+  for (int i = 0; i + 1 < (int)userHex.length(); i += 2) {
+    char byteStr[3] = { userHex[i], userHex[i + 1], 0 };
+    user += (char)strtol(byteStr, nullptr, 16);
   }
-  out[32] = '\0';
+  if (user != String(authUser)) return "";
+  return user;
 }
 
 // AP CONFIG 
@@ -497,11 +536,9 @@ static String extractCookieToken() {
 }
 
 static String getTokenUser() {
-  if (sessionCount == 0) return "";
   String tok = extractCookieToken();
   if (tok.length() == 0) return "";
-  if (isValidSession(tok.c_str())) return String(authUser);
-  return "";
+  return verifySessionToken(tok);
 }
 
 bool checkAuth() {
@@ -708,7 +745,7 @@ void timerCheckExpiry() {
     timerFinished = true;
     timerBlinkOn = true;
     timerBlinkLastMs = millis();
-    playPresetTone(eventSoundTimer);
+    nbPlayPreset(eventSoundTimer);
   }
 }
 
@@ -874,6 +911,8 @@ uint8_t  tempUnit              = 0;
 uint8_t  hourFormat            = 0;
 
 uint8_t  dateFormat            = 2;
+uint8_t  dateLang              = 0;  // 0 = English, 1 = Romanian (used only by dateFormat 4 "Mon 11")
+char     customDateFmt[24]     = "DD/MM/YYYY";  // used only by dateFormat 5 (custom)
 
 enum NpState {
   NP_SHOW_START,
@@ -928,6 +967,7 @@ char          eventSoundWifi[16]  = "urgent";
 char          eventSoundNotif[16] = "soft";
 char          eventSoundEts2[16]  = "urgent";
 char          eventSoundTouch[16] = "soft";
+char          accentColor[8]      = "#d0bcff";
 #define ETS2_SPEED_LIMIT 130
 bool          ets2SpeedAlertFired = false;
 bool          wifiWasConnected    = true;
@@ -1177,7 +1217,7 @@ void playPresetTone(const char* id) {
 }
 void beepSwitch() {
   if (!buzzerOn) return;
-  playPresetTone(eventSoundTile);
+  nbPlayPreset(eventSoundTile);
 }
 
 void beepTouch() {
@@ -1211,6 +1251,9 @@ static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch) {
     if (count < maxCount) buf[count++] = 0x00;
   } else if (ch == ':') {
     for (int i = 0; i < 2 && count < maxCount; i++) buf[count++] = CHAR_COLON[i];
+    if (count < maxCount) buf[count++] = 0x00;
+  } else if (ch == '.') {
+    if (count < maxCount) buf[count++] = CHAR_DOT[0];
     if (count < maxCount) buf[count++] = 0x00;
   } else {
     uint8_t tmp[8];
@@ -1773,41 +1816,82 @@ static bool currencyFetchOne(const char* base, const char* quote, const char* da
   return ok;
 }
 
-void currencyFetch() {
+// --- Non-blocking currency fetch ---------------------------------------
+// Same problem as weatherFetch(), only worse: this ran up to TWO blocking
+// HTTP requests back to back (currencyFetchOne has an 8s timeout each,
+// see above), which could freeze the whole display for up to ~16 seconds
+// right in the middle of loop(). Moved to a background task for the same
+// reasons as weatherFetch().
+static TaskHandle_t  currencyFetchTaskHandle = nullptr;
+static volatile bool currencyFetchBusy       = false;
+static volatile bool currencyFetchReady      = false;
+static volatile bool currFetchOk             = false;
+static float         currFetchRateNow;
+static float         currFetchRateMonthAgo;
+static bool          currFetchHaveMonthAgo;
+static int8_t        currFetchTrend;
+
+static void currencyFetchTask(void* pv) {
+  bool ok = false;
+  currFetchHaveMonthAgo = false;
 
   const char* refQuote = currencyCompareEnabled ? currencyQuote
                         : (strcasecmp(currencyBase, "EUR") == 0 ? "USD" : "EUR");
 
   struct tm ti;
-  if (!getLocalTime(&ti)) { return; }
+  if (getLocalTime(&ti)) {
+    time_t nowEpoch = mktime(&ti);
+    time_t monthAgoEpoch = nowEpoch - (30L * 24L * 60L * 60L);
+    struct tm* tiMonthAgo = gmtime(&monthAgoEpoch);
+    char monthAgoStr[11];
+    snprintf(monthAgoStr, sizeof(monthAgoStr), "%04d-%02d-%02d",
+             tiMonthAgo->tm_year + 1900, tiMonthAgo->tm_mon + 1, tiMonthAgo->tm_mday);
 
-  char todayStr[11];
-  snprintf(todayStr, sizeof(todayStr), "%04d-%02d-%02d", ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+    float rNow = NAN, rOld = NAN;
+    bool okNow = currencyFetchOne(currencyBase, refQuote, "latest", rNow);
+    bool okOld = okNow && currencyFetchOne(currencyBase, refQuote, monthAgoStr, rOld);
 
-  time_t nowEpoch = mktime(&ti);
-  time_t monthAgoEpoch = nowEpoch - (30L * 24L * 60L * 60L);
-  struct tm* tiMonthAgo = gmtime(&monthAgoEpoch);
-  char monthAgoStr[11];
-  snprintf(monthAgoStr, sizeof(monthAgoStr), "%04d-%02d-%02d",
-           tiMonthAgo->tm_year + 1900, tiMonthAgo->tm_mon + 1, tiMonthAgo->tm_mday);
-
-  float rNow = NAN, rOld = NAN;
-  bool okNow = currencyFetchOne(currencyBase, refQuote, "latest", rNow);
-  bool okOld = okNow && currencyFetchOne(currencyBase, refQuote, monthAgoStr, rOld);
-
-  if (okNow) {
-    currencyRateNow = rNow;
-    currencyValid   = true;
-    if (okOld && rOld > 0) {
-      currencyRateMonthAgo = rOld;
-      float pctDiff = (rNow - rOld) / rOld * 100.0f;
-      if (pctDiff >= CURRENCY_TREND_THRESH_PCT)       currencyTrend = 1;
-      else if (pctDiff <= -CURRENCY_TREND_THRESH_PCT) currencyTrend = -1;
-      else                                            currencyTrend = 0;
+    if (okNow) {
+      currFetchRateNow = rNow;
+      ok = true;
+      if (okOld && rOld > 0) {
+        currFetchRateMonthAgo = rOld;
+        currFetchHaveMonthAgo = true;
+        float pctDiff = (rNow - rOld) / rOld * 100.0f;
+        if (pctDiff >= CURRENCY_TREND_THRESH_PCT)       currFetchTrend = 1;
+        else if (pctDiff <= -CURRENCY_TREND_THRESH_PCT) currFetchTrend = -1;
+        else                                            currFetchTrend = 0;
+      }
     }
   }
-  lastCurrencyFetch = millis();
-  (void)todayStr;
+
+  currFetchOk          = ok;
+  currencyFetchReady    = true;
+  currencyFetchBusy     = false;
+  vTaskDelete(nullptr);
+}
+
+void currencyFetch() {
+  if (currencyFetchBusy) return; // a fetch is already in flight
+
+  lastCurrencyFetch  = millis(); // stamp now so loop() doesn't re-trigger every iteration
+  currencyFetchBusy  = true;
+  currencyFetchReady = false;
+  xTaskCreatePinnedToCore(currencyFetchTask, "currFetch", 8192, nullptr, 1, &currencyFetchTaskHandle, 0);
+}
+
+// Call from loop(); cheap check, only does work once a fetch has completed.
+static void currencyFetchPoll() {
+  if (!currencyFetchReady) return;
+  currencyFetchReady = false;
+  if (currFetchOk) {
+    currencyRateNow = currFetchRateNow;
+    currencyValid   = true;
+    if (currFetchHaveMonthAgo) {
+      currencyRateMonthAgo = currFetchRateMonthAgo;
+      currencyTrend        = currFetchTrend;
+    }
+  }
 }
 
 // ETS2 SPEED DISPLAY
@@ -1909,7 +1993,119 @@ static void dateAddNumber(int value, int digits) {
   }
 }
 
-void dateBuildBuffer(int day, int month, int year) {
+const char* const WEEKDAY_NAMES_EN[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const char* const WEEKDAY_NAMES_RO[7] = { "Dum", "Lun", "Mar", "Mie", "Joi", "Vin", "Sam" };
+
+static void dateAddChar(char ch) {
+  if (ch >= '0' && ch <= '9') {
+    dateAddGlyph(FONT[ch - '0']);
+  } else {
+    uint8_t tmp[8];
+    uint8_t n = mx.getChar(ch, sizeof(tmp), tmp);
+    if (n == 0) return;
+    for (int i = 0; i < n && dateColCount < 126; i++) dateColBuf[dateColCount++] = tmp[i];
+    if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
+  }
+}
+
+static void dateAddText(const char* s) {
+  for (int i = 0; s[i] != '\0'; i++) dateAddChar(s[i]);
+}
+
+const char* const WEEKDAY_FULL_EN[7] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+const char* const WEEKDAY_FULL_RO[7] = { "Duminica", "Luni", "Marti", "Miercuri", "Joi", "Vineri", "Sambata" };
+
+// Validates a custom date format pattern made of Y/M/D/W runs and literal '/' characters.
+// Rules: Y run must be exactly 2 or 4 chars; M and D runs must be exactly 2 chars;
+// W runs accept any length; any other character is invalid.
+static bool isDateFmtLiteralChar(char c) {
+  return c == '/' || c == '.' || c == '(' || c == ')' || c == ' ';
+}
+
+static bool dateValidateCustomFormat(const char* pattern, String* errOut = nullptr) {
+  int len = strlen(pattern);
+  if (len == 0 || len > 20) {
+    if (errOut) *errOut = "Format invalid";
+    return false;
+  }
+  bool hasContent = false;
+  int i = 0;
+  while (i < len) {
+    char c = toupper(pattern[i]);
+    if (c != 'Y' && c != 'M' && c != 'D' && c != 'W' && !isDateFmtLiteralChar(pattern[i])) {
+      if (errOut) *errOut = "Caracter invalid";
+      return false;
+    }
+    int j = i;
+    while (j < len && toupper(pattern[j]) == c) j++;
+    int count = j - i;
+    if (c == 'Y') {
+      hasContent = true;
+      if (count != 2 && count != 4) {
+        if (errOut) *errOut = "Y trebuie sa fie YY sau YYYY";
+        return false;
+      }
+    } else if (c == 'M') {
+      hasContent = true;
+      if (count != 2) {
+        if (errOut) *errOut = "M trebuie sa fie MM";
+        return false;
+      }
+    } else if (c == 'D') {
+      hasContent = true;
+      if (count != 2) {
+        if (errOut) *errOut = "D trebuie sa fie DD";
+        return false;
+      }
+    } else if (c == 'W') {
+      hasContent = true;
+    }
+    i = j;
+  }
+  if (!hasContent) {
+    if (errOut) *errOut = "Formatul trebuie sa contina cel putin Y, M, D sau W";
+    return false;
+  }
+  return true;
+}
+
+// Renders a validated custom pattern into the date scroll buffer.
+static void dateRenderCustom(const char* pattern, int day, int month, int year, int wday) {
+  int len = strlen(pattern);
+  int i = 0;
+  if (wday < 0 || wday > 6) wday = 0;
+  while (i < len) {
+    char c = toupper(pattern[i]);
+    int j = i;
+    while (j < len && toupper(pattern[j]) == c) j++;
+    int count = j - i;
+    if (c == 'Y') {
+      if (count == 2) dateAddNumber(year % 100, 2);
+      else dateAddNumber(year, 4);
+    } else if (c == 'M') {
+      dateAddNumber(month, 2);
+    } else if (c == 'D') {
+      dateAddNumber(day, 2);
+    } else if (c == 'W') {
+      const char* full = (dateLang == 1) ? WEEKDAY_FULL_RO[wday] : WEEKDAY_FULL_EN[wday];
+      int flen = strlen(full);
+      if (count >= flen) {
+        dateAddText(full);
+      } else {
+        char buf[16];
+        int n = (count < (int)sizeof(buf) - 1) ? count : (int)sizeof(buf) - 1;
+        memcpy(buf, full, n);
+        buf[n] = '\0';
+        dateAddText(buf);
+      }
+    } else if (isDateFmtLiteralChar(pattern[i])) {
+      for (int k = 0; k < count; k++) dateAddChar(pattern[i + k]);
+    }
+    i = j;
+  }
+}
+
+void dateBuildBuffer(int day, int month, int year, int wday) {
   dateColCount = 0;
   if (scrollIconInBuffer(scrollTypeDate) && !hideIconDate) {
     scrollBufPrependIcon(dateColBuf, dateColCount, 127, dateIcon, DATE_ICON_COLS);
@@ -1935,6 +2131,17 @@ void dateBuildBuffer(int day, int month, int year) {
       dateAddNumber(day, 2);
       dateAddDot();
       dateAddNumber(month, 2);
+      break;
+    case 4: {
+      if (wday < 0 || wday > 6) wday = 0;
+      const char* const* names = (dateLang == 1) ? WEEKDAY_NAMES_RO : WEEKDAY_NAMES_EN;
+      dateAddText(names[wday]);
+      dateAddChar(' ');
+      dateAddNumber(day, 2);
+      break;
+    }
+    case 5:
+      dateRenderCustom(customDateFmt, day, month, year, wday);
       break;
     default:
       dateAddNumber(day, 2);
@@ -1981,12 +2188,13 @@ void dateInit() {
   int day   = ti.tm_mday;
   int month = ti.tm_mon + 1;
   int year  = ti.tm_year + 1900;
+  int wday  = ti.tm_wday;
 
   mx.update(MD_MAX72XX::OFF);
   for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
   mxCommit();
 
-  dateBuildBuffer(day, month, year);
+  dateBuildBuffer(day, month, year, wday);
   int dateEffTextCols = (hideIconDate || scrollIconInBuffer(scrollTypeDate)) ? 32 : DATE_TEXT_COLS;
   dateNeedsScroll = (dateColCount > dateEffTextCols);
 
@@ -2469,12 +2677,7 @@ void notifBuildBuffer() {
     scrollBufPrependIcon(notifColBuf, notifColCount, 512, notifIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && notifColCount < 500; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(cleanBuf[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && notifColCount < 512; i++)
-      notifColBuf[notifColCount++] = tmp[i];
-    if (notifColCount < 512) notifColBuf[notifColCount++] = 0x00;
+    appendGlyphAuto(notifColBuf, notifColCount, 512, cleanBuf[ci]);
   }
   if (notifColCount > 0) notifColCount--;
 }
@@ -3028,12 +3231,7 @@ void ipBuildBuffer() {
     scrollBufPrependIcon(ipColBuf, ipColCount, 128, ipIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && ipColCount < 120; ci++) {
-    uint8_t tmp[8];
-    uint8_t n = mx.getChar(cleanBuf[ci], sizeof(tmp), tmp);
-    if (n == 0) continue;
-    for (int i = 0; i < n && ipColCount < 128; i++)
-      ipColBuf[ipColCount++] = tmp[i];
-    if (ipColCount < 128) ipColBuf[ipColCount++] = 0x00;
+    appendGlyphAuto(ipColBuf, ipColCount, 128, cleanBuf[ci]);
   }
   if (ipColCount > 0) ipColCount--;
 }
@@ -3520,38 +3718,86 @@ void weatherInit() {
   wxState = NP_PAUSE_BEFORE_RIGHT;
   wxPauseStartMs = millis();
 }
+// --- Non-blocking weather fetch --------------------------------------
+// The HTTP request used to run directly inside loop(), which stalled the
+// whole matrix (including any scroll in progress) for up to 5s (the
+// http.setTimeout value) every WEATHER_FETCH_INTERVAL_MS. That is what
+// caused tiles to randomly freeze mid-scroll and then resume where they
+// left off. The actual network call now runs on its own FreeRTOS task
+// (pinned to core 0) so loop() / the matrix refresh is never blocked.
+// Results are staged in wxFetch* variables and only copied into the
+// "live" weather* variables from loop() (same thread that reads them
+// for drawing), so there is no risk of tearing a struct mid-read.
+static TaskHandle_t  weatherFetchTaskHandle = nullptr;
+static volatile bool weatherFetchBusy       = false;
+static volatile bool weatherFetchReady      = false;
+static volatile bool wxFetchOk              = false;
+static float         wxFetchTempC;
+static int           wxFetchHumidity;
+static char          wxFetchDesc[sizeof(weatherDesc)];
+static char          wxFetchCondition[sizeof(weatherCondition)];
+
+static void weatherFetchTask(void* pv) {
+  bool ok = false;
+  if (strlen(weatherApiKey) > 0 && WiFi.status() == WL_CONNECTED) {
+    char url[256];
+    snprintf(url, sizeof(url),
+      "http://api.openweathermap.org/data/2.5/weather?lat=%.4f&lon=%.4f&appid=%s&units=metric&lang=%s",
+      weatherLat, weatherLon, weatherApiKey, weatherLang);
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(5000);
+    int code = http.GET();
+    if (code == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<1024> doc;
+      DeserializationError err = deserializeJson(doc, payload);
+      if (!err) {
+        wxFetchTempC    = doc["main"]["temp"] | -999.0f;
+        wxFetchHumidity = doc["main"]["humidity"] | -1;
+        const char* desc = doc["weather"][0]["description"] | "";
+        strncpy(wxFetchDesc, desc, sizeof(wxFetchDesc) - 1);
+        wxFetchDesc[sizeof(wxFetchDesc)-1] = '\0';
+        if (wxFetchDesc[0] >= 'a' && wxFetchDesc[0] <= 'z') wxFetchDesc[0] -= 32;
+
+        const char* cond = doc["weather"][0]["main"] | "";
+        strncpy(wxFetchCondition, cond, sizeof(wxFetchCondition) - 1);
+        wxFetchCondition[sizeof(wxFetchCondition)-1] = '\0';
+        ok = true;
+      }
+    }
+    http.end();
+  }
+  wxFetchOk         = ok;
+  weatherFetchReady = true;
+  weatherFetchBusy  = false;
+  vTaskDelete(nullptr);
+}
+
 void weatherFetch() {
   if (strlen(weatherApiKey) == 0) return;
   if (WiFi.status() != WL_CONNECTED) return;
-  char url[256];
-  snprintf(url, sizeof(url),
-    "http://api.openweathermap.org/data/2.5/weather?lat=%.4f&lon=%.4f&appid=%s&units=metric&lang=%s",
-    weatherLat, weatherLon, weatherApiKey, weatherLang);
-  HTTPClient http;
-  http.begin(url);
-  http.setTimeout(5000);
-  int code = http.GET();
-  if (code == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (!err) {
-      weatherTempC   = doc["main"]["temp"] | -999.0f;
-      weatherHumidity = doc["main"]["humidity"] | -1;
-      const char* desc = doc["weather"][0]["description"] | "";
-      strncpy(weatherDesc, desc, sizeof(weatherDesc) - 1);
-      weatherDesc[sizeof(weatherDesc)-1] = '\0';
+  if (weatherFetchBusy) return; // a fetch is already in flight
 
-      if (weatherDesc[0] >= 'a' && weatherDesc[0] <= 'z') weatherDesc[0] -= 32;
+  lastWeatherFetch  = millis(); // stamp now so loop() doesn't re-trigger every iteration
+  weatherFetchBusy  = true;
+  weatherFetchReady = false;
+  xTaskCreatePinnedToCore(weatherFetchTask, "wxFetch", 8192, nullptr, 1, &weatherFetchTaskHandle, 0);
+}
 
-      const char* cond = doc["weather"][0]["main"] | "";
-      strncpy(weatherCondition, cond, sizeof(weatherCondition) - 1);
-      weatherCondition[sizeof(weatherCondition)-1] = '\0';
-      weatherValid = true;
-    }
+// Call from loop(); cheap check, only does work once a fetch has completed.
+static void weatherFetchPoll() {
+  if (!weatherFetchReady) return;
+  weatherFetchReady = false;
+  if (wxFetchOk) {
+    weatherTempC    = wxFetchTempC;
+    weatherHumidity = wxFetchHumidity;
+    strncpy(weatherDesc, wxFetchDesc, sizeof(weatherDesc) - 1);
+    weatherDesc[sizeof(weatherDesc)-1] = '\0';
+    strncpy(weatherCondition, wxFetchCondition, sizeof(weatherCondition) - 1);
+    weatherCondition[sizeof(weatherCondition)-1] = '\0';
+    weatherValid = true;
   }
-  http.end();
-  lastWeatherFetch = millis();
 }
 
 // CYCLE HELPERS
@@ -4053,6 +4299,8 @@ void loadSettings() {
   if (strlen(eventSoundEts2) == 0) strcpy(eventSoundEts2, "urgent");
   prefs.getString("evSndTouch", eventSoundTouch, sizeof(eventSoundTouch));
   if (strlen(eventSoundTouch) == 0) strcpy(eventSoundTouch, "soft");
+  prefs.getString("accentColor", accentColor, sizeof(accentColor));
+  if (strlen(accentColor) == 0) strcpy(accentColor, "#d0bcff");
   touchTapAction       = prefs.getUChar("touchTap", 8);
   touchDoubleTapAction = prefs.getUChar("touchDbl", 0);
   npDisplayMode = prefs.getUChar("npmode", 0);
@@ -4060,6 +4308,8 @@ void loadSettings() {
   tempUnit      = prefs.getUChar("tempunit", 0);
   hourFormat    = prefs.getUChar("hourformat", 0);
   dateFormat    = prefs.getUChar("dateformat", 2);
+  dateLang      = prefs.getUChar("datelang", 0);
+  prefs.getString("dateCustFmt", customDateFmt, sizeof(customDateFmt));
   notifEnabled  = prefs.getBool("notifEn", true);
   ets2Enabled   = prefs.getBool("ets2En", true);
   ets2OrderFirst = prefs.getBool("ets2Ord", false);
@@ -4172,6 +4422,8 @@ void saveSettings() {
   prefs.putUChar("tempunit", tempUnit);
   prefs.putUChar("hourformat", hourFormat);
   prefs.putUChar("dateformat", dateFormat);
+  prefs.putUChar("datelang", dateLang);
+  prefs.putString("dateCustFmt", customDateFmt);
   prefs.putUChar("touchTap", touchTapAction);
   prefs.putUChar("touchDbl", touchDoubleTapAction);
   prefs.putBool("notifEn", notifEnabled);
@@ -4359,7 +4611,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   * {
     box-sizing: border-box;
     margin: 0;
-    padding: 0
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent
   }
 
   body {
@@ -4368,6 +4626,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     -webkit-font-smoothing: antialiased;
     min-height: 100vh;
     font-family: Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
     overflow-x: hidden
   }
 
@@ -4603,6 +4862,10 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     display: none
   }
 
+  .li.static.hoverable:hover {
+    background: color-mix(in srgb, var(--on-surf)6%, transparent)
+  }
+
   .lic {
     border-radius: 50%;
     flex-shrink: 0;
@@ -4637,6 +4900,98 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   .lc-grn {
     background: var(--pri-con);
     color: var(--pri)
+  }
+
+  .sugg-box {
+    border-radius: 20px;
+    padding: 10px 10px 8px;
+    background: color-mix(in srgb, var(--pri) 12%, var(--surf-high));
+    border: 1px solid color-mix(in srgb, var(--pri) 35%, transparent);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow: hidden
+  }
+
+  .sugg-box-pad {
+    padding-top: 20px;
+    margin-top: 12px
+  }
+
+  .sugg-box-ap .sugg-title {
+    margin-top: 6px
+  }
+
+  .sugg-title {
+    font-family: Google Sans, sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .8px;
+    text-transform: uppercase;
+    color: var(--pri);
+    opacity: .85;
+    padding: 0;
+    margin-top: -4px;
+    margin-bottom: 4px;
+    margin-left: 6px
+  }
+
+  .sugg-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0
+  }
+
+  .sugg-row {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 38px;
+    padding: 7px 8px;
+    border-radius: 0;
+    transition: background .12s
+  }
+
+  .sugg-rows .sugg-row:only-child {
+    border-radius: 12px
+  }
+
+  .sugg-rows .sugg-row:first-child:not(:only-child) {
+    border-radius: 12px 12px 0 0
+  }
+
+  .sugg-rows .sugg-row:last-child:not(:only-child) {
+    border-radius: 0 0 12px 12px
+  }
+
+  .sugg-row:hover {
+    background: color-mix(in srgb, var(--pri) 14%, transparent)
+  }
+
+  .sugg-row:active {
+    background: color-mix(in srgb, var(--pri) 22%, transparent)
+  }
+
+  .sugg-row-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    color: var(--pri);
+    opacity: .65
+  }
+
+  .sugg-row-icon svg {
+    width: 100%;
+    height: 100%
+  }
+
+  .sugg-row-text {
+    flex: 1;
+    font-family: Google Sans, sans-serif;
+    font-size: 13px;
+    color: var(--on-surf)
   }
 
   .li-body {
@@ -4858,6 +5213,30 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     background: var(--on-surf-var)
   }
 
+  #help-topic-body {
+    scrollbar-width: thin;
+    scrollbar-color: var(--outline-var) transparent;
+    margin: 0 -24px;
+    padding: 0 24px
+  }
+
+  #help-topic-body::-webkit-scrollbar {
+    width: 4px
+  }
+
+  #help-topic-body::-webkit-scrollbar-track {
+    background: transparent
+  }
+
+  #help-topic-body::-webkit-scrollbar-thumb {
+    background: var(--outline-var);
+    border-radius: 2px
+  }
+
+  #help-topic-body::-webkit-scrollbar-thumb:hover {
+    background: var(--on-surf-var)
+  }
+
   .wi {
     cursor: pointer;
     border-bottom: 1px solid var(--outline-var);
@@ -5052,7 +5431,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   .tile-sub {
     color: var(--on-surf-var);
     margin-top: 2px;
-    font-size: 13px
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%
   }
 
   .np-wrap {
@@ -5687,7 +6070,6 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     align-items: center;
     gap: 16px;
     padding: 14px 16px;
-    border-bottom: 1px solid var(--outline-var);
     transition: background .12s;
     position: relative
   }
@@ -5914,7 +6296,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div style="color:var(--on-surf-var);font-size:13px;margin-top:4px;letter-spacing:.3px">Firmware pentru ceas inteligent ESP32</div>
       <div class=sl style="width:100%;text-align:left;margin-top:24px">Info</div>
       <div class=card style="width:100%;text-align:left">
-        <div class="li static" style="border-bottom:none">
+        <div class="li static hoverable" style="border-bottom:none">
           <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.9 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.66-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z" />
             </svg></div>
@@ -5923,7 +6305,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
             <div class="li-sub ip-val" id=about-ip>-</div>
           </div>
         </div>
-        <div class="li static" style="border-bottom:none">
+        <div class="li static hoverable" style="border-bottom:none">
           <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M12 8a4 4 0 0 0-4 4 1 1 0 0 0 2 0 2 2 0 0 1 2-2 1 1 0 0 0 0-2zm0-6C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" />
             </svg></div>
@@ -5959,7 +6341,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
         </div>
-        <div class="li static" style="border-bottom:none">
+        <div class="li static hoverable" style="border-bottom:none">
           <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z" />
             </svg></div>
@@ -5971,10 +6353,22 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
             <div class=sw onclick=toggleDarkMode()><input type=checkbox id=dark-mode-cb checked><span class=sw-track></span><span class=sw-thumb></span></div>
           </div>
         </div>
+        <div onclick="go('s-help-manager')" class=li style="border-bottom:none">
+          <div class="lic lc-blu"><svg viewbox="0 -960 960 960" fill=currentColor height=20 width=20>
+              <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Help Manager</div>
+            <div class=li-sub>Ajutor pentru setari si conectare</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
       </div>
       <div class=sl style="width:100%;text-align:left">Software</div>
       <div class=card style="width:100%;text-align:left">
-        <div class="li static" style="border-bottom:none">
+        <div class="li static hoverable" style="border-bottom:none">
           <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
             </svg></div>
@@ -5997,6 +6391,69 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         </div>
       </div>
     </div>
+  </div>
+  <div class=screen id=s-help-manager>
+    <div class=top-bar><button onclick="go('s-about')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+        </svg></button>
+      <div class=bar-text>
+        <div class=bar-title>Help Manager</div>
+      </div>
+    </div>
+    <div class=content>
+      <div class=sl>Subiecte de ajutor</div>
+      <div class=card>
+        <div onclick="openHelpTopicDlg('sender')" class=li style="border-bottom:none">
+          <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Octoglow Sender</div>
+            <div class=li-sub>Cum trimiti continut catre ceas</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+        <div onclick="openHelpTopicDlg('ap')" class=li style="border-bottom:none">
+          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3a4.237 4.237 0 0 0-6 0zm-4-4l2 2a7.074 7.074 0 0 1 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>AP</div>
+            <div class=li-sub>Conectare prin modul Access Point</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+        <div onclick="openHelpTopicDlg('lang')" class=li style="border-bottom:none">
+          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Switch a Tile/Interface Language</div>
+            <div class=li-sub>Schimba limba tile-urilor sau a interfetei</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class=md-scrim id=help-topic-scrim onclick=closeHelpTopicDlg()></div>
+  <div class=md-dialog id=help-topic-dlg>
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
+          <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
+        </svg></div>
+      <div class=mdd-title id=help-topic-title>Subiect</div>
+    </div>
+    <div class=mdd-body>
+      <div id=help-topic-body style="color:var(--on-surf-var);font-size:13px;line-height:1.6;max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
+    </div>
+    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeHelpTopicDlg()>OK</button></div>
   </div>
   <div class=screen id=s-accent-color>
     <div class=top-bar><button onclick="go('s-about')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
@@ -6098,7 +6555,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         </div>
       </div>
       <div class=card>
-        <div class="li static">
+        <div class="li static hoverable">
           <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z" />
             </svg></div>
@@ -6194,7 +6651,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         </svg></button>
       <div class=bar-text>
         <div class=bar-title>Access Point</div>
-      </div><button class=bar-lead onclick=openDisconDialog() title="Comuta in modul AP" id=ap-switch-btn style=display:none><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
+      </div><button class=bar-lead onclick="openHelpTopicDlg('ap')" title="Ajutor AP"><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
+          <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
+        </svg></button><button class=bar-lead onclick=openDisconDialog() title="Comuta in modul AP" id=ap-switch-btn style=display:none><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
           <path d="M200-120q-33 0-56.5-23.5T120-200v-160q0-33 23.5-56.5T200-440h400v-160h80v160h80q33 0 56.5 23.5T840-360v160q0 33-23.5 56.5T760-120H200Zm0-80h560v-160H200v160Zm108.5-51.5Q320-263 320-280t-11.5-28.5Q297-320 280-320t-28.5 11.5Q240-297 240-280t11.5 28.5Q263-240 280-240t28.5-11.5Zm140 0Q460-263 460-280t-11.5-28.5Q437-320 420-320t-28.5 11.5Q380-297 380-280t11.5 28.5Q403-240 420-240t28.5-11.5Zm140 0Q600-263 600-280t-11.5-28.5Q577-320 560-320t-28.5 11.5Q520-297 520-280t11.5 28.5Q543-240 560-240t28.5-11.5ZM570-630l-58-58q26-24 58-38t70-14q38 0 70 14t58 38l-58 58q-14-14-31.5-22t-38.5-8q-21 0-38.5 8T570-630ZM470-730l-56-56q44-44 102-69t124-25q66 0 124 25t102 69l-56 56q-33-33-76.5-51.5T640-800q-50 0-93.5 18.5T470-730ZM200-200v-160 160Z" />
         </svg></button>
     </div>
@@ -6208,6 +6667,17 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
             </svg></button>
         </div>
         <div class=msg id=ap-msg></div><button class="mbtn mbtn-fill" style="width:100%;margin-top:16px" onclick=saveApSettings() id=ap-save-btn>Salveaza</button>
+      </div>
+      <div class="sugg-box sugg-box-ap">
+        <div class=sugg-title>Looking for something else?</div>
+        <div class=sugg-rows>
+          <div onclick="go('s-about')" class=sugg-row>
+            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
+                <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.9 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.66-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z" />
+              </svg></div>
+            <div class=sugg-row-text>See My IP Address</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -6308,6 +6778,23 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=card id=tgrid></div>
       <div class=sl>Priority Tiles</div>
       <div class=card id=pgrid></div>
+      <div class="sugg-box sugg-box-pad">
+        <div class=sugg-title>Looking for something else?</div>
+        <div class=sugg-rows>
+          <div onclick="go('s-buzzer')" class=sugg-row>
+            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
+                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+              </svg></div>
+            <div class=sugg-row-text>Buzzer Tones</div>
+          </div>
+          <div onclick="go('s-touch')" class=sugg-row>
+            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
+                <path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z" />
+              </svg></div>
+            <div class=sugg-row-text>Touch Sensor Actions</div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class=md-scrim id=sett-scrim onclick=closeSettingsDlg()></div>
     <div class=md-dialog id=sett-dlg>
@@ -6342,7 +6829,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     </div>
     <div class=mdd-body>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Ce sa afiseze pe ceas</div>
-      <div class=seg style="border-radius:12px;overflow:hidden"><button class="sb on" id=npMode0 onclick="setNpMode(0)">Artist + Titlu</button><button class=sb id=npMode1 onclick="setNpMode(1)">Artist</button><button class=sb id=npMode2 onclick="setNpMode(2)">Titlu</button></div>
+      <div class=card id=np-mode-list></div>
     </div>
     <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeNpSettingsDlg()>Gata</button></div>
   </div>
@@ -6356,7 +6843,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     </div>
     <div class=mdd-body>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Unitate de masura</div>
-      <div class=seg style="border-radius:12px;overflow:hidden"><button class="sb on" id=tempUnitC onclick="setTempUnit(0)">°C Celsius</button><button class=sb id=tempUnitF onclick="setTempUnit(1)">°F Fahrenheit</button></div>
+      <div class=card id=temp-unit-list></div>
       <div style="height:16px"></div>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
       <div class=dur-row><input type=range min=2 max=30 step=1 id=temp-dur-slider oninput="onTempDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=temp-dur-val>10s</span></div>
@@ -6373,7 +6860,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     </div>
     <div class=mdd-body>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Format afisare</div>
-      <div class=seg style="border-radius:12px;overflow:hidden"><button class="sb on" id=hourFmt24 onclick="setHourFormat(0)">24h (13:45)</button><button class=sb id=hourFmt12 onclick="setHourFormat(1)">12h (1:45)</button></div>
+      <div class=card id=hour-fmt-list></div>
       <div style="height:16px"></div>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
       <div class=dur-row><input type=range min=2 max=30 step=1 id=hour-dur-slider oninput="onHourDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=hour-dur-val>10s</span></div>
@@ -6389,16 +6876,36 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=mdd-title>Data</div>
     </div>
     <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Format afisare</div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <div class=seg style="border-radius:12px;overflow:hidden"><button class=sb id=dateFmt0 onclick="setDateFormat(0)">2026.06.18</button><button class=sb id=dateFmt1 onclick="setDateFormat(1)">26.06.18</button></div>
-        <div class=seg style="border-radius:12px;overflow:hidden"><button class="sb on" id=dateFmt2 onclick="setDateFormat(2)">18.06.2026</button><button class=sb id=dateFmt3 onclick="setDateFormat(3)">18.06</button></div>
-      </div>
+      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Format afisare</div>
+      <div class=card id=date-fmt-list></div>
       <div style="height:16px"></div>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
       <div class=dur-row><input type=range min=2 max=30 step=1 id=date-dur-slider oninput="onDateDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=date-dur-val>10s</span></div>
     </div>
     <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeDateSettingsDlg()>Gata</button></div>
+  </div>
+  <div class=md-scrim id=date-custom-scrim onclick=closeCustomDateFmtDlg()></div>
+  <div class=md-dialog id=date-custom-dlg style="max-width:420px">
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z" />
+        </svg></div>
+      <div class=mdd-title>Format Personalizat</div>
+    </div>
+    <div class=mdd-body>
+      <div class=mdd-tf-wrap><label class=mdd-label>Format (Y / M / D / W)</label><input class=mdd-input id=date-custom-in placeholder="ex: DD.MM.YYYY" autocomplete=off maxlength=20 oninput=onCustomDateFmtInput()></div>
+      <div id=date-custom-preview style="font-family:Google Sans,sans-serif;font-size:22px;color:var(--pri);text-align:center;padding:12px 0 4px;letter-spacing:1px;min-height:28px"></div>
+      <div class=msg id=date-custom-msg></div>
+      <div style="color:var(--on-surf-var);font-size:12px;line-height:1.7;padding-top:14px;margin-top:4px;border-top:1px solid var(--outline-var)">
+        <b>Y</b> = an &nbsp;(YY sau YYYY)<br>
+        <b>M</b> = luna &nbsp;(MM)<br>
+        <b>D</b> = zi &nbsp;(DD)<br>
+        <b>W</b> = zi saptamana &nbsp;(oricati, ex: W, WWW, WWWW...)<br>
+        <b>/ . ( ) spatiu</b> = separator<br>
+        <span style="opacity:.75">Exemple: DD/MM/YYYY &middot; DD.MM.YYYY &middot; (WWW) DD.MM &middot; WWWW</span>
+      </div>
+    </div>
+    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeCustomDateFmtDlg()>Anuleaza</button><button class="mbtn mbtn-fill" id=date-custom-save-btn onclick=saveCustomDateFmt()>Salveaza</button></div>
   </div>
   <div class=md-scrim id=memo-sett-scrim onclick=closeMemoSettingsDlg()></div>
   <div class=md-dialog id=memo-sett-dlg>
@@ -6531,7 +7038,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div id=wx-status style="color:var(--on-surf-var);font-size:13px;margin-top:10px;min-height:18px"></div>
       <div style="height:14px"></div>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Unitate temperatura</div>
-      <div class=seg style="border-radius:12px;overflow:hidden"><button class="sb" id=wxTempUnitC onclick="setWxTempUnit(0)">°C Celsius</button><button class=sb id=wxTempUnitF onclick="setWxTempUnit(1)">°F Fahrenheit</button></div>
+      <div class=card id=wx-unit-list></div>
     </div>
     <div id=wx-saving style="display:none;flex-direction:column;align-items:center;justify-content:center;padding:32px 24px 40px;gap:18px;transition:opacity .25s">
       <div style="width:40px;height:40px;border:3px solid var(--surf-var);border-top-color:var(--pri);border-radius:50%;animation:wx-spin .8s linear infinite"></div>
@@ -6602,7 +7109,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         <option value=RON>RON</option>
       </select>
       <div style="height:14px"></div>
-      <div class="li static" style="padding:0 0 4px">
+      <div class="li static" style="padding:0 0 4px;border-bottom:none">
         <div class=li-body>
           <div class=li-head>Enable Comparison</div>
           <div class=li-sub>Compara cu o a doua moneda</div>
@@ -6686,7 +7193,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=content>
       <div class=sl>Categorii</div>
       <div class=card>
-        <div onclick="openLangPicker()" class=li>
+        <div onclick="openLangPicker()" class=li style="border-bottom:none">
           <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z" />
             </svg></div>
@@ -6698,8 +7205,33 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
         </div>
+        <div onclick="openDateLangPicker(event)" class=li style="border-bottom:none">
+          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Date Language</div>
+            <div class=li-sub id=date-lang-sub>English (en)</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
       </div>
     </div>
+  </div>
+  <div class=md-scrim id=date-lang-scrim onclick=closeDateLangPicker()></div>
+  <div class=md-dialog id=date-lang-dlg style="max-width:400px">
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
+        </svg></div>
+      <div class=mdd-title>Limba Data</div>
+    </div>
+    <div class=mdd-body style="padding:0 24px 8px">
+      <div id=date-lang-list style="max-height:320px;overflow-y:auto;margin:0 -24px;border-top:1px solid var(--outline-var);scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
+    </div>
+    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDateLangPicker()>Anuleaza</button></div>
   </div>
   <div class=md-scrim id=lang-scrim onclick=closeLangPicker()></div>
   <div class=md-dialog id=lang-dlg style="max-width:400px">
@@ -6707,13 +7239,27 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
           <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
         </svg></div>
-      <div class=mdd-title>Alege Limba</div>
+      <div class=mdd-title>OpenWeatherMap Language</div>
     </div>
     <div class=mdd-body style="padding:0 24px 8px">
       <div class=mdd-tf-wrap style="margin-bottom:10px"><label class=mdd-label>Cauta limba</label><input class=mdd-input id=lang-search placeholder="ex: Romanian, English..." oninput=filterLangs()></div>
       <div id=lang-list style="max-height:320px;overflow-y:auto;margin:0 -24px;border-top:1px solid var(--outline-var);scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
     </div>
     <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeLangPicker()>Anuleaza</button></div>
+  </div>
+  <div class=md-scrim id=oor-scrim></div>
+  <div class=md-dialog id=oor-dlg>
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" height=24 width=24>
+          <path fill=currentColor d="M2 22h3v-3H2v3zm5 0h3v-8H7v8zm5 0h3v-13h-3v13z" />
+          <circle cx=18.5 cy=8.5 r=6 fill=var(--err-con) />
+          <text x=18.5 y=11.6 text-anchor=middle font-family="Google Sans,sans-serif" font-size=8.5 font-weight=700 fill=var(--err)>?</text>
+        </svg></div>
+      <div class=mdd-title>Octoglow is out of range</div>
+    </div>
+    <div class=mdd-body>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 0 20px 9px;color:var(--on-surf-var);font-size:14px;line-height:1.5"><span class=spin-ring style="flex-shrink:0;margin-right:0"></span>Your device is out of range or is not successfully connected. Reconnecting…</div>
+    </div>
   </div>
   <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
@@ -7103,6 +7649,49 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       if (state === `sw-newupdate`) document.getElementById(`sw-actions-newupdate`).style.display = `flex`
     }
 
+    var helpTopics = {
+      sender: {
+        title: `Octoglow Sender`,
+        body: `<p>Octoglow Sender is an app that makes your machine communicate with your Octoglow device by sending data over the internet to your Octoglow device.</p>` +
+          `<p>You can download Octoglow Sender directly from <a href="https://github.com/Adium1000/Octoglow" target="_blank" rel="noopener" style="color:var(--pri)">this repository</a>.</p>` +
+          `<p>For the following tiles you will need Octoglow Sender:</p>` +
+          `<ul style="margin:0;padding-left:18px">` +
+          `<li style="margin-bottom:8px"><b>Now Playing</b> detects the song currently playing on your machine (Spotify, browser, etc.) via the Windows Media Session and sends it every few seconds.</li>` +
+          `<li style="margin-bottom:8px"><b>Windows Notifications</b> listens for toast notifications on Windows and forwards them to the clock (with automatic diacritics removal and truncation to a maximum character count).</li>` +
+          `<li><b>Euro Truck Simulator 2</b> if the game is running, reads live telemetry (current speed) and streams it to the clock in real time. Requires an extra one-time plugin install in-game, see Setting Up ETS2 Speed Integration.</li>` +
+          `</ul>`
+      },
+      ap: {
+        title: `AP`,
+        body: `<p>AP mode allows your Octoglow to create its own Wi-Fi network if your home connection fails or needs troubleshooting; in this mode, some tiles may not be able to sync with the Internet connection.</p>`
+      },
+      lang: {
+        title: `Switch a Tile/Interface Language`,
+        body: `<p>If you want to change the interface language or the language of a specific tile, you can do so in the language manager. The most commonly supported languages are Romanian and English, but some tiles may also support other languages.</p>`
+      }
+    };
+
+    var TILE_HELP_SVG = `<svg width="18" height="18" viewBox="0 -960 960 960" fill="currentColor"><path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>`;
+
+    function openTileHelpDlg(e, key) {
+      if (e) e.stopPropagation();
+      openHelpTopicDlg(key)
+    }
+
+    function openHelpTopicDlg(key) {
+      var topic = helpTopics[key];
+      if (!topic) return;
+      document.getElementById(`help-topic-title`).textContent = topic.title;
+      document.getElementById(`help-topic-body`).innerHTML = topic.body;
+      document.getElementById(`help-topic-scrim`).classList.add(`open`);
+      document.getElementById(`help-topic-dlg`).classList.add(`open`)
+    }
+
+    function closeHelpTopicDlg() {
+      document.getElementById(`help-topic-scrim`).classList.remove(`open`);
+      document.getElementById(`help-topic-dlg`).classList.remove(`open`)
+    }
+
     function openSwUpdateDlg() {
       document.getElementById(`sw-update-scrim`).classList.add(`open`);
       document.getElementById(`sw-update-dlg`).classList.add(`open`);
@@ -7272,10 +7861,17 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       if (customInput) customInput.value = hex;
       buildAccentPresetGrid();
       updateAccentCustomSel();
+      try {
+        localStorage.setItem(`accentColor`, hex)
+      } catch (e) {}
       if (persist !== !1) {
-        try {
-          localStorage.setItem(`accentColor`, hex)
-        } catch (e) {}
+        fetch(`/accentsett`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `application/x-www-form-urlencoded`
+          },
+          body: `hex=` + encodeURIComponent(hex)
+        }).catch(function() {})
       }
     }
 
@@ -7958,10 +8554,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         var swHtml = `<div class=\"sw\" onclick=\"toggleTile(` + idx + `)\"><input type=\"checkbox\" id=\"tsw` + idx + `\"` + (item.enabled ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>`;
         var gearSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87a.49.49 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z\"/></svg>`;
         var npGearHtml = isNp ? `<button class=\"np-gear-btn\" onclick=\"openNpSettingsDlg(event)\" title=\"Setari Now Playing\">` + gearSvg + `</button>` : ``;
+        var npHelpHtml = isNp ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'sender')\" title=\"Ajutor Now Playing\">` + TILE_HELP_SVG + `</button>` : ``;
         var wxGearHtml = isWx ? `<button class=\"np-gear-btn\" onclick=\"openWxSettingsDlg(event)\" title=\"Setari Meteo\">` + gearSvg + `</button>` : ``;
+        var wxHelpHtml = isWx ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'lang')\" title=\"Ajutor Meteo\">` + TILE_HELP_SVG + `</button>` : ``;
         var tempGearHtml = isTemp ? `<button class=\"np-gear-btn\" onclick=\"openTempSettingsDlg(event)\" title=\"Setari Temperatura\">` + gearSvg + `</button>` : ``;
         var hourGearHtml = isHour ? `<button class=\"np-gear-btn\" onclick=\"openHourSettingsDlg(event)\" title=\"Setari Ora\">` + gearSvg + `</button>` : ``;
         var dateGearHtml = isDate ? `<button class=\"np-gear-btn\" onclick=\"openDateSettingsDlg(event)\" title=\"Setari Data\">` + gearSvg + `</button>` : ``;
+        var dateHelpHtml = isDate ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'lang')\" title=\"Ajutor Data\">` + TILE_HELP_SVG + `</button>` : ``;
         var isMemo = item.id === 5,
           pencilSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z\"/></svg>`,
           memoGearHtml = isMemo ? `<button class=\"np-gear-btn\" onclick=\"openMemoSettingsDlg(event)\" title=\"Setari Memento\">` + pencilSvg + `</button>` : ``,
@@ -7969,7 +8568,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         var pressureGearHtml = isPressure ? `<button class=\"np-gear-btn\" onclick=\"openPressureSettingsDlg(event)\" title=\"Setari Presiune\">` + gearSvg + `</button>` : ``;
         var ssGearHtml = isScreensaver ? `<button class=\"np-gear-btn\" onclick=\"openSsSettingsDlg(event)\" title=\"Setari Screen Saver\">` + gearSvg + `</button>` : ``;
         var currencyGearHtml = isCurrency ? `<button class=\"np-gear-btn\" onclick=\"openCurrencySettingsDlg(event)\" title=\"Setari Currency Standards\">` + gearSvg + `</button>` : ``;
-        d.innerHTML = `<span class="drag-handle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class="lic ` + ILCLS[item.id] + `">` + ISVG[item.id] + `</div><div class="tile-body"><div class="tile-head">` + NAMES[item.id] + `</div>` + (isNp ? `<div class="tile-sub" id="nptxt-` + idx + `">Astept date de la PC...</div>` : isWx ? `<div class="tile-sub" id="wxtxt-` + idx + `">` + wxPreviewText() + `</div>` : isCanvas ? `<div class="tile-sub">Desen personalizat 8×32</div>` : isMemoTile ? `<div class="tile-sub" id="memotxt-` + idx + `">` + (memoText || `Niciun text configurat`) + `</div>` : isHour ? `<div class="tile-sub" id="hourtxt-` + idx + `">` + hourPreviewText() + `</div>` : isDate ? `<div class="tile-sub" id="datetxt-` + idx + `">` + datePreviewText() + `</div>` : isTemp ? `<div class="tile-sub" id="temptxt-` + idx + `">` + tempPreviewText() + `</div>` : isPressure ? `<div class="tile-sub" id="pressuretxt-` + idx + `">` + pressurePreviewText() + `</div>` : isScreensaver ? `<div class="tile-sub" id="sstxt-` + idx + `">` + ssAnimPreviewText() + `</div>` : isCurrency ? `<div class="tile-sub" id="currencytxt-` + idx + `">` + currencyPreviewText() + `</div>` : ``) + `</div>` + tempGearHtml + hourGearHtml + dateGearHtml + npGearHtml + wxGearHtml + memoGearHtml + canvasGearHtml + pressureGearHtml + ssGearHtml + currencyGearHtml + swHtml;
+        d.innerHTML = `<span class="drag-handle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class="lic ` + ILCLS[item.id] + `">` + ISVG[item.id] + `</div><div class="tile-body"><div class="tile-head">` + NAMES[item.id] + `</div>` + (isNp ? `<div class="tile-sub" id="nptxt-` + idx + `">Astept date de la Octoglow Sender...</div>` : isWx ? `<div class="tile-sub" id="wxtxt-` + idx + `">` + wxPreviewText() + `</div>` : isCanvas ? `<div class="tile-sub">Desen personalizat 8×32</div>` : isMemoTile ? `<div class="tile-sub" id="memotxt-` + idx + `">` + (memoText || `Niciun text configurat`) + `</div>` : isHour ? `<div class="tile-sub" id="hourtxt-` + idx + `">` + hourPreviewText() + `</div>` : isDate ? `<div class="tile-sub" id="datetxt-` + idx + `">` + datePreviewText() + `</div>` : isTemp ? `<div class="tile-sub" id="temptxt-` + idx + `">` + tempPreviewText() + `</div>` : isPressure ? `<div class="tile-sub" id="pressuretxt-` + idx + `">` + pressurePreviewText() + `</div>` : isScreensaver ? `<div class="tile-sub" id="sstxt-` + idx + `">` + ssAnimPreviewText() + `</div>` : isCurrency ? `<div class="tile-sub" id="currencytxt-` + idx + `">` + currencyPreviewText() + `</div>` : ``) + `</div>` + npHelpHtml + wxHelpHtml + dateHelpHtml + tempGearHtml + hourGearHtml + dateGearHtml + npGearHtml + wxGearHtml + memoGearHtml + canvasGearHtml + pressureGearHtml + ssGearHtml + currencyGearHtml + swHtml;
         var container = document.createElement(`div`);
         container.style.position = `relative`;
         container.dataset.idx = String(idx);
@@ -8074,12 +8673,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           icon = isNowPlaying ? ISVG[3] : isEts2 ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm12 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-1-9.5h2.5l2.07 2.5H17V9z"/></svg>` : isStopwatch ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>` : `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`,
           cls = isNowPlaying ? `lc-amb` : isEts2 ? `lc-blu` : isStopwatch ? `lc-grn` : `lc-pur`,
           name = isNowPlaying ? `Now Playing` : isEts2 ? `Euro Truck Simulator 2` : isStopwatch ? `Stopwatch` : `Notificari`,
-          subHtml = isNowPlaying ? `<div class=\"tile-sub\" id=\"nptxt-p` + idx + `\">Astept date de la PC...</div>` : isStopwatch ? `<div class=\"tile-sub\" id=\"sw-sub\">` + (swRunning ? `Ruleaza - ` + (swLastText || `00:00:00:00`) : `Oprit`) + `</div>` : `<div class=\"tile-sub\" id=\"` + (isEts2 ? `ets2-sub` : `notif-sub`) + `\">` + (isEts2 ? `Inactiv` : `Afiseaza notificarile trimise de Now Sender`) + `</div>`,
+          subHtml = isNowPlaying ? `<div class=\"tile-sub\" id=\"nptxt-p` + idx + `\">Astept date de la Octoglow Sender...</div>` : isStopwatch ? `<div class=\"tile-sub\" id=\"sw-sub\">` + (swRunning ? `Ruleaza - ` + (swLastText || `00:00:00:00`) : `Oprit`) + `</div>` : `<div class=\"tile-sub\" id=\"` + (isEts2 ? `ets2-sub` : `notif-sub`) + `\">` + (isEts2 ? `Inactiv` : `Afiseaza notificari primite de Octoglow Sender`) + `</div>`,
           gearHtml = isNowPlaying ? `<button class=\"np-gear-btn\" onclick=\"openNpSettingsDlg(event)\" title=\"Setari Now Playing\">` + gearSvg + `</button>` : ``,
+          helpHtml = isStopwatch ? `` : `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'sender')\" title=\"Ajutor\">` + TILE_HELP_SVG + `</button>`,
           swHtml = isNowPlaying ? `<div class=\"sw\" onclick=\"toggleTile(` + npIdx + `)\"><input type=\"checkbox\" id=\"npPrioCb` + idx + `\"` + (npIdx >= 0 && items[npIdx].enabled ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>` : isStopwatch ? `<button class=\"np-gear-btn sw-toggle-btn` + (swRunning ? ` playing` : ``) + `\" id=\"sw-toggle-btn\" onclick=\"toggleStopwatch()\" title=\"Start / Stop\">` + (swRunning ? `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M6 19h4V5H6v14zm8-14v14h4V5h-4z\"/></svg>` : `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M8 5v14l11-7z\"/></svg>`) + `</button>` : `<div class=\"sw\" onclick=\"` + (isEts2 ? `toggleEts2()` : `toggleNotif()`) + `\"><input type=\"checkbox\" id=\"` + (isEts2 ? `ets2-cb` : `notif-cb`) + `\"` + ((isEts2 ? ets2En : notifEn) ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>`,
           d = document.createElement(`div`);
         d.className = `tile-item`;
-        d.innerHTML = `<span class=\"drag-handle\"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class=\"lic ` + cls + `\">` + icon + `</div><div class=\"tile-body\"><div class=\"tile-head\">` + name + `</div>` + subHtml + `</div>` + gearHtml + swHtml;
+        d.innerHTML = `<span class=\"drag-handle\"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class=\"lic ` + cls + `\">` + icon + `</div><div class=\"tile-body\"><div class=\"tile-head\">` + name + `</div>` + subHtml + `</div>` + helpHtml + gearHtml + swHtml;
         g.appendChild(d);
         d.draggable = !0;
         d.addEventListener(`dragstart`, function(e) {
@@ -8185,9 +8785,110 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       return (h < 10 ? `0` : ``) + h + `:` + mm
     }
 
-    function datePreviewText() {
+    function datePreviewTextFor(i) {
+      if (i === 5) return renderCustomDatePattern(customDateFmtV);
+      if (i === 4) {
+        var names = dateLangV === 1 ? [`Dum`, `Lun`, `Mar`, `Mie`, `Joi`, `Vin`, `Sam`] : [`Sun`, `Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat`],
+          dd = new Date(),
+          day = dd.getDate();
+        return names[dd.getDay()] + ` ` + (day < 10 ? `0` : ``) + day
+      }
       var arr = [`2026.06.18`, `26.06.18`, `18.06.2026`, `18.06`];
-      return arr[dateFormatV] || arr[2]
+      return arr[i] || arr[2]
+    }
+
+    function datePreviewText() {
+      return datePreviewTextFor(dateFormatV)
+    }
+
+    function buildDateFormatList() {
+      var c = document.getElementById(`date-fmt-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      for (var i = 0; i <= 5; i++) {
+        (function(idx) {
+          var row = document.createElement(`div`);
+          row.className = `sel-row`;
+          row.onclick = function() {
+            if (idx === 5) openCustomDateFmtDlg();
+            else setDateFormat(idx)
+          };
+          var label = idx === 5 ? `Custom (` + customDateFmtV + `)` : datePreviewTextFor(idx);
+          var radio = `<span class="sel-radio` + (dateFormatV === idx ? ` sel-radio-on` : ``) + `"></span>`;
+          row.innerHTML = radio + `<span class="sel-label">` + label + `</span>`;
+          c.appendChild(row)
+        })(i)
+      }
+    }
+
+    var NP_MODE_OPTIONS = [`Artist + Titlu`, `Artist`, `Titlu`];
+
+    function buildNpModeList() {
+      var c = document.getElementById(`np-mode-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      NP_MODE_OPTIONS.forEach(function(name, i) {
+        var row = document.createElement(`div`);
+        row.className = `sel-row`;
+        row.onclick = function() {
+          setNpMode(i)
+        };
+        var radio = `<span class="sel-radio` + (npM === i ? ` sel-radio-on` : ``) + `"></span>`;
+        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
+        c.appendChild(row)
+      })
+    }
+
+    var TEMP_UNIT_OPTIONS = [`°C Celsius`, `°F Fahrenheit`];
+
+    function buildTempUnitList() {
+      var c = document.getElementById(`temp-unit-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      TEMP_UNIT_OPTIONS.forEach(function(name, i) {
+        var row = document.createElement(`div`);
+        row.className = `sel-row`;
+        row.onclick = function() {
+          setTempUnit(i)
+        };
+        var radio = `<span class="sel-radio` + (tempUnitV === i ? ` sel-radio-on` : ``) + `"></span>`;
+        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
+        c.appendChild(row)
+      })
+    }
+
+    function buildWxUnitList() {
+      var c = document.getElementById(`wx-unit-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      TEMP_UNIT_OPTIONS.forEach(function(name, i) {
+        var row = document.createElement(`div`);
+        row.className = `sel-row`;
+        row.onclick = function() {
+          setWxTempUnit(i)
+        };
+        var radio = `<span class="sel-radio` + (tempUnitV === i ? ` sel-radio-on` : ``) + `"></span>`;
+        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
+        c.appendChild(row)
+      })
+    }
+
+    var HOUR_FMT_OPTIONS = [`24h (13:45)`, `12h (1:45)`];
+
+    function buildHourFormatList() {
+      var c = document.getElementById(`hour-fmt-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      HOUR_FMT_OPTIONS.forEach(function(name, i) {
+        var row = document.createElement(`div`);
+        row.className = `sel-row`;
+        row.onclick = function() {
+          setHourFormat(i)
+        };
+        var radio = `<span class="sel-radio` + (hourFormatV === i ? ` sel-radio-on` : ``) + `"></span>`;
+        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
+        c.appendChild(row)
+      })
     }
 
     function tempPreviewText() {
@@ -8545,10 +9246,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function setNpMode(m) {
-      npM = m, [0, 1, 2].forEach(function(i) {
-        var e = document.getElementById(`npMode` + i);
-        e && (e.className = `sb` + (i === m ? ` on` : ``))
-      }), fetch(`/npmode`, {
+      npM = m, buildNpModeList(), fetch(`/npmode`, {
         method: `POST`,
         headers: {
           "Content-Type": `application/x-www-form-urlencoded`
@@ -8706,10 +9404,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         return it.id === 3
       });
       if (npIdx < 0) return;
-      [0, 1, 2].forEach(function(i) {
-        var b = document.getElementById(`npMode` + i);
-        b && (b.className = `sb` + (i === npM ? ` on` : ``))
-      });
+      buildNpModeList();
       document.getElementById(`np-sett-scrim`).classList.add(`open`);
       document.getElementById(`np-sett-dlg`).classList.add(`open`)
     }
@@ -8725,32 +9420,17 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }).then(function(s) {
         var all = document.querySelectorAll(`[id^=nptxt-]`);
         all.forEach(function(el) {
-          el.textContent = s.active ? s.text : `Astept date de la PC…`
+          el.textContent = s.active ? s.text : `Astept date de la Octoglow Sender…`
         });
-        s.tempunit !== void 0 && (tempUnitV = s.tempunit, [`tempUnitC`, `tempUnitF`, `wxTempUnitC`, `wxTempUnitF`].forEach(function(bid, bi) {
-          var b = document.getElementById(bid);
-          b && (b.className = `sb` + (bi % 2 === tempUnitV ? ` on` : ``))
-        }), refreshTempTilePreview());
-        s.npmode !== void 0 && (npM = s.npmode, [0, 1, 2].forEach(function(i) {
-          var e = document.getElementById(`npMode` + i);
-          e && (e.className = `sb` + (i === s.npmode ? ` on` : ``))
-        }));
-        s.hourformat !== void 0 && (hourFormatV = s.hourformat, [`hourFmt24`, `hourFmt12`].forEach(function(b, i) {
-          var el = document.getElementById(b);
-          el && (el.className = `sb` + (i === hourFormatV ? ` on` : ``))
-        }), refreshHourTilePreview()), s.dateformat !== void 0 && (dateFormatV = s.dateformat, [`dateFmt0`, `dateFmt1`, `dateFmt2`, `dateFmt3`].forEach(function(b, i) {
-          var el = document.getElementById(b);
-          el && (el.className = `sb` + (i === dateFormatV ? ` on` : ``))
-        }), refreshDateTilePreview()), s.lastTemp !== void 0 && (lastTempV = s.lastTemp, refreshTempTilePreview()), s.wxValid !== void 0 && (wxValidV = s.wxValid, wxTempV = s.wxTemp, wxHumidityV = s.wxHumidity, wxDescV = s.wxDesc, refreshWeatherTilePreview())
+        s.tempunit !== void 0 && (tempUnitV = s.tempunit, buildTempUnitList(), buildWxUnitList(), refreshTempTilePreview());
+        s.npmode !== void 0 && (npM = s.npmode, buildNpModeList());
+        s.hourformat !== void 0 && (hourFormatV = s.hourformat, buildHourFormatList(), refreshHourTilePreview()), s.dateformat !== void 0 && (dateFormatV = s.dateformat, buildDateFormatList(), refreshDateTilePreview()), s.lastTemp !== void 0 && (lastTempV = s.lastTemp, refreshTempTilePreview()), s.wxValid !== void 0 && (wxValidV = s.wxValid, wxTempV = s.wxTemp, wxHumidityV = s.wxHumidity, wxDescV = s.wxDesc, refreshWeatherTilePreview())
       }).catch(function() {}), setTimeout(pollNP, 3e3)
     }
 
     function openTempSettingsDlg(e) {
       e && e.stopPropagation();
-      [`tempUnitC`, `tempUnitF`].forEach(function(bid, bi) {
-        var b = document.getElementById(bid);
-        b && (b.className = `sb` + (bi === tempUnitV ? ` on` : ``))
-      });
+      buildTempUnitList();
       var tIdx = items.findIndex(function(it) {
         return it.id === 2
       });
@@ -8775,14 +9455,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
     function setTempUnit(u) {
       tempUnitV = u;
-      [`tempUnitC`, `tempUnitF`].forEach(function(bid, bi) {
-        var b = document.getElementById(bid);
-        b && (b.className = `sb` + (bi === u ? ` on` : ``))
-      });
-      [`wxTempUnitC`, `wxTempUnitF`].forEach(function(bid, bi) {
-        var b = document.getElementById(bid);
-        b && (b.className = `sb` + (bi === u ? ` on` : ``))
-      });
+      buildTempUnitList();
+      buildWxUnitList();
       refreshTempTilePreview();
       fetch(`/tempunit`, {
         method: `POST`,
@@ -9165,10 +9839,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           }
         }
       }).catch(function() {});
-      [`wxTempUnitC`, `wxTempUnitF`].forEach(function(bid, bi) {
-        var b = document.getElementById(bid);
-        b && (b.className = `sb` + (bi === tempUnitV ? ` on` : ``))
-      });
+      buildWxUnitList();
       document.getElementById(`wx-sett-scrim`).classList.add(`open`);
       document.getElementById(`wx-sett-dlg`).classList.add(`open`)
     }
@@ -9289,10 +9960,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
     function openHourSettingsDlg(e) {
       e && e.stopPropagation();
-      [`hourFmt24`, `hourFmt12`].forEach(function(b, i) {
-        var el = document.getElementById(b);
-        el && (el.className = `sb` + (i === hourFormatV ? ` on` : ``))
-      });
+      buildHourFormatList();
       var hIdx = items.findIndex(function(it) {
         return it.id === 0
       });
@@ -9317,10 +9985,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
     function setHourFormat(f) {
       hourFormatV = f;
-      [`hourFmt24`, `hourFmt12`].forEach(function(b, i) {
-        var el = document.getElementById(b);
-        el && (el.className = `sb` + (i === f ? ` on` : ``))
-      });
+      buildHourFormatList();
       refreshHourTilePreview();
       fetch(`/hourformat`, {
         method: `POST`,
@@ -9331,13 +9996,15 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       })
     }
     var dateFormatV = 2;
+    var dateLangV = 0;
+
+    function dateLangLabel(v) {
+      return v === 1 ? `Romana (ro)` : `English (en)`
+    }
 
     function openDateSettingsDlg(e) {
       e && e.stopPropagation();
-      [`dateFmt0`, `dateFmt1`, `dateFmt2`, `dateFmt3`].forEach(function(b, i) {
-        var el = document.getElementById(b);
-        el && (el.className = `sb` + (i === dateFormatV ? ` on` : ``))
-      });
+      buildDateFormatList();
       var dIdx = items.findIndex(function(it) {
         return it.id === 1
       });
@@ -9362,10 +10029,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
 
     function setDateFormat(f) {
       dateFormatV = f;
-      [`dateFmt0`, `dateFmt1`, `dateFmt2`, `dateFmt3`].forEach(function(b, i) {
-        var el = document.getElementById(b);
-        el && (el.className = `sb` + (i === f ? ` on` : ``))
-      });
+      buildDateFormatList();
       refreshDateTilePreview();
       fetch(`/dateformat`, {
         method: `POST`,
@@ -9373,6 +10037,233 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           "Content-Type": `application/x-www-form-urlencoded`
         },
         body: `fmt=` + f
+      })
+    }
+
+    var customDateFmtV = `DD/MM/YYYY`;
+
+    function isDateFmtLiteralChar(c) {
+      return c === `/` || c === `.` || c === `(` || c === `)` || c === ` `
+    }
+
+    function dateCustomValidate(pattern) {
+      pattern = (pattern || ``).toUpperCase();
+      if (!pattern.length) return {
+        ok: false,
+        err: `Introdu un format`
+      };
+      if (pattern.length > 20) return {
+        ok: false,
+        err: `Format prea lung`
+      };
+      var i = 0,
+        len = pattern.length,
+        hasContent = false;
+      while (i < len) {
+        var c = pattern[i];
+        if (c !== `Y` && c !== `M` && c !== `D` && c !== `W` && !isDateFmtLiteralChar(c)) return {
+          ok: false,
+          err: `Caracter invalid — foloseste doar Y, M, D, W, / . ( ) sau spatiu`
+        };
+        var j = i;
+        while (j < len && pattern[j] === c) j++;
+        var count = j - i;
+        if (c === `Y`) {
+          hasContent = true;
+          if (count !== 2 && count !== 4) return {
+            ok: false,
+            err: `Y trebuie sa fie YY sau YYYY`
+          }
+        } else if (c === `M`) {
+          hasContent = true;
+          if (count !== 2) return {
+            ok: false,
+            err: `M trebuie sa fie MM`
+          }
+        } else if (c === `D`) {
+          hasContent = true;
+          if (count !== 2) return {
+            ok: false,
+            err: `D trebuie sa fie DD`
+          }
+        } else if (c === `W`) {
+          hasContent = true
+        }
+        i = j
+      }
+      if (!hasContent) return {
+        ok: false,
+        err: `Formatul trebuie sa contina cel putin Y, M, D sau W`
+      };
+      return {
+        ok: true,
+        err: ``
+      }
+    }
+
+    function renderCustomDatePattern(pattern) {
+      pattern = (pattern || ``).toUpperCase();
+      var namesFull = dateLangV === 1 ? [`Duminica`, `Luni`, `Marti`, `Miercuri`, `Joi`, `Vineri`, `Sambata`] : [`Sunday`, `Monday`, `Tuesday`, `Wednesday`, `Thursday`, `Friday`, `Saturday`],
+        dd = new Date(),
+        day = dd.getDate(),
+        month = dd.getMonth() + 1,
+        year = dd.getFullYear(),
+        wday = dd.getDay();
+
+      function pad(n, w) {
+        n = String(n);
+        while (n.length < w) n = `0` + n;
+        return n
+      }
+      var out = ``,
+        i = 0,
+        len = pattern.length;
+      while (i < len) {
+        var c = pattern[i],
+          j = i;
+        while (j < len && pattern[j] === c) j++;
+        var count = j - i;
+        if (c === `Y`) out += count === 2 ? pad(year % 100, 2) : pad(year, 4);
+        else if (c === `M`) out += pad(month, 2);
+        else if (c === `D`) out += pad(day, 2);
+        else if (c === `W`) {
+          var full = namesFull[wday];
+          out += count >= full.length ? full : full.substring(0, count)
+        } else if (isDateFmtLiteralChar(c)) {
+          out += pattern.substring(i, j)
+        }
+        i = j
+      }
+      return out
+    }
+
+    function openCustomDateFmtDlg() {
+      var inp = document.getElementById(`date-custom-in`);
+      if (inp) inp.value = customDateFmtV;
+      var m = document.getElementById(`date-custom-msg`);
+      if (m) {
+        m.style.display = `none`;
+        m.textContent = ``
+      }
+      onCustomDateFmtInput();
+      document.getElementById(`date-custom-scrim`).classList.add(`open`);
+      document.getElementById(`date-custom-dlg`).classList.add(`open`)
+    }
+
+    function closeCustomDateFmtDlg() {
+      document.getElementById(`date-custom-scrim`).classList.remove(`open`);
+      document.getElementById(`date-custom-dlg`).classList.remove(`open`)
+    }
+
+    function onCustomDateFmtInput() {
+      var inp = document.getElementById(`date-custom-in`);
+      var pattern = inp ? inp.value : ``;
+      var prev = document.getElementById(`date-custom-preview`);
+      var m = document.getElementById(`date-custom-msg`);
+      var v = dateCustomValidate(pattern);
+      if (v.ok) {
+        if (prev) prev.textContent = renderCustomDatePattern(pattern);
+        if (m) {
+          m.style.display = `none`;
+          m.textContent = ``
+        }
+      } else {
+        if (prev) prev.textContent = ``;
+        if (m) {
+          m.textContent = v.err;
+          m.className = `msg err`;
+          m.style.display = `block`
+        }
+      }
+    }
+
+    function saveCustomDateFmt() {
+      var inp = document.getElementById(`date-custom-in`);
+      var pattern = (inp ? inp.value : ``).toUpperCase().trim();
+      var v = dateCustomValidate(pattern);
+      var m = document.getElementById(`date-custom-msg`);
+      if (!v.ok) {
+        if (m) {
+          m.textContent = v.err;
+          m.className = `msg err`;
+          m.style.display = `block`
+        }
+        return
+      }
+      customDateFmtV = pattern;
+      dateFormatV = 5;
+      buildDateFormatList();
+      refreshDateTilePreview();
+      fetch(`/datecustomfmt`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/x-www-form-urlencoded`
+        },
+        body: `pattern=` + encodeURIComponent(pattern)
+      }).then(function(r) {
+        if (!r.ok) return r.text().then(function(t) {
+          throw new Error(t)
+        });
+        closeCustomDateFmtDlg()
+      }).catch(function(e) {
+        if (m) {
+          m.textContent = e.message || `Eroare la salvare`;
+          m.className = `msg err`;
+          m.style.display = `block`
+        }
+      })
+    }
+
+    function openDateLangPicker(e) {
+      e && e.stopPropagation();
+      buildDateLangList();
+      document.getElementById(`date-lang-scrim`).classList.add(`open`);
+      document.getElementById(`date-lang-dlg`).classList.add(`open`)
+    }
+
+    function closeDateLangPicker() {
+      document.getElementById(`date-lang-scrim`).classList.remove(`open`);
+      document.getElementById(`date-lang-dlg`).classList.remove(`open`)
+    }
+
+    function buildDateLangList() {
+      var list = document.getElementById(`date-lang-list`);
+      list.innerHTML = ``;
+      var opts = [{
+        v: 0,
+        n: `English`,
+        c: `en`
+      }, {
+        v: 1,
+        n: `Romana`,
+        c: `ro`
+      }];
+      opts.forEach(function(o) {
+        var isSel = (o.v === dateLangV);
+        var d = document.createElement(`div`);
+        d.style.cssText = `display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--outline-var);cursor:pointer;transition:background .12s;background:` + (isSel ? `color-mix(in srgb,var(--pri)14%,transparent)` : ``);
+        d.innerHTML = `<div><div style="font-family:Google Sans,sans-serif;font-size:15px;color:` + (isSel ? `var(--pri)` : `var(--on-surf)`) + `">` + o.n + `</div><div style="font-size:12px;color:var(--on-surf-var);margin-top:2px">` + o.c + `</div></div>` + (isSel ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--pri)"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>` : ``);
+        d.onmouseenter = function() {
+          if (!isSel) d.style.background = `color-mix(in srgb,var(--on-surf)6%,transparent)`
+        };
+        d.onmouseleave = function() {
+          if (!isSel) d.style.background = ``
+        };
+        d.onclick = function() {
+          dateLangV = o.v;
+          fetch(`/datelang`, {
+            method: `POST`,
+            headers: {
+              "Content-Type": `application/x-www-form-urlencoded`
+            },
+            body: `lang=` + o.v
+          });
+          var s1 = document.getElementById(`date-lang-sub`);
+          if (s1) s1.textContent = dateLangLabel(o.v);
+          refreshDateTilePreview();
+          closeDateLangPicker()
+        };
+        list.appendChild(d)
       })
     }
     var memoText = ``;
@@ -9806,6 +10697,49 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         window.location.href = `/`
       })
     }
+
+    function openOorDialog() {
+      document.getElementById(`oor-scrim`).classList.add(`open`);
+      document.getElementById(`oor-dlg`).classList.add(`open`)
+    }
+
+    function closeOorDialog() {
+      document.getElementById(`oor-scrim`).classList.remove(`open`);
+      document.getElementById(`oor-dlg`).classList.remove(`open`)
+    }
+
+    var heartbeatTimer = null;
+
+    function heartbeatTick() {
+      var ctrl = (typeof AbortController !== `undefined`) ? new AbortController() : null;
+      var timeout = ctrl ? setTimeout(function() {
+        ctrl.abort()
+      }, 8000) : null;
+      fetch(`/whoami`, {
+        cache: `no-store`,
+        signal: ctrl ? ctrl.signal : undefined
+      }).then(function(r) {
+        if (timeout) clearTimeout(timeout);
+        if (r.status === 401) {
+          window.location.href = `/`;
+          return
+        }
+        closeOorDialog()
+      }).catch(function() {
+        if (timeout) clearTimeout(timeout);
+        openOorDialog()
+      })
+    }
+
+    function startHeartbeat() {
+      stopHeartbeat();
+      heartbeatTimer = setInterval(heartbeatTick, 15000)
+    }
+
+    function stopHeartbeat() {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null
+    }
     var WAVE_SVG = `<svg class="wave-hand" xmlns="http://www.w3.org/2000/svg" height="22px" viewBox="0 -960 960 960" width="22px" fill="currentColor"><path d="M880-759q0-51-35-86t-86-35v-60q75 0 128 53t53 128h-60ZM240-40q-83 0-141.5-58.5T40-240h60q0 58 41 99t99 41v60Zm162 0q-30 0-56-13.5T303-92L48-465l24-23q19-19 45-22t47 12l116 81v-383q0-17 11.5-28.5T320-840q17 0 28.5 11.5T360-800v537L212-367l157 229q5 8 14 13t19 5h278q33 0 56.5-23.5T760-200v-560q0-17 11.5-28.5T800-800q17 0 28.5 11.5T840-760v560q0 66-47 113T680-40H402Zm38-440v-400q0-17 11.5-28.5T480-920q17 0 28.5 11.5T520-880v400h-80Zm160 0v-360q0-17 11.5-28.5T640-880q17 0 28.5 11.5T680-840v360h-80ZM486-300Z"/></svg>`;
     var LOGOUT_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M17 7l-1.41 1.41L17.17 10H8v2h9.17l-1.58 1.59L17 15l4-4zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>`;
 
@@ -9901,6 +10835,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     window.onload = function() {
       loadDarkMode();
       loadAccentColor();
+      startHeartbeat();
       fetch(`/whoami`).then(function(r) {
         if (r.status === 401) {
           window.location.href = `/`;
@@ -9958,27 +10893,30 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         if (s.canvasBmp) {
           canvasBmpHex = s.canvasBmp;
         }
+        if (s.accentColor && /^#[0-9a-fA-F]{6}$/.test(s.accentColor) && s.accentColor.toLowerCase() !== accentCurrentHex.toLowerCase()) {
+          applyAccentColor(s.accentColor, !1)
+        }
         buildGrid();
         if (s.tempunit !== void 0) {
           tempUnitV = s.tempunit;
-          [`tempUnitC`, `tempUnitF`, `wxTempUnitC`, `wxTempUnitF`].forEach(function(bid, bi) {
-            var b = document.getElementById(bid);
-            b && (b.className = `sb` + (bi % 2 === tempUnitV ? ` on` : ``))
-          })
+          buildTempUnitList();
+          buildWxUnitList()
         }
         if (s.hourformat !== void 0) {
           hourFormatV = s.hourformat;
-          [`hourFmt24`, `hourFmt12`].forEach(function(bid, bi) {
-            var b = document.getElementById(bid);
-            b && (b.className = `sb` + (bi === hourFormatV ? ` on` : ``))
-          })
+          buildHourFormatList()
+        };
+        if (s.datelang !== void 0) {
+          dateLangV = s.datelang;
+          var _dls = document.getElementById(`date-lang-sub`);
+          if (_dls) _dls.textContent = dateLangLabel(s.datelang)
+        };
+        if (s.customdatefmt) {
+          customDateFmtV = s.customdatefmt
         };
         if (s.dateformat !== void 0) {
           dateFormatV = s.dateformat;
-          [`dateFmt0`, `dateFmt1`, `dateFmt2`, `dateFmt3`].forEach(function(bid, bi) {
-            var b = document.getElementById(bid);
-            b && (b.className = `sb` + (bi === dateFormatV ? ` on` : ``))
-          })
+          buildDateFormatList()
         };
         if (s.wxLang) {
           owmLangCode = s.wxLang;
@@ -10459,7 +11397,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         var dlg = document.createElement("div");
         dlg.className = "md-dialog";
         dlg.id = "timer-sett-dlg";
-        dlg.innerHTML = '<div class="mdd-head"><div class="mdd-icon">' + TIMER_SVG + '</div><div class="mdd-title">Timer</div></div>' + '<div class="mdd-body">' + '<div id="timer-picker-preview" style="text-align:center;font-family:Google Sans,sans-serif;font-size:32px;color:var(--pri);padding:8px 0 16px;letter-spacing:1px">05:00</div>' + '<div id="timer-running-hint" style="display:none;color:var(--on-surf-var);font-size:12px;text-align:center;padding-bottom:12px">Opreste countdown-ul pentru a schimba durata</div>' + '<div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:4px 0 8px;font-weight:500">Preseturi</div>' + '<div id="timer-preset-list" style="display:flex;flex-direction:column;gap:4px"></div>' + '<div id="timer-custom-wrap" style="display:none;gap:8px;padding-top:12px;justify-content:center">' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Ore</label><input class="mdd-input" type="number" min="0" max="99" id="timer-h-in" value="0" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Minute</label><input class="mdd-input" type="number" min="0" max="59" id="timer-m-in" value="5" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Secunde</label><input class="mdd-input" type="number" min="0" max="59" id="timer-s-in" value="0" oninput="onTimerCustomInput()"></div>' + "</div>" + "</div>" + '<div class="mdd-actions"><button class="mbtn mbtn-fill" onclick="closeTimerSettingsDlg()">Gata</button></div>';
+        dlg.innerHTML = '<div class="mdd-head"><div class="mdd-icon">' + TIMER_SVG + '</div><div class="mdd-title">Timer</div></div>' + '<div class="mdd-body">' + '<div id="timer-picker-preview" style="text-align:center;font-family:Google Sans,sans-serif;font-size:32px;color:var(--pri);padding:8px 0 16px;letter-spacing:1px">05:00</div>' + '<div id="timer-running-hint" style="display:none;color:var(--on-surf-var);font-size:12px;text-align:center;padding-bottom:12px">Opreste countdown-ul pentru a schimba durata</div>' + '<div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:4px 0 8px;font-weight:500">Preseturi</div>' + '<div class="card" id="timer-preset-list"></div>' + '<div id="timer-custom-wrap" style="display:none;gap:8px;padding-top:12px;justify-content:center">' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Ore</label><input class="mdd-input" type="number" min="0" max="99" id="timer-h-in" value="0" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Minute</label><input class="mdd-input" type="number" min="0" max="59" id="timer-m-in" value="5" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Secunde</label><input class="mdd-input" type="number" min="0" max="59" id="timer-s-in" value="0" oninput="onTimerCustomInput()"></div>' + "</div>" + "</div>" + '<div class="mdd-actions"><button class="mbtn mbtn-fill" onclick="closeTimerSettingsDlg()">Gata</button></div>';
         document.body.appendChild(scrim);
         document.body.appendChild(dlg);
       }
@@ -10471,13 +11409,12 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         PRESETS.forEach(function(p) {
           var isSel = p.id === timerPresetV;
           var d = document.createElement("div");
-          d.className = "li";
-          d.style.cursor = "pointer";
-          d.style.minHeight = "52px";
-          d.innerHTML = '<div class="li-body"><div class="li-head" style="' + (isSel ? "color:var(--pri)" : "") + '">' + p.label + '</div></div><div class="li-trail">' + (isSel ? '<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--pri)"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>' : "") + "</div>";
+          d.className = "sel-row";
           d.onclick = function() {
             selectTimerPreset(p.id);
           };
+          var radio = '<span class="sel-radio' + (isSel ? ' sel-radio-on' : '') + '"></span>';
+          d.innerHTML = radio + '<span class="sel-label">' + p.label + '</span>';
           c.appendChild(d);
         });
       }
@@ -10867,10 +11804,9 @@ void handleAuthSetup() {
   sha256hex(p.c_str(), hash);
   saveAuth(u.c_str(), hash);
 
-  char newTok[33];
-  genToken(newTok);
-  addSession(newTok);
-  server.sendHeader("Set-Cookie", String("sc_tok=") + newTok + "; Path=/; HttpOnly");
+  String newTok = makeSessionToken(u.c_str());
+  server.sendHeader("Set-Cookie", String("sc_tok=") + newTok +
+    "; Path=/; HttpOnly; Max-Age=" + String(SESSION_TTL_SECONDS) + "; SameSite=Lax");
   server.send(200, "application/json", String("{\"ok\":true,\"user\":\"") + u + "\"}");
 }
 
@@ -10889,25 +11825,16 @@ void handleLogin() {
     return;
   }
 
-  String existingTok = extractCookieToken();
-  if (existingTok.length() > 0 && isValidSession(existingTok.c_str())) {
-
-    server.sendHeader("Set-Cookie", String("sc_tok=") + existingTok + "; Path=/; HttpOnly");
-    server.send(200, "application/json", String("{\"ok\":true,\"user\":\"") + u + "\"}");
-    return;
-  }
-
-  char newTok[33];
-  genToken(newTok);
-  addSession(newTok);
-  server.sendHeader("Set-Cookie", String("sc_tok=") + newTok + "; Path=/; HttpOnly");
+  String newTok = makeSessionToken(u.c_str());
+  server.sendHeader("Set-Cookie", String("sc_tok=") + newTok +
+    "; Path=/; HttpOnly; Max-Age=" + String(SESSION_TTL_SECONDS) + "; SameSite=Lax");
   server.send(200, "application/json", String("{\"ok\":true,\"user\":\"") + u + "\"}");
 }
 
 void handleLogout() {
-  String tok = extractCookieToken();
-  if (tok.length() > 0) removeSession(tok.c_str());
-  server.sendHeader("Set-Cookie", "sc_tok=; Path=/; HttpOnly; Max-Age=0");
+  // Token-ul e stateless (nu exista nicio lista de sesiuni pe ESP), deci
+  // "logout" inseamna doar stergerea cookie-ului din browser-ul curent.
+  server.sendHeader("Set-Cookie", "sc_tok=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax");
   server.send(200, "text/plain", "ok");
 }
 
@@ -11070,7 +11997,13 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
   * {
     box-sizing: border-box;
     margin: 0;
-    padding: 0
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent
   }
 
   body {
@@ -11081,6 +12014,7 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     display: flex;
     align-items: center;
     justify-content: center;
+    -webkit-tap-highlight-color: transparent;
     padding: 24px
   }
 
@@ -11446,9 +12380,16 @@ static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
     }
 
     function init() {
-      fetch('/authstate').then(function(r) {
-        return r.json()
+      fetch('/whoami').then(function(r) {
+        if (r.ok) {
+          window.location.replace('/dashboard');
+          return null
+        }
+        return fetch('/authstate').then(function(r2) {
+          return r2.json()
+        })
       }).then(function(d) {
+        if (!d) return;
         isSetup = !d.configured;
         var form = document.getElementById('auth-form');
         var title = document.getElementById('auth-title');
@@ -11795,6 +12736,35 @@ void handleTouchSett() {
   server.send(200, "text/plain", "OK");
 }
 
+bool isValidHexColor(const String& s) {
+  if (s.length() != 7 || s.charAt(0) != '#') return false;
+  for (int i = 1; i < 7; i++) {
+    char c = s.charAt(i);
+    if (!isxdigit((unsigned char)c)) return false;
+  }
+  return true;
+}
+
+void handleAccentSett() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("hex")) {
+    server.send(400, "text/plain", "Lipseste hex");
+    return;
+  }
+  String hex = server.arg("hex");
+  hex.trim();
+  hex.toLowerCase();
+  if (!isValidHexColor(hex)) {
+    server.send(400, "text/plain", "Culoare invalida");
+    return;
+  }
+  hex.toCharArray(accentColor, sizeof(accentColor));
+  prefs.begin("settings", false);
+  prefs.putString("accentColor", accentColor);
+  prefs.end();
+  server.send(200, "text/plain", "OK");
+}
+
 void handleState() {
   if (!checkAuth()) return;
   prefs.begin("wifi", true);
@@ -11832,6 +12802,8 @@ void handleState() {
           ",\"tempunit\":" + String(tempUnit) +
           ",\"hourformat\":" + String(hourFormat) +
           ",\"dateformat\":" + String(dateFormat) +
+          ",\"datelang\":" + String(dateLang) +
+          ",\"customdatefmt\":\"" + String(customDateFmt) + "\"" +
           ",\"wxCity\":\"" + String(weatherCity) + "\"" +
           ",\"wxLang\":\"" + String(weatherLang) + "\"" +
           ",\"wxHasKey\":" + String(strlen(weatherApiKey) > 0 ? "true" : "false") +
@@ -11900,6 +12872,7 @@ void handleState() {
           ",\"evSndTimer\":\"" + String(eventSoundTimer) + "\"" +
           ",\"touchTapAction\":" + String(touchTapAction) +
           ",\"touchDoubleTapAction\":" + String(touchDoubleTapAction) +
+          ",\"accentColor\":\"" + String(accentColor) + "\"" +
           ",\"ssAnim\":" + String(ssAnimSelected) + "}";
   server.send(200, "application/json", json);
 }
@@ -12213,7 +13186,7 @@ void handleNotification() {
     beginC2PCapture();
     notifInit();
     finishC2PTransition();
-    playPresetTone(eventSoundNotif);
+    nbPlayPreset(eventSoundNotif);
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste text");
@@ -12274,7 +13247,7 @@ void handleEts2Speed() {
     if (spd > ETS2_SPEED_LIMIT) {
       if (!ets2SpeedAlertFired) {
         ets2SpeedAlertFired = true;
-        playPresetTone(eventSoundEts2);
+        nbPlayPreset(eventSoundEts2);
       }
     } else {
       ets2SpeedAlertFired = false;
@@ -12497,7 +13470,7 @@ void handleDateFormat() {
   if (!checkAuth()) return;
   if (server.hasArg("fmt")) {
     uint8_t f = (uint8_t)server.arg("fmt").toInt();
-    if (f <= 3) {
+    if (f <= 5) {
       dateFormat = f;
       saveSettings();
 
@@ -12509,6 +13482,48 @@ void handleDateFormat() {
   } else {
     server.send(400, "text/plain", "Lipseste fmt");
   }
+}
+
+void handleDateLang() {
+  if (!checkAuth()) return;
+  if (server.hasArg("lang")) {
+    uint8_t l = (uint8_t)server.arg("lang").toInt();
+    if (l <= 1) {
+      dateLang = l;
+      saveSettings();
+
+      if (items[currentSlot].id == ITEM_DATE) {
+        dateInit();
+      }
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Parametru invalid");
+}
+
+void handleDateCustomFmt() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("pattern")) {
+    server.send(400, "text/plain", "Lipseste pattern");
+    return;
+  }
+  String p = server.arg("pattern");
+  p.toUpperCase();
+  p.trim();
+  String err;
+  if (!dateValidateCustomFormat(p.c_str(), &err)) {
+    server.send(400, "text/plain", err);
+    return;
+  }
+  p.toCharArray(customDateFmt, sizeof(customDateFmt));
+  dateFormat = 5;
+  saveSettings();
+
+  if (items[currentSlot].id == ITEM_DATE) {
+    dateInit();
+  }
+  server.send(200, "text/plain", "OK");
 }
 
 void handleTempUnit() {
@@ -12555,6 +13570,8 @@ void startProvisionMode() {
   server.on("/tempunit",   HTTP_POST, handleTempUnit);
   server.on("/hourformat",  HTTP_POST, handleHourFormat);
   server.on("/dateformat",  HTTP_POST, handleDateFormat);
+  server.on("/datelang",    HTTP_POST, handleDateLang);
+  server.on("/datecustomfmt", HTTP_POST, handleDateCustomFmt);
   server.on("/weathersett",  HTTP_POST, handleWeatherSett);
   server.on("/weathersearch", HTTP_GET,  handleWeatherSearch);
   server.on("/weatherstate", HTTP_GET,  handleWeatherState);
@@ -12581,6 +13598,7 @@ void startProvisionMode() {
   server.on("/canvassett",    HTTP_POST, handleCanvasSett);
   server.on("/eventsoundsett", HTTP_POST, handleEventSoundSett);
   server.on("/touchsett",     HTTP_POST, handleTouchSett);
+  server.on("/accentsett",    HTTP_POST, handleAccentSett);
   server.on("/startap",       HTTP_POST, handleStartAp);
   server.on("/apstate",       HTTP_GET,  handleApState);
   server.on("/apsett",        HTTP_POST, handleApSett);
@@ -12737,6 +13755,8 @@ bool connectToWiFi(const char* ssid, const char* pass) {
     server.on("/tempunit",   HTTP_POST, handleTempUnit);
     server.on("/hourformat",  HTTP_POST, handleHourFormat);
     server.on("/dateformat",  HTTP_POST, handleDateFormat);
+    server.on("/datelang",    HTTP_POST, handleDateLang);
+    server.on("/datecustomfmt", HTTP_POST, handleDateCustomFmt);
     server.on("/weathersett",  HTTP_POST, handleWeatherSett);
   server.on("/weathersearch", HTTP_GET,  handleWeatherSearch);
     server.on("/weatherstate", HTTP_GET,  handleWeatherState);
@@ -12763,6 +13783,7 @@ bool connectToWiFi(const char* ssid, const char* pass) {
     server.on("/canvassett",    HTTP_POST, handleCanvasSett);
     server.on("/eventsoundsett", HTTP_POST, handleEventSoundSett);
     server.on("/touchsett",     HTTP_POST, handleTouchSett);
+    server.on("/accentsett",    HTTP_POST, handleAccentSett);
     server.on("/startap",       HTTP_POST, handleStartAp);
     server.on("/apstate",       HTTP_GET,  handleApState);
     server.on("/apsett",        HTTP_POST, handleApSett);
@@ -12892,7 +13913,6 @@ void handleTouch() {
 // SETUP
 void setup() {
   Serial.begin(115200);
-  initSessionPool();
   loadAuth();
   pinMode(TOUCH_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
@@ -12976,7 +13996,7 @@ void loop() {
   // WiFi Connection Lost detects the connected > disconnected transition
   bool wifiNowConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiWasConnected && !wifiNowConnected) {
-    playPresetTone(eventSoundWifi);
+    nbPlayPreset(eventSoundWifi);
   }
   wifiWasConnected = wifiNowConnected;
 
@@ -13434,16 +14454,19 @@ void loop() {
     applyBrightness();
   }
 
+  // Both fetches below only kick off a background task and return
+  // immediately (see weatherFetch()/currencyFetch() definitions) - they
+  // no longer block loop() while the HTTP request is in flight.
   if (strlen(weatherApiKey) > 0 &&
       (lastWeatherFetch == 0 || nowMs - lastWeatherFetch >= WEATHER_FETCH_INTERVAL_MS)) {
     weatherFetch();
-    nowMs = millis();
   }
+  weatherFetchPoll();
 
   if (lastCurrencyFetch == 0 || nowMs - lastCurrencyFetch >= CURRENCY_FETCH_INTERVAL_MS) {
     currencyFetch();
-    nowMs = millis();
   }
+  currencyFetchPoll();
 
   tempSampleTick();
   pressureSampleTick();
