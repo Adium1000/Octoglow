@@ -29,7 +29,7 @@ Welcome to my todo list
 
  14. Reset & Restore & backup functions in about
 
- 15. Tile manager Custom Fonts
+ ~~15. Tile manager Custom Fonts~~
 
 ~~16. Custom accent color~~
 
@@ -56,13 +56,3 @@ Welcome to my todo list
 ~~27. Data formatting DD/MM/YYY~~
 
 ~~28.Design Flow in tile manager settings~~
-
-Revnote
-
-This is NOT a Hardware project, this is a firmware intended for a hardware project, so you should not care about the following elements 
-
-BOM
-Schematics
-and Cad files
-
-This are not what i did track here on macondo (Psh anyway some of you don t even know how to read so this will be ignored 99% of the times )

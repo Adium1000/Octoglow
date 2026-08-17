@@ -617,6 +617,21 @@ uint8_t  scrollTypeStopwatch    = 0;
 uint8_t  scrollTypeTimer        = 0;
 uint8_t  scrollTypeIp           = 0;
 
+// FONT TYPE (0 = Marymba/default, 1 = Tiko 3x7)
+uint8_t  fontType               = 0;
+
+uint8_t  fontTypeDate           = 0;
+uint8_t  fontTypeTemp           = 0;
+uint8_t  fontTypeReminder       = 0;
+uint8_t  fontTypeWeather        = 0;
+uint8_t  fontTypeNotif          = 0;
+uint8_t  fontTypeNowPlaying     = 0;
+uint8_t  fontTypePressure       = 0;
+uint8_t  fontTypeCurrency       = 0;
+uint8_t  fontTypeStopwatch      = 0;
+uint8_t  fontTypeTimer          = 0;
+uint8_t  fontTypeIp             = 0;
+
 // TILE TRANSITION 
 uint8_t  tileTransGlobal       = 0;
 uint8_t  tileTransHour         = 0;
@@ -1244,7 +1259,20 @@ const uint8_t CHAR_DEG[5]   = {0x06, 0x09, 0x09, 0x06, 0x00};
 const uint8_t CHAR_SPACE[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
 const uint8_t CHAR_COLON[2] = {0x36, 0x36};
 const uint8_t CHAR_DOT[1]   = {0x40};
-static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch) {
+// Font mode constants (moved up from below so they're visible to appendGlyphAuto)
+#define FONT_MODE_DEFAULT 0
+#define FONT_MODE_TIKO    1
+#define TIKO_MAX_COLS 5
+
+static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch, uint8_t fontMode = FONT_MODE_DEFAULT) {
+  if (fontMode == FONT_MODE_TIKO) {
+    uint8_t tmp[TIKO_MAX_COLS];
+    uint8_t n = tikoGetChar(ch, sizeof(tmp), tmp);
+    if (n == 0) return;
+    for (int i = 0; i < n && count < maxCount; i++) buf[count++] = tmp[i];
+    if (count < maxCount) buf[count++] = 0x00;
+    return;
+  }
   if (ch >= '0' && ch <= '9') {
     const uint8_t* g = FONT[ch - '0'];
     for (int i = 0; i < 5 && count < maxCount; i++) buf[count++] = g[i];
@@ -1263,6 +1291,126 @@ static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch) {
     if (count < maxCount) buf[count++] = 0x00;
   }
 }
+
+
+// ============================================================
+// TIKO FONT (3x7 custom pixel font) — alternative to the
+// library-default "Marymba" font used across all tiles.
+// Each glyph is stored as N columns (N=3 for almost every
+// character, N=5 only for 'W'); each column byte packs 7 rows,
+// bit r (r=0..6, r=0 is the TOP row) -> same column-encoding
+// convention as the existing digit FONT[][5] table above, so
+// it can be dropped in anywhere getChar()-style output is used.
+// ============================================================
+struct TikoGlyph {
+  char    ch;
+  uint8_t cols;
+  uint8_t data[TIKO_MAX_COLS];
+};
+
+const TikoGlyph TIKO_FONT[] = {
+  { '1', 3, { 0x42, 0x7F, 0x40 } },
+  { '0', 3, { 0x3E, 0x41, 0x3E } },
+  { '2', 3, { 0x62, 0x51, 0x4E } },
+  { '3', 3, { 0x41, 0x49, 0x3E } },
+  { '4', 3, { 0x0F, 0x08, 0x7F } },
+  { '5', 3, { 0x4F, 0x49, 0x31 } },
+  { '6', 3, { 0x3E, 0x49, 0x30 } },
+  { '7', 3, { 0x01, 0x71, 0x0F } },
+  { '8', 3, { 0x3E, 0x49, 0x3E } },
+  { '9', 3, { 0x06, 0x49, 0x3E } },
+  { 'A', 3, { 0x7E, 0x09, 0x7E } },
+  { 'B', 3, { 0x7F, 0x49, 0x3E } },
+  { 'C', 3, { 0x3E, 0x41, 0x41 } },
+  { 'D', 3, { 0x7F, 0x41, 0x3E } },
+  { 'E', 3, { 0x7F, 0x49, 0x41 } },
+  { 'F', 3, { 0x7F, 0x09, 0x01 } },
+  { 'H', 3, { 0x7F, 0x08, 0x7F } },
+  { 'I', 3, { 0x00, 0x7F, 0x00 } },
+  { 'J', 3, { 0x40, 0x3F, 0x00 } },
+  { 'K', 3, { 0x7F, 0x10, 0x6C } },
+  { 'L', 3, { 0x3F, 0x40, 0x40 } },
+  { 'G', 3, { 0x3E, 0x41, 0x70 } },
+  { 'M', 3, { 0x7F, 0x02, 0x7F } },
+  { 'N', 3, { 0x7F, 0x01, 0x7E } },
+  { 'O', 3, { 0x3E, 0x41, 0x3E } },
+  { 'P', 3, { 0x7F, 0x09, 0x06 } },
+  { 'Q', 3, { 0x1E, 0x21, 0x5E } },
+  { 'R', 3, { 0x7F, 0x09, 0x76 } },
+  { 'S', 3, { 0x4E, 0x49, 0x31 } },
+  { 'T', 3, { 0x01, 0x7F, 0x01 } },
+  { 'U', 3, { 0x3F, 0x40, 0x3F } },
+  { 'V', 3, { 0x3F, 0x60, 0x3F } },
+  { 'W', 5, { 0x3F, 0x40, 0x38, 0x40, 0x3F } },
+  { 'X', 3, { 0x67, 0x18, 0x67 } },
+  { 'Y', 3, { 0x07, 0x78, 0x07 } },
+  { ':', 3, { 0x00, 0x36, 0x00 } },
+  { ',', 3, { 0x00, 0x60, 0x00 } },
+  { '.', 3, { 0x00, 0x20, 0x00 } },
+  { '?', 3, { 0x02, 0x51, 0x0E } },
+  { '!', 3, { 0x00, 0x5F, 0x00 } },
+  { '%', 3, { 0x71, 0x08, 0x47 } },
+  { '^', 3, { 0x04, 0x03, 0x04 } },
+  { '(', 3, { 0x3E, 0x41, 0x00 } },
+  { ')', 3, { 0x00, 0x41, 0x3E } },
+  { '[', 3, { 0x7F, 0x41, 0x00 } },
+  { ']', 3, { 0x00, 0x41, 0x7F } },
+  { '<', 3, { 0x08, 0x14, 0x00 } },
+  { '>', 3, { 0x00, 0x14, 0x08 } },
+  { '\'', 3, { 0x00, 0x03, 0x00 } },
+  { ';', 3, { 0x40, 0x26, 0x00 } },
+  { '/', 3, { 0x70, 0x1C, 0x07 } },
+  { '\\', 3, { 0x07, 0x1C, 0x70 } },
+  { '|', 3, { 0x00, 0x7F, 0x00 } },
+  { '"', 3, { 0x03, 0x00, 0x03 } },
+  { '`', 3, { 0x01, 0x02, 0x00 } },
+  { '~', 3, { 0x0C, 0x08, 0x18 } },
+  { 'Z', 3, { 0x47, 0x4D, 0x71 } },
+};
+const uint8_t TIKO_FONT_COUNT = sizeof(TIKO_FONT) / sizeof(TIKO_FONT[0]);
+
+// Characters that exist in the pixel-art source but are not part
+// of the printable glyph table above (used by the temp/pressure
+// builders instead of going through tikoGetChar):
+const uint8_t TIKO_DEG[3]   = { 0x02, 0x05, 0x02 };  // °
+const uint8_t TIKO_MINUS[3] = { 0x08, 0x08, 0x08 };  // -
+const uint8_t TIKO_SPACE[2] = { 0x00, 0x00 };        // ' ' (no glyph in source font)
+
+// Drop-in replacement for mx.getChar(ch, size, buf): looks the
+// character up in TIKO_FONT (case-insensitive — the source font
+// only defines uppercase letters), falls back to a blank space
+// glyph for anything unmapped (accented letters, '@', '-', '+',
+// '=', '&', '*', '#', '_', '$', etc. are not present in the
+// supplied pixel art and are not guessed at here).
+uint8_t tikoGetChar(char ch, uint8_t size, uint8_t* buf) {
+  if (ch == ' ') {
+    uint8_t n = (2 <= size) ? 2 : size;
+    for (uint8_t i = 0; i < n; i++) buf[i] = TIKO_SPACE[i];
+    return n;
+  }
+  if (ch == '-') {
+    uint8_t n = (3 <= size) ? 3 : size;
+    for (uint8_t i = 0; i < n; i++) buf[i] = TIKO_MINUS[i];
+    return n;
+  }
+  char up = (ch >= 'a' && ch <= 'z') ? (ch - 32) : ch;
+  for (uint8_t gi = 0; gi < TIKO_FONT_COUNT; gi++) {
+    if (TIKO_FONT[gi].ch == up) {
+      uint8_t n = (TIKO_FONT[gi].cols <= size) ? TIKO_FONT[gi].cols : size;
+      for (uint8_t i = 0; i < n; i++) buf[i] = TIKO_FONT[gi].data[i];
+      return n;
+    }
+  }
+  // Unmapped character: fall back to a blank 3-col space so text
+  // keeps flowing instead of stalling the buffer.
+  uint8_t n = (3 <= size) ? 3 : size;
+  for (uint8_t i = 0; i < n; i++) buf[i] = 0x00;
+  return n;
+}
+
+// FONT_MODE_DEFAULT = 0 ("Marymba", the existing library/FONT[] look)
+// FONT_MODE_TIKO    = 1 (new 3x7 custom font)
+// (defined earlier, near appendGlyphAuto, so they're visible where first used)
 
 const uint8_t wifiLogo[8] = {
   0b00000010, 0b00001001, 0b00000101, 0b00110101,
@@ -1436,19 +1584,39 @@ static unsigned long datePauseMs = 0;
 static bool     dateNeedsScroll = false;
 static int      dateWrapPass = 0;
 
-static void tempAddGlyphTo(uint8_t* buf, int& count, const uint8_t* glyph) {
-  for (int i = 0; i < 5 && count < 62; i++)
+static void tempAddGlyphTo(uint8_t* buf, int& count, const uint8_t* glyph, int width = 5) {
+  for (int i = 0; i < width && count < 62; i++)
     buf[count++] = glyph[i];
   if (count < 63) buf[count++] = 0x00;
 }
 
-static void tempAddGlyph(const uint8_t* glyph) {
-  for (int i = 0; i < 5 && tempColCount < 126; i++)
+static void tempAddGlyph(const uint8_t* glyph, int width = 5) {
+  for (int i = 0; i < width && tempColCount < 126; i++)
     tempColBuf[tempColCount++] = glyph[i];
   if (tempColCount < 127) tempColBuf[tempColCount++] = 0x00;
 }
 
+// Shared helper: returns a pointer-friendly digit glyph (0-9) for
+// either the classic 5-wide FONT[] table or the new 3-wide Tiko
+// font, and reports its column width via 'width'. 'tmp' must be
+// at least TIKO_MAX_COLS bytes and stays valid until reused.
+static const uint8_t* digitGlyph(uint8_t fontMode, int d, uint8_t* tmp, int& width) {
+  if (fontMode == FONT_MODE_TIKO) {
+    width = tikoGetChar((char)('0' + d), TIKO_MAX_COLS, tmp);
+    return tmp;
+  }
+  width = 5;
+  return FONT[d];
+}
+
 static void dateAddDot() {
+  if (fontTypeDate == FONT_MODE_TIKO) {
+    uint8_t tmp[TIKO_MAX_COLS];
+    uint8_t n = tikoGetChar('.', TIKO_MAX_COLS, tmp);
+    for (int i = 0; i < n && dateColCount < 126; i++) dateColBuf[dateColCount++] = tmp[i];
+    if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
+    return;
+  }
   if (dateColCount < 126) dateColBuf[dateColCount++] = CHAR_DOT[0];
   if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
 }
@@ -1475,26 +1643,37 @@ void tempBuildBuffer(int tempC) {
 
   bool negative = (temp < 0);
   int  absTemp  = abs(temp);
+  bool tiko = (fontTypeTemp == FONT_MODE_TIKO);
 
   if (negative) {
-    for (int i = 0; i < 3 && tempColCount < 126; i++)
-      tempColBuf[tempColCount++] = 0x08;
+    const uint8_t* minusGlyph = tiko ? TIKO_MINUS : nullptr;
+    int minusW = tiko ? 3 : 3;
+    for (int i = 0; i < minusW && tempColCount < 126; i++)
+      tempColBuf[tempColCount++] = tiko ? minusGlyph[i] : 0x08;
     if (tempColCount < 127) tempColBuf[tempColCount++] = 0x00;
   }
 
+  uint8_t dtmp[TIKO_MAX_COLS]; int dw;
   if (absTemp >= 100) {
-    tempAddGlyph(FONT[absTemp / 100]);
-    tempAddGlyph(FONT[(absTemp / 10) % 10]);
-    tempAddGlyph(FONT[absTemp % 10]);
+    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 100, dtmp, dw), dw);
+    tempAddGlyph(digitGlyph(fontTypeTemp, (absTemp / 10) % 10, dtmp, dw), dw);
+    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
   } else if (absTemp >= 10) {
-    tempAddGlyph(FONT[absTemp / 10]);
-    tempAddGlyph(FONT[absTemp % 10]);
+    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 10, dtmp, dw), dw);
+    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
   } else {
-    tempAddGlyph(FONT[absTemp]);
+    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp, dtmp, dw), dw);
   }
 
-  tempAddGlyph(CHAR_DEG);
-  tempAddGlyph((tempUnit == 1) ? CHAR_F : CHAR_C);
+  if (tiko) {
+    tempAddGlyph(TIKO_DEG, 3);
+    uint8_t utmp[TIKO_MAX_COLS];
+    uint8_t uw = tikoGetChar((tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
+    tempAddGlyph(utmp, uw);
+  } else {
+    tempAddGlyph(CHAR_DEG);
+    tempAddGlyph((tempUnit == 1) ? CHAR_F : CHAR_C);
+  }
 
   if (tempColCount > 0) tempColCount--;
 }
@@ -1621,20 +1800,21 @@ void pressureBuildBuffer(int hpaInt) {
   }
 
   int absVal = abs(hpaInt);
+  uint8_t dtmp[TIKO_MAX_COLS]; int dw;
   if (absVal >= 1000) {
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[(absVal / 1000) % 10]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[(absVal / 100) % 10]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[(absVal / 10) % 10]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal % 10]);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, (absVal / 1000) % 10, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, (absVal / 100) % 10, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, (absVal / 10) % 10, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal % 10, dtmp, dw), dw);
   } else if (absVal >= 100) {
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal / 100]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[(absVal / 10) % 10]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal % 10]);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal / 100, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, (absVal / 10) % 10, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal % 10, dtmp, dw), dw);
   } else if (absVal >= 10) {
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal / 10]);
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal % 10]);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal / 10, dtmp, dw), dw);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal % 10, dtmp, dw), dw);
   } else {
-    tempAddGlyphTo(pressureColBuf, pressureColCount, FONT[absVal]);
+    tempAddGlyphTo(pressureColBuf, pressureColCount, digitGlyph(fontTypePressure, absVal, dtmp, dw), dw);
   }
 
   if (pressureColCount > 0) pressureColCount--;
@@ -1718,7 +1898,7 @@ static bool     currNeedsScroll = false;
 static int      currWrapPass = 0;
 
 static void currBufAppendMD(char ch) {
-  appendGlyphAuto(currColBuf, currColCount, 127, ch);
+  appendGlyphAuto(currColBuf, currColCount, 127, ch, fontTypeCurrency);
 }
 
 void currencyBuildBuffer() {
@@ -1977,8 +2157,16 @@ static int writeDigit(int d, int col) {
   return col;
 }
 
-static void dateAddGlyph(const uint8_t* glyph) {
-  for (int i = 0; i < 5 && dateColCount < 126; i++)
+static int writeDigitFont(int d, int col, uint8_t fontMode) {
+  uint8_t tmp[TIKO_MAX_COLS]; int w;
+  const uint8_t* g = digitGlyph(fontMode, d, tmp, w);
+  writeCharN(g, w, col); col += w;
+  writeGap(col);         col += 1;
+  return col;
+}
+
+static void dateAddGlyph(const uint8_t* glyph, int width = 5) {
+  for (int i = 0; i < width && dateColCount < 126; i++)
     dateColBuf[dateColCount++] = glyph[i];
   if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
 }
@@ -1988,7 +2176,8 @@ static void dateAddNumber(int value, int digits) {
   for (int i = 1; i < digits; i++) divisor *= 10;
   for (int i = 0; i < digits; i++) {
     int d = (value / divisor) % 10;
-    dateAddGlyph(FONT[d]);
+    uint8_t dtmp[TIKO_MAX_COLS]; int dw;
+    dateAddGlyph(digitGlyph(fontTypeDate, d, dtmp, dw), dw);
     divisor /= 10;
   }
 }
@@ -1997,6 +2186,14 @@ const char* const WEEKDAY_NAMES_EN[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fr
 const char* const WEEKDAY_NAMES_RO[7] = { "Dum", "Lun", "Mar", "Mie", "Joi", "Vin", "Sam" };
 
 static void dateAddChar(char ch) {
+  if (fontTypeDate == FONT_MODE_TIKO) {
+    uint8_t tmp[TIKO_MAX_COLS];
+    uint8_t n = tikoGetChar(ch, sizeof(tmp), tmp);
+    if (n == 0) return;
+    for (int i = 0; i < n && dateColCount < 126; i++) dateColBuf[dateColCount++] = tmp[i];
+    if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
+    return;
+  }
   if (ch >= '0' && ch <= '9') {
     dateAddGlyph(FONT[ch - '0']);
   } else {
@@ -2235,23 +2432,29 @@ void drawHour() {
   for (int i = 0; i < 32; i++) mx.setColumn(i, 0x00);
 
   bool twoDigitH = (h >= 10);
+  bool tiko = (fontType == FONT_MODE_TIKO);
+  int digitW = tiko ? 3 : 5;
 
-  int totalWidth = (twoDigitH ? 2 : 1) * 6 + 3 + 11;
+  uint8_t colonTmp[TIKO_MAX_COLS];
+  const uint8_t* colonGlyph = CHAR_COLON;
+  int colonW = 2;
+  if (tiko) { colonW = tikoGetChar(':', TIKO_MAX_COLS, colonTmp); colonGlyph = colonTmp; }
+
+  int totalWidth = (twoDigitH ? 2 : 1) * (digitW + 1) + (colonW + 1) + 2 * digitW + 1;
   int col = (32 - totalWidth) / 2;
 
   if (twoDigitH) {
-    col = writeDigit(h / 10, col);
+    col = writeDigitFont(h / 10, col, fontType);
   }
-  col = writeDigit(h % 10, col);
+  col = writeDigitFont(h % 10, col, fontType);
   if (show) {
-    writeCharN(CHAR_COLON, 2, col); col += 2; writeGap(col); col += 1;
+    writeCharN(colonGlyph, colonW, col); col += colonW; writeGap(col); col += 1;
   } else {
-    mx.setColumn(31 - col, 0x00); col++;
-    mx.setColumn(31 - col, 0x00); col++;
-    mx.setColumn(31 - col, 0x00); col++;
+    for (int i = 0; i < colonW + 1; i++) { mx.setColumn(31 - col, 0x00); col++; }
   }
-  col = writeDigit(m / 10, col);
-  writeChar(FONT[m % 10], col);
+  col = writeDigitFont(m / 10, col, fontType);
+  uint8_t dtmp[TIKO_MAX_COLS]; int dw;
+  writeCharN(digitGlyph(fontType, m % 10, dtmp, dw), dw, col);
 
   mxCommit();
 }
@@ -2276,7 +2479,7 @@ void npBuildBuffer() {
     scrollBufPrependIcon(npColBuf, npColCount, 512, musicIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && npColCount < 500; ci++) {
-    appendGlyphAuto(npColBuf, npColCount, 512, cleanBuf[ci]);
+    appendGlyphAuto(npColBuf, npColCount, 512, cleanBuf[ci], fontTypeNowPlaying);
   }
 
   if (npColCount > 0) npColCount--;
@@ -2339,7 +2542,7 @@ void swBuildBuffer() {
   swFormatAdaptive(txt, sizeof(txt), swGetElapsedMs());
   swColCount = 0;
   for (int ci = 0; txt[ci] != '\0' && swColCount < 150; ci++) {
-    appendGlyphAuto(swColBuf, swColCount, 160, txt[ci]);
+    appendGlyphAuto(swColBuf, swColCount, 160, txt[ci], fontTypeStopwatch);
   }
   if (swColCount > 0) swColCount--;
 }
@@ -2510,7 +2713,7 @@ void timerBuildBuffer() {
   timerFormatText(txt, sizeof(txt));
   timerColCount = 0;
   for (int ci = 0; txt[ci] != '\0' && timerColCount < 150; ci++) {
-    appendGlyphAuto(timerColBuf, timerColCount, 160, txt[ci]);
+    appendGlyphAuto(timerColBuf, timerColCount, 160, txt[ci], fontTypeTimer);
   }
   if (timerColCount > 0) timerColCount--;
 }
@@ -2677,7 +2880,7 @@ void notifBuildBuffer() {
     scrollBufPrependIcon(notifColBuf, notifColCount, 512, notifIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && notifColCount < 500; ci++) {
-    appendGlyphAuto(notifColBuf, notifColCount, 512, cleanBuf[ci]);
+    appendGlyphAuto(notifColBuf, notifColCount, 512, cleanBuf[ci], fontTypeNotif);
   }
   if (notifColCount > 0) notifColCount--;
 }
@@ -2727,7 +2930,7 @@ void mementoBuildBuffer() {
     scrollBufPrependIcon(mementoColBuf, mementoColCount, 512, mementoIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && mementoColCount < 500; ci++) {
-    appendGlyphAuto(mementoColBuf, mementoColCount, 512, cleanBuf[ci]);
+    appendGlyphAuto(mementoColBuf, mementoColCount, 512, cleanBuf[ci], fontTypeReminder);
   }
   if (mementoColCount > 0) mementoColCount--;
 }
@@ -3231,7 +3434,7 @@ void ipBuildBuffer() {
     scrollBufPrependIcon(ipColBuf, ipColCount, 128, ipIcon, NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && ipColCount < 120; ci++) {
-    appendGlyphAuto(ipColBuf, ipColCount, 128, cleanBuf[ci]);
+    appendGlyphAuto(ipColBuf, ipColCount, 128, cleanBuf[ci], fontTypeIp);
   }
   if (ipColCount > 0) ipColCount--;
 }
@@ -3533,7 +3736,9 @@ static void wxBufAppend(const uint8_t* src, int n, bool gap = true) {
 
 static void wxBufAppendMD(char ch) {
   uint8_t tmp[8];
-  uint8_t n = mx.getChar(ch, sizeof(tmp), tmp);
+  uint8_t n = (fontTypeWeather == FONT_MODE_TIKO)
+                ? tikoGetChar(ch, sizeof(tmp), tmp)
+                : mx.getChar(ch, sizeof(tmp), tmp);
   if (n == 0) return;
   for (int i = 0; i < n && wxColCount < 511; i++)
     wxColBuf[wxColCount++] = tmp[i];
@@ -3630,20 +3835,36 @@ void weatherBuildBuffer() {
   int  absTemp    = abs(displayTemp);
   bool twoDigit   = (absTemp >= 10);
 
+  bool wxTiko = (fontTypeWeather == FONT_MODE_TIKO);
+  uint8_t dtmp[TIKO_MAX_COLS]; int dw;
+
   if (neg) {
     static const uint8_t CHAR_MINUS[3] = {0x08, 0x08, 0x08};
-    wxBufAppend(CHAR_MINUS, 3);
+    if (wxTiko) wxBufAppend(TIKO_MINUS, 3);
+    else        wxBufAppend(CHAR_MINUS, 3);
   }
 
-  if (twoDigit) {
-    wxBufAppend(FONT[absTemp / 10], 5);
-    wxBufAppend(FONT[absTemp % 10], 5);
+  if (wxTiko) {
+    if (twoDigit) {
+      wxBufAppend(digitGlyph(fontTypeWeather, absTemp / 10, dtmp, dw), dw);
+      wxBufAppend(digitGlyph(fontTypeWeather, absTemp % 10, dtmp, dw), dw);
+    } else {
+      wxBufAppend(digitGlyph(fontTypeWeather, absTemp, dtmp, dw), dw);
+    }
+    wxBufAppend(TIKO_DEG, 3);
+    uint8_t utmp[TIKO_MAX_COLS];
+    uint8_t uw = tikoGetChar((tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
+    wxBufAppend(utmp, uw);
   } else {
-    wxBufAppend(FONT[absTemp], 5);
+    if (twoDigit) {
+      wxBufAppend(FONT[absTemp / 10], 5);
+      wxBufAppend(FONT[absTemp % 10], 5);
+    } else {
+      wxBufAppend(FONT[absTemp], 5);
+    }
+    wxBufAppend(CHAR_DEG, 5);
+    wxBufAppend((tempUnit == 1) ? CHAR_F : CHAR_C, 5);
   }
-
-  wxBufAppend(CHAR_DEG, 5);
-  wxBufAppend((tempUnit == 1) ? CHAR_F : CHAR_C, 5);
 
   if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
   if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
@@ -3654,14 +3875,14 @@ void weatherBuildBuffer() {
     int humTens = hum / 10;
     int humOnes = hum % 10;
     if (hum >= 100) {
-      wxBufAppend(FONT[1], 5);
-      wxBufAppend(FONT[0], 5);
-      wxBufAppend(FONT[0], 5);
+      wxBufAppend(digitGlyph(fontTypeWeather, 1, dtmp, dw), dw);
+      wxBufAppend(digitGlyph(fontTypeWeather, 0, dtmp, dw), dw);
+      wxBufAppend(digitGlyph(fontTypeWeather, 0, dtmp, dw), dw);
     } else if (hum >= 10) {
-      wxBufAppend(FONT[humTens], 5);
-      wxBufAppend(FONT[humOnes], 5);
+      wxBufAppend(digitGlyph(fontTypeWeather, humTens, dtmp, dw), dw);
+      wxBufAppend(digitGlyph(fontTypeWeather, humOnes, dtmp, dw), dw);
     } else {
-      wxBufAppend(FONT[humOnes], 5);
+      wxBufAppend(digitGlyph(fontTypeWeather, humOnes, dtmp, dw), dw);
     }
     wxBufAppendMD('%');
   }
@@ -4354,6 +4575,19 @@ void loadSettings() {
   scrollTypeStopwatch  = prefs.getUChar("scrollTypeSw",     scrollType);
   scrollTypeTimer      = prefs.getUChar("scrollTypeTmr",    0);
   scrollTypeIp         = prefs.getUChar("scrollTypeIp",     scrollType);
+
+  fontType         = prefs.getUChar("fontType",     0);
+  fontTypeDate       = prefs.getUChar("fontTypeDate",   fontType);
+  fontTypeTemp       = prefs.getUChar("fontTypeTemp",   fontType);
+  fontTypeReminder   = prefs.getUChar("fontTypeRem",    fontType);
+  fontTypeWeather    = prefs.getUChar("fontTypeWx",     fontType);
+  fontTypeNotif      = prefs.getUChar("fontTypeNotif",  fontType);
+  fontTypeNowPlaying = prefs.getUChar("fontTypeNp",     fontType);
+  fontTypePressure   = prefs.getUChar("fontTypePress",  fontType);
+  fontTypeCurrency   = prefs.getUChar("fontTypeCurr",   fontType);
+  fontTypeStopwatch  = prefs.getUChar("fontTypeSw",     fontType);
+  fontTypeTimer      = prefs.getUChar("fontTypeTmr",    fontType);
+  fontTypeIp         = prefs.getUChar("fontTypeIp",     fontType);
   tileTransGlobal = prefs.getUChar("trGlobal", 0);
   tileTransHour   = prefs.getUChar("trHour",   tileTransGlobal);
   tileTransDate   = prefs.getUChar("trDate",   tileTransGlobal);
@@ -4453,6 +4687,19 @@ void saveSettings() {
   prefs.putUChar("scrollTypeSw",    scrollTypeStopwatch);
   prefs.putUChar("scrollTypeTmr",   scrollTypeTimer);
   prefs.putUChar("scrollTypeIp",    scrollTypeIp);
+
+  prefs.putUChar("fontType",     fontType);
+  prefs.putUChar("fontTypeDate",  fontTypeDate);
+  prefs.putUChar("fontTypeTemp",  fontTypeTemp);
+  prefs.putUChar("fontTypeRem",   fontTypeReminder);
+  prefs.putUChar("fontTypeWx",    fontTypeWeather);
+  prefs.putUChar("fontTypeNotif", fontTypeNotif);
+  prefs.putUChar("fontTypeNp",    fontTypeNowPlaying);
+  prefs.putUChar("fontTypePress", fontTypePressure);
+  prefs.putUChar("fontTypeCurr",  fontTypeCurrency);
+  prefs.putUChar("fontTypeSw",    fontTypeStopwatch);
+  prefs.putUChar("fontTypeTmr",   fontTypeTimer);
+  prefs.putUChar("fontTypeIp",    fontTypeIp);
   prefs.putUChar("trGlobal", tileTransGlobal);
   prefs.putUChar("trHour",   tileTransHour);
   prefs.putUChar("trDate",   tileTransDate);
@@ -6750,7 +6997,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
         </div>
-        <div class="li" style="border-bottom:none" onclick="go('s-tiletransition')">
+        <div class="li" onclick="go('s-tiletransition')">
           <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" />
             </svg></div>
@@ -6770,6 +7017,21 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
               <option value=8>Expand Right</option>
               <option value=9>Expand Centre</option>
             </select><span class=chevron onclick="event.stopPropagation();go('s-tiletransition')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
+        <div class="li" style="border-bottom:none" onclick="go('s-fonttype')">
+          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M9.93 13.5h4.14L12 7.98zM20 2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-4.05 16.5l-1.14-3H9.17l-1.12 3H5.96l5.11-13h1.86l5.11 13h-2.09z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Font Type</div>
+            <div class=li-sub>Fontul folosit pentru textul de pe tile-uri</div>
+          </div>
+          <div class=li-trail><select class=evsnd-select onclick="event.stopPropagation()" onchange=setFontType(this.value) id=font-type-sel style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">
+              <option value=0 selected>Marymba</option>
+              <option value=1>Tiko</option>
+            </select><span class=chevron onclick="event.stopPropagation();go('s-fonttype')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
                 <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
               </svg></span></div>
         </div>
@@ -7150,6 +7412,19 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=card id=scrolltype-list></div>
     </div>
   </div>
+  <div class=screen id=s-fonttype>
+    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+        </svg></button>
+      <div class=bar-text>
+        <div class=bar-title>Font Type</div>
+      </div>
+    </div>
+    <div class=content>
+      <div class=sl>Font individual per tile</div>
+      <div class=card id=fonttype-list></div>
+    </div>
+  </div>
   <div class=screen id=s-hideicons>
     <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
           <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
@@ -7331,6 +7606,26 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }, {
         v: 3,
         n: `Wrap + Icon`
+      }],
+      fontTypeV = 0,
+      indivFont = {
+        date: 0,
+        temp: 0,
+        reminder: 0,
+        weather: 0,
+        notif: 0,
+        nowplaying: 0,
+        pressure: 0,
+        stopwatch: 0,
+        currency: 0,
+        ip: 0
+      },
+      FONT_TYPE_OPTIONS = [{
+        v: 0,
+        n: `Marymba`
+      }, {
+        v: 1,
+        n: `Tiko`
       }],
       buzzerVolume = 80,
       buzzerPreset = `calm`,
@@ -7995,6 +8290,9 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       if (id === `s-scrolltype`) {
         buildScrollTypeList()
       }
+      if (id === `s-fonttype`) {
+        buildFontTypeList()
+      }
       if (id === `s-hideicons`) {
         buildHideIconsList()
       }
@@ -8474,6 +8772,51 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         indivScroll[k] = scrollTypeV
       });
       refreshScrollTypeSelects();
+      saveSettings()
+    }
+
+    function setFontType(v) {
+      fontTypeV = parseInt(v);
+      var sel = document.getElementById(`font-type-sel`);
+      if (sel) sel.value = fontTypeV;
+      Object.keys(indivFont).forEach(function(k) {
+        indivFont[k] = fontTypeV
+      });
+      refreshFontTypeSelects();
+      saveSettings()
+    }
+
+    function applyFontType() {
+      var sel = document.getElementById(`font-type-sel`);
+      if (sel) sel.value = fontTypeV
+    }
+
+    function refreshFontTypeSelects() {
+      Object.keys(indivFont).forEach(function(k) {
+        var s = document.getElementById(`fonttype-sel-` + k);
+        if (s) s.value = indivFont[k]
+      })
+    }
+
+    function buildFontTypeList() {
+      var c = document.getElementById(`fonttype-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      SCROLL_TILES.forEach(function(t, i) {
+        var row = document.createElement(`div`);
+        row.className = `li static`;
+        row.style.borderBottom = `none`;
+        var opts = ``;
+        FONT_TYPE_OPTIONS.forEach(function(o) {
+          opts += `<option value="` + o.v + `"` + (o.v === indivFont[t.key] ? ` selected` : ``) + `>` + o.n + `</option>`
+        });
+        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div></div><div class="li-trail"><select class="evsnd-select" id="fonttype-sel-` + t.key + `" onchange="setIndividualFontType(\'` + t.key + `\',this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">` + opts + `</select></div>`;
+        c.appendChild(row)
+      })
+    }
+
+    function setIndividualFontType(key, val) {
+      indivFont[key] = parseInt(val);
       saveSettings()
     }
 
@@ -9256,7 +9599,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function saveSettings() {
-      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0);
+      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0) + `&fontType=` + fontTypeV + `&fontTypeDate=` + indivFont.date + `&fontTypeTemp=` + indivFont.temp + `&fontTypeReminder=` + indivFont.reminder + `&fontTypeWeather=` + indivFont.weather + `&fontTypeNotif=` + indivFont.notif + `&fontTypeNowPlaying=` + indivFont.nowplaying + `&fontTypePressure=` + indivFont.pressure + `&fontTypeStopwatch=` + indivFont.stopwatch + `&fontTypeCurrency=` + indivFont.currency + `&fontTypeIp=` + (indivFont.ip || 0);
       items.forEach(function(it, i) {
         p += `&id` + i + `=` + it.id + `&en` + i + `=` + (it.enabled ? 1 : 0) + `&dur` + i + `=` + it.dur
       }), fetch(`/settings`, {
@@ -10958,6 +11301,23 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           indivScroll.ip = s.scrollTypeIp !== void 0 ? s.scrollTypeIp : 0;
           refreshScrollTypeSelects()
         }
+        if (s.fontType !== void 0) {
+          fontTypeV = s.fontType;
+          applyFontType()
+        }
+        if (s.fontTypeDate !== void 0) {
+          indivFont.date = s.fontTypeDate;
+          indivFont.temp = s.fontTypeTemp;
+          indivFont.reminder = s.fontTypeReminder;
+          indivFont.weather = s.fontTypeWeather;
+          indivFont.notif = s.fontTypeNotif;
+          indivFont.nowplaying = s.fontTypeNowPlaying;
+          indivFont.pressure = s.fontTypePressure;
+          indivFont.stopwatch = s.fontTypeStopwatch !== void 0 ? s.fontTypeStopwatch : 0;
+          indivFont.currency = s.fontTypeCurrency !== void 0 ? s.fontTypeCurrency : 0;
+          indivFont.ip = s.fontTypeIp !== void 0 ? s.fontTypeIp : 0;
+          refreshFontTypeSelects()
+        }
         if (s.notifEnabled !== void 0) {
           notifEn = s.notifEnabled;
           var nc = document.getElementById(`notif-cb`);
@@ -11285,7 +11645,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         });
       };
       saveSettings = function() {
-        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0);
+        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0) + "&fontType=" + fontTypeV + "&fontTypeDate=" + indivFont.date + "&fontTypeTemp=" + indivFont.temp + "&fontTypeReminder=" + indivFont.reminder + "&fontTypeWeather=" + indivFont.weather + "&fontTypeNotif=" + indivFont.notif + "&fontTypeNowPlaying=" + indivFont.nowplaying + "&fontTypePressure=" + indivFont.pressure + "&fontTypeStopwatch=" + indivFont.stopwatch + "&fontTypeTimer=" + (indivFont.timer || 0) + "&fontTypeCurrency=" + (indivFont.currency || 0) + "&fontTypeIp=" + (indivFont.ip || 0);
         items.forEach(function(it, i) {
           p += "&id" + i + "=" + it.id + "&en" + i + "=" + (it.enabled ? 1 : 0) + "&dur" + i + "=" + it.dur;
         });
@@ -12590,6 +12950,91 @@ void handleSettings() {
     int st = server.arg("scrollTypeIp").toInt();
     if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeIp) scrollTypeTouched = true; scrollTypeIp = (uint8_t)st; }
   }
+
+  bool fontTypeTouched = false;
+  if (server.hasArg("fontType")) {
+    int ft = server.arg("fontType").toInt();
+    if (ft >= 0 && ft <= 1 && (uint8_t)ft != fontType) {
+      fontTypeTouched = true;
+      fontType = (uint8_t)ft;
+
+      fontTypeDate       = (uint8_t)ft;
+      fontTypeTemp       = (uint8_t)ft;
+      fontTypeReminder   = (uint8_t)ft;
+      fontTypeWeather    = (uint8_t)ft;
+      fontTypeNotif      = (uint8_t)ft;
+      fontTypeNowPlaying = (uint8_t)ft;
+      fontTypePressure   = (uint8_t)ft;
+      fontTypeStopwatch  = (uint8_t)ft;
+      fontTypeCurrency   = (uint8_t)ft;
+      fontTypeTimer      = (uint8_t)ft;
+      fontTypeIp         = (uint8_t)ft;
+    }
+  }
+  if (server.hasArg("fontTypeDate")) {
+    int ft = server.arg("fontTypeDate").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeDate) fontTypeTouched = true; fontTypeDate = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeTemp")) {
+    int ft = server.arg("fontTypeTemp").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeTemp) fontTypeTouched = true; fontTypeTemp = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeReminder")) {
+    int ft = server.arg("fontTypeReminder").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeReminder) fontTypeTouched = true; fontTypeReminder = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeWeather")) {
+    int ft = server.arg("fontTypeWeather").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeWeather) fontTypeTouched = true; fontTypeWeather = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeNotif")) {
+    int ft = server.arg("fontTypeNotif").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeNotif) fontTypeTouched = true; fontTypeNotif = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeNowPlaying")) {
+    int ft = server.arg("fontTypeNowPlaying").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeNowPlaying) fontTypeTouched = true; fontTypeNowPlaying = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypePressure")) {
+    int ft = server.arg("fontTypePressure").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypePressure) fontTypeTouched = true; fontTypePressure = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeStopwatch")) {
+    int ft = server.arg("fontTypeStopwatch").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeStopwatch) fontTypeTouched = true; fontTypeStopwatch = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeCurrency")) {
+    int ft = server.arg("fontTypeCurrency").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeCurrency) fontTypeTouched = true; fontTypeCurrency = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeTimer")) {
+    int ft = server.arg("fontTypeTimer").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeTimer) fontTypeTouched = true; fontTypeTimer = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeIp")) {
+    int ft = server.arg("fontTypeIp").toInt();
+    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeIp) fontTypeTouched = true; fontTypeIp = (uint8_t)ft; }
+  }
+  if (fontTypeTouched) {
+
+    if (notifActive) {
+      notifBuildBuffer();
+    } else if (ipShowActive) {
+      ipBuildBuffer();
+    } else if (swRunning) {
+      swInit();
+    } else {
+      CycleItem& cur = items[currentSlot];
+      if (cur.id == ITEM_NOW_PLAYING)     npInit();
+      else if (cur.id == ITEM_WEATHER)    weatherInit();
+      else if (cur.id == ITEM_MEMENTO)    mementoInit();
+      else if (cur.id == ITEM_DATE)       dateInit();
+      else if (cur.id == ITEM_TEMP)       tempInit(lastTemp);
+      else if (cur.id == ITEM_PRESSURE)   pressureInit((int)round(lastPressureHpa));
+      else if (cur.id == ITEM_CURRENCY)   currencyInit();
+    }
+  }
+
   if (scrollTypeTouched) {
 
     if (notifActive) {
@@ -12837,6 +13282,18 @@ void handleState() {
           ",\"scrollTypeCurrency\":" + String(scrollTypeCurrency) +
           ",\"scrollTypeTimer\":" + String(scrollTypeTimer) +
           ",\"scrollTypeIp\":" + String(scrollTypeIp) +
+          ",\"fontType\":" + String(fontType) +
+          ",\"fontTypeDate\":" + String(fontTypeDate) +
+          ",\"fontTypeTemp\":" + String(fontTypeTemp) +
+          ",\"fontTypeReminder\":" + String(fontTypeReminder) +
+          ",\"fontTypeWeather\":" + String(fontTypeWeather) +
+          ",\"fontTypeNotif\":" + String(fontTypeNotif) +
+          ",\"fontTypeNowPlaying\":" + String(fontTypeNowPlaying) +
+          ",\"fontTypePressure\":" + String(fontTypePressure) +
+          ",\"fontTypeStopwatch\":" + String(fontTypeStopwatch) +
+          ",\"fontTypeCurrency\":" + String(fontTypeCurrency) +
+          ",\"fontTypeTimer\":" + String(fontTypeTimer) +
+          ",\"fontTypeIp\":" + String(fontTypeIp) +
           ",\"tileTransGlobal\":" + String(tileTransGlobal) +
           ",\"tileTransHour\":" + String(tileTransHour) +
           ",\"tileTransDate\":" + String(tileTransDate) +

@@ -1,4 +1,4 @@
-![banner](/.github/banner.png)
+![banner](/.github/banner2.png)
 
 A compact smart desk clock firmware that connects to Wi-Fi, syncs time automatically, and displays time, date, temperature, and atmospheric pressure  all in one firmware.
 
@@ -200,7 +200,7 @@ Here is a full schematic you can build if you want your Octoglow to run on batte
 
 Octoglow sender is a app that makes your matchine comunicate with your octoglow device by sending data over the internet to your octoglow device
 
-![octoglowsender](<.github/Octoglow Sender.png>)
+![octoglowsender](<.github/Octoglow_Sender.png>)
 
 ![What it does?](.github/titles/wid.png)
 
