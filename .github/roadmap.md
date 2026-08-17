@@ -128,14 +128,31 @@ Here Is the full list of buzzer tones
 
 ![dd](roadmaps/roadmap4.png)
 
+# 7. Released the Octoglow Website + Major Firmware Fixes
 
-7.
-Notification tile font issue
-IP adress Scroling font issue
-Connection Issue Popup
-No ReLogin cache issue
-Locking for something else
-Scrolling freeze bugs
-Help Manager
-Data formatting DD/MM/YYY
-Design Flow in tile manager settings
+## 1. Octoglow Website
+
+Released the new **Octoglow Website**! This page makes the Octoglow setup and introduction easier for new users, while also providing a way to try out the Octoglow dashboard.
+
+## 2. Firmware Updates
+
+* **Fixed Tile Font Issues:** Fixed numeric font issues affecting the following tiles:
+
+  * IP Address
+  * Notification
+
+* **Fixed Text Scrolling Freezes:** Fixed most of the freeze issues that occurred when a tile was scrolling text.
+
+* **"Looking for Something Else" Section:** Added a **"Looking for Something Else"** section to the Tile Manager and AP pages. This will help users find information related to these menus.
+
+* **No Re-Login Required:** Fixed the login cache issue. Now, even if you unplug your Octoglow, you can still access it without entering your password again, as long as you have previously logged in or revisited the page within the last 30 days.
+
+* **Connection Issue Popup:** If your ESP loses its internet connection, a popup will now be displayed in the web interface to notify you.
+
+* **Tile Manager Design Improvements:** Improved the design flow in the Tile Manager settings. All custom options for a tile are now displayed in a cleaner list format using radio buttons.
+
+* **Help Manager:** Some tiles now have a **(?)** icon. Pressing it will show information about how to properly configure and use that tile.
+
+* **Custom Date Formatting:** You can now customize the date format however you want using:
+  **W, Y, M, D, /, , and .**
+
