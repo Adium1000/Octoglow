@@ -150,7 +150,7 @@ The firmware should work on any ESP board, although it was tested on the followi
 Here is a full schematic you can build if you want your Octoglow to run on battery
 (the battery circuit is optional and can be skipped).
 
-![schematics](.github/Schematics.png)
+![schematics](Web/Schematics.png)
 
 
 | Component | GPIO |
@@ -200,7 +200,7 @@ Here is a full schematic you can build if you want your Octoglow to run on batte
 
 Octoglow sender is a app that makes your matchine comunicate with your octoglow device by sending data over the internet to your octoglow device
 
-![octoglowsender](<.github/Octoglow_Sender.png>)
+![octoglowsender](<Web/Octoglow_Sender.png>)
 
 ![What it does?](.github/titles/wid.png)
 
