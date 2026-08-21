@@ -5123,6 +5123,14 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     display: flex
   }
 
+  /* Nothing renders until the initial /state payload is in - only the
+     "Loading: User Settings" dialog is allowed to be visible. This has to
+     be plain CSS (not something a script adds later) so it applies on the
+     very first paint, before any script has had a chance to run. */
+  body.boot-hide>*:not(#us-load-scrim):not(#us-load-dlg) {
+    visibility: hidden !important
+  }
+
   @keyframes slide-in {
     0% {
       opacity: 0;
@@ -6643,7 +6651,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   }
 </style>
 
-<body>
+<body class=boot-hide>
   <script>
     (function() {
       try {
@@ -7865,6 +7873,19 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=mdd-body>
       <div style="display:flex;align-items:center;gap:10px;padding:4px 0 20px 9px;color:var(--on-surf-var);font-size:14px;line-height:1.5"><span class=spin-ring style="flex-shrink:0;margin-right:0"></span>Your device is out of range or is not successfully connected. Reconnecting…</div>
     </div>
+  </div>
+  <div class="md-scrim open" id=us-load-scrim></div>
+  <div class="md-dialog open" id=us-load-dlg>
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
+        </svg></div>
+      <div class=mdd-title>Loading: User Settings</div>
+    </div>
+    <div class=mdd-body>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 0 4px 9px;color:var(--on-surf-var);font-size:14px;line-height:1.5"><span class=spin-ring style="flex-shrink:0;margin-right:0"></span><span id=us-load-status>Se incarca setarile utilizatorului de pe dispozitiv…</span></div>
+    </div>
+    <div class=mdd-actions id=us-load-actions style="display:none"><button class="mbtn mbtn-ton" onclick="location.reload()">Reincarca pagina</button></div>
   </div>
   <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
@@ -11858,6 +11879,27 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       document.getElementById(`oor-dlg`).classList.remove(`open`)
     }
 
+    // "Loading: User Settings" popup - shown while the initial /state
+    // payload (and any retries) fill the client-side buffer, so the user
+    // doesn't interact with a half-populated UI before it's ready.
+    function openUsLoadDialog() {
+      document.getElementById(`us-load-scrim`).classList.add(`open`);
+      document.getElementById(`us-load-dlg`).classList.add(`open`)
+    }
+
+    function closeUsLoadDialog() {
+      document.getElementById(`us-load-scrim`).classList.remove(`open`);
+      document.getElementById(`us-load-dlg`).classList.remove(`open`)
+    }
+
+    function setUsLoadStatus(txt, isError) {
+      var el = document.getElementById(`us-load-status`);
+      if (el) {
+        el.textContent = txt;
+        el.style.color = isError ? `var(--err)` : ``
+      }
+    }
+
     var heartbeatTimer = null;
 
     function heartbeatTick() {
@@ -12002,6 +12044,8 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       });
       // Top bar elevation on scroll
       function loadHomeState() {
+      openUsLoadDialog();
+      setUsLoadStatus(stateLoadAttempt === 0 ? `Se incarca setarile utilizatorului de pe dispozitiv…` : `Reincercare ` + (stateLoadAttempt + 1) + ` din 5 - se incarca setarile utilizatorului…`);
       fetch(`/state`).then(function(r) {
         return r.json()
       }).then(function(s) {
@@ -12224,7 +12268,10 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         window.octoglowInitialState = s;
         window.dispatchEvent(new CustomEvent(`octoglow-state-ready`, {
           detail: s
-        }))
+        }));
+        setUsLoadStatus(`Setari incarcate.`);
+        closeUsLoadDialog();
+        document.body.classList.remove(`boot-hide`)
       }).catch(function(err) {
         // Previously silent about *why* a load failed - network error, JSON
         // parse failure, and the hasCompleteCircuitState throw all looked
@@ -12233,10 +12280,14 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         // the retry/toast behavior the user sees.
         console.error(`[octoglow] /state load attempt`, stateLoadAttempt + 1, `failed:`, err && err.message ? err.message : err);
         if (stateLoadAttempt < 4) {
+          setUsLoadStatus(`Eroare la incarcare (` + (err && err.message ? err.message : `necunoscuta`) + `). Se reincearca…`, !0);
           stateLoadAttempt++;
           setTimeout(loadHomeState, 500 * stateLoadAttempt);
           return
         }
+        setUsLoadStatus(`Nu s-au putut incarca setarile dupa 5 incercari. Reincarca pagina manual.`, !0);
+        var usAct = document.getElementById(`us-load-actions`);
+        if (usAct) usAct.style.display = ``;
         showToast(`Nu s-au putut incarca tile-urile. Reincarca pagina.`)
       })
       }

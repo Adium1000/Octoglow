@@ -196,11 +196,11 @@ Here is a full schematic you can build if you want your Octoglow to run on batte
 6. On first boot, the clock starts in **AP mode**  connect to its Wi-Fi network and open `192.168.4.1` in your browser to set up its connection to your home network.
 
 
-## Octoglow Sender 
+## Octoglow Connect
 
-Octoglow sender is a app that makes your matchine comunicate with your octoglow device by sending data over the internet to your octoglow device
+Octoglow Connect is a app that makes your matchine comunicate with your octoglow device by sending data over the internet to your octoglow device
 
-![octoglowsender](<Web/Octoglow_Sender.png>)
+![Octoglow_Connect](Web/Octoglow_Connect.png)
 
 ![What it does?](.github/titles/wid.png)
 
@@ -210,7 +210,7 @@ Octoglow sender is a app that makes your matchine comunicate with your octoglow 
 
 ![Setting Up ](.github/titles/su.png)
 
-First, you will need to get you Octoglow's IP adress and insert it in the `IP Adress` text box (you can ignore the port most of the times)
+First, you will need to get you Octoglow's IP adress and insert it in the `IP Adress` text box (you can ignore the port most of the times) in the conection tab
 
 ### How can I find my Octoglow's IP adress?
 
@@ -254,7 +254,6 @@ The ETS2 tile shows your truck's current speed on the clock, but it needs one ex
 ![oct1](.github/OctoglowInAction/IMG_0079.png)
 ![oct2](.github/OctoglowInAction/IMG_0080.png)
 
-![Want to share your Octoglow here?](adrian.tomoiaga12345@gmail.com)
 
 
 
