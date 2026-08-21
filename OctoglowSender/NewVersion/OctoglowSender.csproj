@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <UseWPF>false</UseWPF>
+    <WindowsPackageType>None</WindowsPackageType>
+    <UseWindowsForms>false</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\octoglow_logo.ico</ApplicationIcon>
+    <AssemblyName>OctoglowSender</AssemblyName>
+    <RootNamespace>OctoglowSender</RootNamespace>
+    <!-- No explicit CsWinRT package/CsWinRTIncludes needed: the net8.0-windows10.0.19041.0
+         TFM already ships built-in projections for Windows.Media.Control and
+         Windows.UI.Notifications. Forcing CsWinRTIncludes=Windows makes cswinrt.exe try to
+         regenerate a projection of the ENTIRE Windows namespace, which requires the UAP
+         Platform.xml that only exists if the full UWP Visual Studio workload is installed. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="SCSSdkClient.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\octoglow_logo.svg" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\octoglow_logo.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.251106002" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

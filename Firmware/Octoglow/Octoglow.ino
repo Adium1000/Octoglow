@@ -37,6 +37,7 @@ void handleApPass();
 void handleStopAp();
 String getApSsid();
 String getApPass();
+String jsonEscape(const String& in);
 void saveSettings();
 void applyBrightness();
 // AUTH
@@ -587,6 +588,11 @@ bool     nowPlayingActive      = false;
 
 uint8_t  npDisplayMode         = 0;
 
+// Adaptive icon: shows a "video" glyph instead of the music note when the
+// detected playback source is a video player (set by Octoglow Sender).
+bool     npAdaptiveIcon        = true;
+bool     npIsVideoSource       = false;
+
 // NOTIFICATIONS 
 char     notifBuf[204]         = "";
 bool     notifActive           = false;
@@ -602,6 +608,27 @@ bool     hideIconNowPlaying    = false;
 bool     hideIconPressure      = false;
 bool     hideIconCurrency      = false;
 bool     hideIconIp            = false;
+
+// TILE ICON OVERRIDES (0 = Auto/Default -> tile's own built-in icon)
+// Values 1..N select an entry from ICON_CATALOG (see below).
+uint8_t  iconSelDate           = 0;
+uint8_t  iconSelTemp           = 0;
+uint8_t  iconSelReminder       = 0;
+uint8_t  iconSelNotif          = 0;
+uint8_t  iconSelNpMusic        = 0;
+uint8_t  iconSelNpVideo        = 0;
+uint8_t  iconSelPressure       = 0;
+uint8_t  iconSelCurrency       = 0;
+uint8_t  iconSelIp             = 0;
+// Weather has several built-in icons (one per condition); each can be
+// overridden independently since the tile switches icon automatically.
+uint8_t  iconWxSunny           = 0;
+uint8_t  iconWxCloud           = 0;
+uint8_t  iconWxRain            = 0;
+uint8_t  iconWxStorm           = 0;
+uint8_t  iconWxSnow            = 0;
+uint8_t  iconWxWind            = 0;
+uint8_t  iconWxNight           = 0;
 
 uint8_t  scrollType            = 0;
 
@@ -896,16 +923,16 @@ static bool isNight() {
 
 const uint8_t* getWeatherIcon() {
   if (strcasecmp(weatherCondition, "Clear") == 0)
-    return isNight() ? moonIcon : sunnyIcon;
+    return isNight() ? resolveTileIcon(iconWxNight, moonIcon) : resolveTileIcon(iconWxSunny, sunnyIcon);
   if (strcasecmp(weatherCondition, "Clouds") == 0)
-    return cloudIcon;
+    return resolveTileIcon(iconWxCloud, cloudIcon);
   if (strcasecmp(weatherCondition, "Rain") == 0 ||
       strcasecmp(weatherCondition, "Drizzle") == 0)
-    return cloudRainIcon;
+    return resolveTileIcon(iconWxRain, cloudRainIcon);
   if (strcasecmp(weatherCondition, "Thunderstorm") == 0)
-    return cloudLightningIcon;
+    return resolveTileIcon(iconWxStorm, cloudLightningIcon);
   if (strcasecmp(weatherCondition, "Snow") == 0)
-    return cloudSnowIcon;
+    return resolveTileIcon(iconWxSnow, cloudSnowIcon);
   if (strcasecmp(weatherCondition, "Wind") == 0   ||
       strcasecmp(weatherCondition, "Mist") == 0   ||
       strcasecmp(weatherCondition, "Fog") == 0    ||
@@ -916,9 +943,9 @@ const uint8_t* getWeatherIcon() {
       strcasecmp(weatherCondition, "Ash") == 0    ||
       strcasecmp(weatherCondition, "Squall") == 0 ||
       strcasecmp(weatherCondition, "Tornado") == 0)
-    return windIcon;
+    return resolveTileIcon(iconWxWind, windIcon);
 
-  return cloudIcon;
+  return resolveTileIcon(iconWxCloud, cloudIcon);
 }
 
 uint8_t  tempUnit              = 0;
@@ -1435,7 +1462,7 @@ void drawApScreen() {
   for (int col = 0; col < 8; col++) {
     uint8_t colVal = 0;
     for (int row = 0; row < 8; row++) {
-      if (apIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+      if (ipIcon[row] & (0x80 >> col)) colVal |= (1 << row);
     }
     mx.setColumn(31 - col, colVal);
   }
@@ -1461,6 +1488,17 @@ const uint8_t musicIcon[8] = {
   0b11100110,
   0b11000111,
   0b00000110
+};
+
+const uint8_t videoIcon[8] = {
+  0b00000000,
+  0b01111110,
+  0b11101111,
+  0b11100111,
+  0b11100111,
+  0b11101111,
+  0b01111110,
+  0b00000000
 };
 
 const uint8_t mementoIcon[8] = {
@@ -1548,6 +1586,118 @@ const uint8_t pressureIconFlat[8] = {
 #define PRESSURE_ICON_COLS  8
 #define PRESSURE_SEP_COLS   1
 #define PRESSURE_TEXT_COLS  (32 - PRESSURE_ICON_COLS - PRESSURE_SEP_COLS)
+
+// ============================================================
+// CUSTOM TILE ICONS (extra icons offered in the web UI picker,
+// in addition to every icon the tiles already use natively)
+// ============================================================
+const uint8_t exclamationIcon[8] = {
+  0b00011000,
+  0b00011000,
+  0b00011000,
+  0b00011000,
+  0b00011000,
+  0b00000000,
+  0b00011000,
+  0b00011000
+};
+
+const uint8_t pauseIcon[8] = {
+  0b00000000,
+  0b01100110,
+  0b01100110,
+  0b01100110,
+  0b01100110,
+  0b01100110,
+  0b01100110,
+  0b00000000
+};
+
+const uint8_t euroIcon[8] = {
+  0b00011000,
+  0b00100100,
+  0b01110000,
+  0b00100000,
+  0b01110000,
+  0b00100100,
+  0b00011000,
+  0b00000000
+};
+
+const uint8_t bluetoothIcon[8] = {
+  0b00001000,
+  0b00101100,
+  0b00011010,
+  0b00001100,
+  0b00001100,
+  0b00011010,
+  0b00101100,
+  0b00001000
+};
+
+const uint8_t blockedIcon[8] = {
+  0b00000000,
+  0b00111100,
+  0b01000110,
+  0b01001010,
+  0b01010010,
+  0b01100010,
+  0b00111100,
+  0b00000000
+};
+
+// Master catalog of every icon selectable in the "Icon Settings" picker
+// (all pre-existing tile icons + the new ones above). The index used by
+// iconSel*/iconWx* settings is (position in this array + 1); 0 means
+// "Auto / Default" i.e. keep the tile's own built-in icon logic.
+struct IconCatalogEntry { const char* id; const uint8_t* bmp; };
+const IconCatalogEntry ICON_CATALOG[] = {
+  { "date",      dateIcon },
+  { "temp",      tempIcon },
+  { "reminder",  mementoIcon },
+  { "music",     musicIcon },
+  { "notif",     notifIcon },
+  { "pressup",   pressureIconUp },
+  { "pressdown", pressureIconDown },
+  { "pressflat", pressureIconFlat },
+  { "sunny",     sunnyIcon },
+  { "cloud",     cloudIcon },
+  { "rain",      cloudRainIcon },
+  { "storm",     cloudLightningIcon },
+  { "snow",      cloudSnowIcon },
+  { "wind",      windIcon },
+  { "moon",      moonIcon },
+  { "wifi",      ipIcon },
+  { "ap",        apIcon },
+  { "exclaim",   exclamationIcon },
+  { "pause",     pauseIcon },
+  { "euro",      euroIcon },
+  { "bluetooth", bluetoothIcon },
+  { "blocked",   blockedIcon },
+  { "wifilogo",  wifiLogo },
+  { "video",     videoIcon }
+};
+#define ICON_CATALOG_COUNT (sizeof(ICON_CATALOG) / sizeof(ICON_CATALOG[0]))
+
+static inline const uint8_t* resolveTileIcon(uint8_t sel, const uint8_t* fallback) {
+  if (sel > 0 && sel <= ICON_CATALOG_COUNT) return ICON_CATALOG[sel - 1].bmp;
+  return fallback;
+}
+
+// Now Playing's default (un-overridden) icon: the music note, unless
+// Adaptive Icon is on and the source app was reported as a video player.
+static inline const uint8_t* npFallbackIcon() {
+  return (npAdaptiveIcon && npIsVideoSource) ? videoIcon : musicIcon;
+}
+
+// Resolves the icon actually shown on the Now Playing tile: uses the
+// Music override or the Video override depending on the currently
+// detected source, falling back to npFallbackIcon() (which respects
+// Adaptive Icon) when the relevant override is left on Auto.
+static inline const uint8_t* npResolvedIcon() {
+  uint8_t sel = npIsVideoSource ? iconSelNpVideo : iconSelNpMusic;
+  return resolveTileIcon(sel, npFallbackIcon());
+}
 
 // DISPLAY HELPERS
 
@@ -1638,7 +1788,7 @@ void tempBuildBuffer(int tempC) {
   int temp = (tempUnit == 1) ? (tempC * 9 / 5 + 32) : tempC;
   tempColCount = 0;
   if (scrollIconInBuffer(scrollTypeTemp) && !hideIconTemp) {
-    scrollBufPrependIcon(tempColBuf, tempColCount, 127, tempIcon, TEMP_ICON_COLS);
+    scrollBufPrependIcon(tempColBuf, tempColCount, 127, resolveTileIcon(iconSelTemp, tempIcon), TEMP_ICON_COLS);
   }
 
   bool negative = (temp < 0);
@@ -1686,7 +1836,7 @@ void tempDrawAtPos(int pos) {
     for (int col = 0; col < TEMP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (tempIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (resolveTileIcon(iconSelTemp, tempIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -1743,9 +1893,10 @@ float         lastPressureHpa       = 1013.25f;
 int8_t        pressureTrend         = 0;
 
 static inline const uint8_t* pressureIconForTrend() {
-  if (pressureTrend > 0) return pressureIconUp;
-  if (pressureTrend < 0) return pressureIconDown;
-  return pressureIconFlat;
+  const uint8_t* base = pressureIconFlat;
+  if (pressureTrend > 0) base = pressureIconUp;
+  else if (pressureTrend < 0) base = pressureIconDown;
+  return resolveTileIcon(iconSelPressure, base);
 }
 
 void tempSampleTick() {
@@ -1883,9 +2034,10 @@ int8_t        currencyTrend       = 0;
 unsigned long lastCurrencyFetch   = 0;
 
 static inline const uint8_t* currencyIconForTrend() {
-  if (currencyTrend > 0) return pressureIconUp;
-  if (currencyTrend < 0) return pressureIconDown;
-  return pressureIconFlat;
+  const uint8_t* base = pressureIconFlat;
+  if (currencyTrend > 0) base = pressureIconUp;
+  else if (currencyTrend < 0) base = pressureIconDown;
+  return resolveTileIcon(iconSelCurrency, base);
 }
 
 static uint8_t  currColBuf[128];
@@ -2305,7 +2457,7 @@ static void dateRenderCustom(const char* pattern, int day, int month, int year, 
 void dateBuildBuffer(int day, int month, int year, int wday) {
   dateColCount = 0;
   if (scrollIconInBuffer(scrollTypeDate) && !hideIconDate) {
-    scrollBufPrependIcon(dateColBuf, dateColCount, 127, dateIcon, DATE_ICON_COLS);
+    scrollBufPrependIcon(dateColBuf, dateColCount, 127, resolveTileIcon(iconSelDate, dateIcon), DATE_ICON_COLS);
   }
   int yy = year % 100;
 
@@ -2360,7 +2512,7 @@ void dateDrawAtPos(int pos) {
     for (int col = 0; col < DATE_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (dateIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (resolveTileIcon(iconSelDate, dateIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -2476,7 +2628,7 @@ void npBuildBuffer() {
 
   npColCount = 0;
   if (scrollIconInBuffer(scrollTypeNowPlaying) && !hideIconNowPlaying) {
-    scrollBufPrependIcon(npColBuf, npColCount, 512, musicIcon, NP_ICON_COLS);
+    scrollBufPrependIcon(npColBuf, npColCount, 512, npResolvedIcon(), NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && npColCount < 500; ci++) {
     appendGlyphAuto(npColBuf, npColCount, 512, cleanBuf[ci], fontTypeNowPlaying);
@@ -2493,7 +2645,7 @@ void npDrawAtPos(int pos) {
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (musicIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (npResolvedIcon()[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -2877,7 +3029,7 @@ void notifBuildBuffer() {
   sanitizeUtf8(notifBuf, cleanBuf, sizeof(cleanBuf));
   notifColCount = 0;
   if (scrollIconInBuffer(scrollTypeNotif) && !hideIconNotif) {
-    scrollBufPrependIcon(notifColBuf, notifColCount, 512, notifIcon, NP_ICON_COLS);
+    scrollBufPrependIcon(notifColBuf, notifColCount, 512, resolveTileIcon(iconSelNotif, notifIcon), NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && notifColCount < 500; ci++) {
     appendGlyphAuto(notifColBuf, notifColCount, 512, cleanBuf[ci], fontTypeNotif);
@@ -2891,7 +3043,7 @@ void notifDrawAtPos(int pos) {
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (notifIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (resolveTileIcon(iconSelNotif, notifIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -2927,7 +3079,7 @@ void mementoBuildBuffer() {
   sanitizeUtf8(mementoBuf, cleanBuf, sizeof(cleanBuf));
   mementoColCount = 0;
   if (scrollIconInBuffer(scrollTypeReminder) && !hideIconReminder) {
-    scrollBufPrependIcon(mementoColBuf, mementoColCount, 512, mementoIcon, NP_ICON_COLS);
+    scrollBufPrependIcon(mementoColBuf, mementoColCount, 512, resolveTileIcon(iconSelReminder, mementoIcon), NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && mementoColCount < 500; ci++) {
     appendGlyphAuto(mementoColBuf, mementoColCount, 512, cleanBuf[ci], fontTypeReminder);
@@ -2942,7 +3094,7 @@ void mementoDrawAtPos(int pos) {
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (mementoIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (resolveTileIcon(iconSelReminder, mementoIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -3431,7 +3583,7 @@ void ipBuildBuffer() {
   sanitizeUtf8(ipBuf, cleanBuf, sizeof(cleanBuf));
   ipColCount = 0;
   if (scrollIconInBuffer(scrollTypeIp) && !hideIconIp) {
-    scrollBufPrependIcon(ipColBuf, ipColCount, 128, ipIcon, NP_ICON_COLS);
+    scrollBufPrependIcon(ipColBuf, ipColCount, 128, resolveTileIcon(iconSelIp, ipIcon), NP_ICON_COLS);
   }
   for (int ci = 0; cleanBuf[ci] != '\0' && ipColCount < 120; ci++) {
     appendGlyphAuto(ipColBuf, ipColCount, 128, cleanBuf[ci], fontTypeIp);
@@ -3446,7 +3598,7 @@ void ipDrawAtPos(int pos) {
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (ipIcon[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (resolveTileIcon(iconSelIp, ipIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -4383,8 +4535,17 @@ void drawCircuitTileFrame() {
         if (tf >= -40 && tf <= 85) {
           lastTemp = (int)round(tf);
         }
-        gStaticDrawDone = true;
-        tempInit(lastTemp);
+        // lastTemp starts life at the -999 sentinel and is only ever
+        // overwritten once a BMP280 read actually succeeds. Previously this
+        // called tempInit(lastTemp) unconditionally, so if the very first
+        // read after boot/slot-change glitched, "-999DEG" got drawn straight
+        // to the matrix. Now we only draw once we have a real value; if we
+        // don't, gStaticDrawDone stays false and the retry logic in loop()
+        // (case ITEM_TEMP) keeps sampling every tick until one succeeds.
+        if (lastTemp != -999) {
+          gStaticDrawDone = true;
+          tempInit(lastTemp);
+        }
         break;
       }
       case ITEM_CANVAS:
@@ -4432,7 +4593,6 @@ void advanceSlot() {
   inScrollAnim = false;
   inFadeOut    = false;
   inFadeIn     = false;
-  lastTemp     = -999;
   npState      = NP_SHOW_START;
   dateState    = NP_SHOW_START;
 
@@ -4452,7 +4612,6 @@ void retreatSlot() {
   inScrollAnim = false;
   inFadeOut    = false;
   inFadeIn     = false;
-  lastTemp     = -999;
   npState      = NP_SHOW_START;
   dateState    = NP_SHOW_START;
 
@@ -4560,9 +4719,31 @@ void loadSettings() {
   hideIconWeather    = prefs.getBool("hideIconWx",    hideTileIcons);
   hideIconNotif      = prefs.getBool("hideIconNotif", hideTileIcons);
   hideIconNowPlaying = prefs.getBool("hideIconNp",    hideTileIcons);
+  npAdaptiveIcon     = prefs.getBool("npAdaptIcon",   true);
   hideIconPressure   = prefs.getBool("hideIconPress", hideTileIcons);
   hideIconCurrency   = prefs.getBool("hideIconCurr",  hideTileIcons);
   hideIconIp         = prefs.getBool("hideIconIp",    hideTileIcons);
+  iconSelDate       = prefs.getUChar("iconSelDate",  0);
+  iconSelTemp       = prefs.getUChar("iconSelTemp",  0);
+  iconSelReminder   = prefs.getUChar("iconSelRem",   0);
+  iconSelNotif      = prefs.getUChar("iconSelNotif", 0);
+  {
+    // Migrate the old single "iconSelNp" override (if present) into
+    // both new per-source slots the first time this runs.
+    uint8_t legacyIconSelNp = prefs.getUChar("iconSelNp", 0);
+    iconSelNpMusic = prefs.getUChar("iconSelNpM", legacyIconSelNp);
+    iconSelNpVideo = prefs.getUChar("iconSelNpV", legacyIconSelNp);
+  }
+  iconSelPressure   = prefs.getUChar("iconSelPress", 0);
+  iconSelCurrency   = prefs.getUChar("iconSelCurr",  0);
+  iconSelIp         = prefs.getUChar("iconSelIp",    0);
+  iconWxSunny       = prefs.getUChar("iconWxSunny",  0);
+  iconWxCloud       = prefs.getUChar("iconWxCloud",  0);
+  iconWxRain        = prefs.getUChar("iconWxRain",   0);
+  iconWxStorm       = prefs.getUChar("iconWxStorm",  0);
+  iconWxSnow        = prefs.getUChar("iconWxSnow",   0);
+  iconWxWind        = prefs.getUChar("iconWxWind",   0);
+  iconWxNight       = prefs.getUChar("iconWxNight",  0);
   scrollType     = prefs.getUChar("scrollType", 0);
   scrollTypeDate       = prefs.getUChar("scrollTypeDate",   scrollType);
   scrollTypeTemp       = prefs.getUChar("scrollTypeTemp",   scrollType);
@@ -4672,9 +4853,26 @@ void saveSettings() {
   prefs.putBool("hideIconWx",    hideIconWeather);
   prefs.putBool("hideIconNotif", hideIconNotif);
   prefs.putBool("hideIconNp",    hideIconNowPlaying);
+  prefs.putBool("npAdaptIcon",   npAdaptiveIcon);
   prefs.putBool("hideIconPress", hideIconPressure);
   prefs.putBool("hideIconCurr",  hideIconCurrency);
   prefs.putBool("hideIconIp",    hideIconIp);
+  prefs.putUChar("iconSelDate",  iconSelDate);
+  prefs.putUChar("iconSelTemp",  iconSelTemp);
+  prefs.putUChar("iconSelRem",   iconSelReminder);
+  prefs.putUChar("iconSelNotif", iconSelNotif);
+  prefs.putUChar("iconSelNpM",   iconSelNpMusic);
+  prefs.putUChar("iconSelNpV",   iconSelNpVideo);
+  prefs.putUChar("iconSelPress", iconSelPressure);
+  prefs.putUChar("iconSelCurr",  iconSelCurrency);
+  prefs.putUChar("iconSelIp",    iconSelIp);
+  prefs.putUChar("iconWxSunny",  iconWxSunny);
+  prefs.putUChar("iconWxCloud",  iconWxCloud);
+  prefs.putUChar("iconWxRain",   iconWxRain);
+  prefs.putUChar("iconWxStorm",  iconWxStorm);
+  prefs.putUChar("iconWxSnow",   iconWxSnow);
+  prefs.putUChar("iconWxWind",   iconWxWind);
+  prefs.putUChar("iconWxNight",  iconWxNight);
   prefs.putUChar("scrollType", scrollType);
   prefs.putUChar("scrollTypeDate",  scrollTypeDate);
   prefs.putUChar("scrollTypeTemp",  scrollTypeTemp);
@@ -4750,8 +4948,33 @@ void saveSettings() {
 
 // WIFI
 String scanNetworks() {
-  int n = WiFi.scanNetworks();
-  String json = "[";
+  // WiFi.scanNetworks() with no args runs SYNCHRONOUSLY and blocks the calling
+  // task - and since this whole app runs on the single-threaded, synchronous
+  // WebServer (not an async server), that blocked every other HTTP request
+  // (including /state, and a second /scan) for the full scan duration
+  // (commonly several seconds), plus froze loop() itself (display updates,
+  // etc.) for that window. This is rewritten around the async SDK scan so the
+  // handler always returns immediately; the client polls until results land.
+  int n = WiFi.scanComplete();
+
+  if (n == WIFI_SCAN_RUNNING) {
+    // A scan (ours or one kicked off moments ago) is still in flight. Say so
+    // explicitly instead of returning an empty list, so the client can tell
+    // "try again shortly" apart from "no networks found".
+    return "{\"scanning\":true,\"networks\":[]}";
+  }
+
+  if (n == WIFI_SCAN_FAILED) {
+    // No scan has completed yet (first call ever, or the previous one
+    // errored). Kick one off and tell the client to poll again.
+    WiFi.scanNetworks(true /* async */);
+    return "{\"scanning\":true,\"networks\":[]}";
+  }
+
+  // n >= 0: a completed scan's results are ready.
+  String json;
+  json.reserve(64 + n * 96);
+  json = "{\"scanning\":false,\"networks\":[";
   for (int i = 0; i < n; i++) {
     if (i > 0) json += ",";
     wifi_auth_mode_t auth = WiFi.encryptionType(i);
@@ -4767,10 +4990,22 @@ String scanNetworks() {
       case WIFI_AUTH_WPA2_WPA3_PSK: authStr = "WPA2/WPA3"; break;
       default:                      authStr = "WPA2"; break;
     }
-    json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"secured\":" + (secured ? "true" : "false") + ",\"auth\":\"" + authStr + "\""  + "}";
+    json += "{\"ssid\":\"";
+    json += WiFi.SSID(i);
+    json += "\",\"rssi\":";
+    json += String(WiFi.RSSI(i));
+    json += ",\"secured\":";
+    json += (secured ? "true" : "false");
+    json += ",\"auth\":\"";
+    json += authStr;
+    json += "\"}";
   }
-  json += "]";
+  json += "]}";
   WiFi.scanDelete();
+  // Kick off the next scan now so a poll a few seconds from now (silent
+  // auto-scan or a manual refresh) finds fresh results already waiting
+  // instead of blocking again.
+  WiFi.scanNetworks(true);
   return json;
 }
 
@@ -5457,6 +5692,23 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   }
 
   #lang-list::-webkit-scrollbar-thumb:hover {
+    background: var(--on-surf-var)
+  }
+
+  #iconpicker-body::-webkit-scrollbar {
+    width: 4px
+  }
+
+  #iconpicker-body::-webkit-scrollbar-track {
+    background: transparent
+  }
+
+  #iconpicker-body::-webkit-scrollbar-thumb {
+    background: var(--outline-var);
+    border-radius: 2px
+  }
+
+  #iconpicker-body::-webkit-scrollbar-thumb:hover {
     background: var(--on-surf-var)
   }
 
@@ -6980,6 +7232,18 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
               </svg></span>
           </div>
         </div>
+        <div class="li" onclick="go('s-iconsettings')">
+          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
+              <path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z" />
+            </svg></div>
+          <div class=li-body>
+            <div class=li-head>Icon Settings</div>
+            <div class=li-sub>Alege iconita afisata pentru fiecare tile</div>
+          </div>
+          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
+                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+              </svg></span></div>
+        </div>
         <div class="li" onclick="go('s-scrolltype')">
           <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
               <path d="M13 3c-4.42 0-8 3.58-8 8H2l3.89 3.89.07.14L10 11H7c0-3.31 2.69-6 6-6s6 2.69 6 6-2.69 6-6 6c-1.66 0-3.14-.69-4.22-1.78l-1.42 1.42C8.68 18.11 10.75 19 13 19c4.42 0 8-3.58 8-8s-3.58-8-8-8zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
@@ -7092,8 +7356,35 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     <div class=mdd-body>
       <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Ce sa afiseze pe ceas</div>
       <div class=card id=np-mode-list></div>
+      <div style="height:16px"></div>
+      <div class=card>
+        <div class=li style="border-bottom:none">
+          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></div>
+          <div class=li-body>
+            <div class=li-head>Adaptive Icon</div>
+            <div class=li-sub>Arata o iconita diferita cand sursa e un player video (Chrome, Edge etc.)</div>
+          </div>
+          <div class=li-trail>
+            <div class=sw onclick="toggleNpAdaptiveIcon()"><input type=checkbox id=np-adaptive-icon-cb checked><span class=sw-track></span><span class=sw-thumb></span></div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeNpSettingsDlg()>Gata</button></div>
+  </div>
+  <div class=md-scrim id=np-icon-sett-scrim onclick=closeNpIconSettingsDlg()></div>
+  <div class=md-dialog id=np-icon-sett-dlg>
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+        </svg></div>
+      <div class=mdd-title>Now Playing - Iconita</div>
+    </div>
+    <div class=mdd-body>
+      <div style="color:var(--on-surf-var);font-size:12px;padding:0 0 12px">Alege o iconita separata pentru cand se detecteaza Muzica si pentru cand se detecteaza Video. Pe Automat se foloseste setarea Adaptive Icon.</div>
+      <div class=card id=np-icon-sett-list></div>
+    </div>
+    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeNpIconSettingsDlg()>Gata</button></div>
   </div>
   <div class=md-scrim id=temp-sett-scrim onclick=closeTempSettingsDlg()></div>
   <div class=md-dialog id=temp-sett-dlg>
@@ -7425,6 +7716,45 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       <div class=card id=fonttype-list></div>
     </div>
   </div>
+  <div class=screen id=s-iconsettings>
+    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+        </svg></button>
+      <div class=bar-text>
+        <div class=bar-title>Icon Settings</div>
+      </div>
+    </div>
+    <div class=content>
+      <div class=sl>Iconita afisata per tile</div>
+      <div class=card id=iconsettings-list></div>
+    </div>
+  </div>
+  <div class=screen id=s-iconsettings-weather>
+    <div class=top-bar><button onclick="go('s-iconsettings')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+        </svg></button>
+      <div class=bar-text>
+        <div class=bar-title>Icon Settings - Meteo</div>
+      </div>
+    </div>
+    <div class=content>
+      <div class=sl>O iconita pentru fiecare stare meteo</div>
+      <div class=card id=iconsettings-weather-list></div>
+    </div>
+  </div>
+  <div class=md-scrim id=iconpicker-scrim onclick=closeIconPicker()></div>
+  <div class=md-dialog id=iconpicker-dlg style="max-height:78vh;display:flex;flex-direction:column">
+    <div class=mdd-head>
+      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
+          <path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z" />
+        </svg></div>
+      <div class=mdd-title id=iconpicker-title>Alege iconita</div>
+    </div>
+    <div class=mdd-body id=iconpicker-body style="overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent">
+      <div id=iconpicker-grid style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:4px 0 8px"></div>
+    </div>
+    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeIconPicker()>Inchide</button></div>
+  </div>
   <div class=screen id=s-hideicons>
     <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
           <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
@@ -7538,12 +7868,18 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
   </div>
   <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
-    var apSsidCache = ``,
+    // Never persist Tile Manager data before the complete /state response has
+    // arrived. A failed response used to leave the UI with a short fallback
+    // list, which the next save could overwrite into persistent settings.
+    var stateLoadComplete = !1,
+      EXPECTED_CIRCUIT_TILE_COUNT = 10,
+      apSsidCache = ``,
       selSSID = ``,
       selSec = !1,
       bOn = !0,
       items = [],
       npM = 0,
+      npAdaptiveIconV = !0,
       tempUnitV = 0,
       lastTempV = -999,
       wxValidV = !1,
@@ -7581,6 +7917,123 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         currency: !1,
         ip: !1
       },
+      indivIcon = {
+        date: 0,
+        temp: 0,
+        reminder: 0,
+        notif: 0,
+        nowplayingMusic: 0,
+        nowplayingVideo: 0,
+        pressure: 0,
+        currency: 0,
+        ip: 0
+      },
+      indivWxIcon = {
+        sunny: 0,
+        cloud: 0,
+        rain: 0,
+        storm: 0,
+        snow: 0,
+        wind: 0,
+        night: 0
+      },
+      ICON_CATALOG = [{
+        id: 1,
+        n: `Data`,
+        rows: [0b01111110, 0b11111111, 0b11111111, 0b10000001, 0b10000001, 0b10000001, 0b10000001, 0b01111110]
+      }, {
+        id: 2,
+        n: `Temperatura`,
+        rows: [0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00101100, 0b00100100, 0b00011000]
+      }, {
+        id: 3,
+        n: `Memento`,
+        rows: [0b00100100, 0b01011010, 0b00111100, 0b00111100, 0b00111100, 0b01111110, 0b00011000, 0b00000000]
+      }, {
+        id: 4,
+        n: `Music Note`,
+        rows: [0b11100000, 0b10011100, 0b10000100, 0b10000100, 0b11000100, 0b11100110, 0b11000111, 0b00000110]
+      }, {
+        id: 5,
+        n: `Mail`,
+        rows: [0b00000000, 0b01111110, 0b11000011, 0b10100101, 0b10011001, 0b10000001, 0b01111110, 0b00000000]
+      }, {
+        id: 6,
+        n: `Up Arrow`,
+        rows: [0b00011000, 0b00111100, 0b01111110, 0b11011011, 0b10011001, 0b00011000, 0b00011000, 0b00011000]
+      }, {
+        id: 7,
+        n: `Down Arrow`,
+        rows: [0b00011000, 0b00011000, 0b00011000, 0b10011001, 0b11011011, 0b01111110, 0b00111100, 0b00011000]
+      }, {
+        id: 8,
+        n: `Minus`,
+        rows: [0b00000000, 0b00000000, 0b00000000, 0b01111110, 0b01111110, 0b00000000, 0b00000000, 0b00000000]
+      }, {
+        id: 9,
+        n: `Sun`,
+        rows: [0b00011000, 0b01000010, 0b00011000, 0b10111101, 0b10111101, 0b00011000, 0b01000010, 0b00011000]
+      }, {
+        id: 10,
+        n: `Cloud`,
+        rows: [0b00000000, 0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b00000000, 0b00000000]
+      }, {
+        id: 11,
+        n: `Cloud Rain`,
+        rows: [0b00000000, 0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b01010100, 0b00101010]
+      }, {
+        id: 12,
+        n: `Furtuna`,
+        rows: [0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b00100100, 0b01101100, 0b01001000]
+      }, {
+        id: 13,
+        n: `Ninsoare`,
+        rows: [0b00111000, 0b01000110, 0b10000001, 0b10010001, 0b00111000, 0b01010010, 0b11100111, 0b01000010]
+      }, {
+        id: 14,
+        n: `Vant`,
+        rows: [0b00001100, 0b00010010, 0b00000010, 0b11111100, 0b00000000, 0b11111000, 0b00000100, 0b00001000]
+      }, {
+        id: 15,
+        n: `Luna`,
+        rows: [0b00111100, 0b01110000, 0b11100000, 0b11100000, 0b11100000, 0b11100000, 0b01110000, 0b00111100]
+      }, {
+        id: 16,
+        n: `Signal Bar`,
+        rows: [0b00000001, 0b00000011, 0b00001011, 0b00011011, 0b01011011, 0b11011011, 0b11011011, 0b00000000]
+      }, {
+        id: 17,
+        n: `Access Point`,
+        rows: [0b00011000, 0b01000010, 0b00011000, 0b10111101, 0b10111101, 0b00011000, 0b01000010, 0b00011000]
+      }, {
+        id: 18,
+        n: `Exclamare`,
+        rows: [0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000, 0b00011000, 0b00011000]
+      }, {
+        id: 19,
+        n: `Pauza`,
+        rows: [0b00000000, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b00000000]
+      }, {
+        id: 20,
+        n: `Euro`,
+        rows: [0b00011000, 0b00100100, 0b01110000, 0b00100000, 0b01110000, 0b00100100, 0b00011000, 0b00000000]
+      }, {
+        id: 21,
+        n: `Bluetooth`,
+        rows: [0b00001000, 0b00101100, 0b00011010, 0b00001100, 0b00001100, 0b00011010, 0b00101100, 0b00001000]
+      }, {
+        id: 22,
+        n: `Blocat`,
+        rows: [0b00000000, 0b00111100, 0b01000110, 0b01001010, 0b01010010, 0b01100010, 0b00111100, 0b00000000]
+      }, {
+        id: 23,
+        n: `WiFi`,
+        rows: [0b00000010, 0b00001001, 0b00000101, 0b00110101, 0b00110101, 0b00000101, 0b00001001, 0b00000010]
+      }, {
+        id: 24,
+        n: `Video`,
+        rows: [0b00000000, 0b01111110, 0b11101111, 0b11100111, 0b11100111, 0b11101111, 0b01111110, 0b00000000]
+      }],
       scrollTypeV = 0,
       indivScroll = {
         date: 0,
@@ -7867,24 +8320,46 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       return h + `h ` + pad2(m) + `m ` + pad2(s) + `s`
     }
 
-    function refreshAboutState() {
+    function applyAboutState(s) {
+      var ipEl = document.getElementById(`about-ip`);
+      if (ipEl) ipEl.textContent = s.ip || `-`;
+      var verEl = document.getElementById(`about-version`);
+      if (verEl) verEl.textContent = s.version || fwVersion;
+      var swVerEl = document.getElementById(`sw-version`);
+      if (swVerEl) swVerEl.textContent = s.version || fwVersion;
+      if (s.version) fwVersion = s.version;
+      if (s.uptime !== void 0) {
+        bootUptimeSec = s.uptime;
+        uptimeFetchedAt = Date.now();
+        var upEl = document.getElementById(`about-uptime`);
+        if (upEl) upEl.textContent = formatUptime(bootUptimeSec)
+      }
+    }
+
+    function fetchAboutState(attempt) {
+      attempt = attempt || 0;
       fetch(`/state`).then(function(r) {
         return r.json()
       }).then(function(s) {
-        var ipEl = document.getElementById(`about-ip`);
-        if (ipEl) ipEl.textContent = s.ip || `-`;
-        var verEl = document.getElementById(`about-version`);
-        if (verEl) verEl.textContent = s.version || fwVersion;
-        var swVerEl = document.getElementById(`sw-version`);
-        if (swVerEl) swVerEl.textContent = s.version || fwVersion;
-        if (s.version) fwVersion = s.version;
-        if (s.uptime !== void 0) {
-          bootUptimeSec = s.uptime;
-          uptimeFetchedAt = Date.now();
-          var upEl = document.getElementById(`about-uptime`);
-          if (upEl) upEl.textContent = formatUptime(bootUptimeSec)
-        }
-      }).catch(function() {})
+        applyAboutState(s)
+      }).catch(function() {
+        // Previously an empty catch: on failure the "-" placeholders in the
+        // HTML just stayed forever, with no retry and no feedback. Retry a
+        // few times with backoff instead - this endpoint is the same /state
+        // this page depends on everywhere else, so a transient failure here
+        // shouldn't be a dead end.
+        if (attempt < 3) setTimeout(function() { fetchAboutState(attempt + 1) }, 500 * (attempt + 1))
+      })
+    }
+
+    function refreshAboutState() {
+      // Paint instantly from the dashboard's own already-loaded state if we
+      // have it (no need to wait on a second network round trip), then still
+      // do our own fetch so Uptime keeps ticking from a fresh value.
+      withInitialState(function(s) {
+        applyAboutState(s)
+      });
+      fetchAboutState(0)
     }
 
     function tickAboutUptime() {
@@ -8296,6 +8771,12 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       if (id === `s-hideicons`) {
         buildHideIconsList()
       }
+      if (id === `s-iconsettings`) {
+        buildIconSettingsList()
+      }
+      if (id === `s-iconsettings-weather`) {
+        buildIconSettingsWeatherList()
+      }
       if (id === `s-ap`) {
         loadApSettings()
       }
@@ -8435,13 +8916,23 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       })
     }
 
-    function doScanSilent() {
-      if (wifiScanRunning) return;
+    function doScanSilent(attempt) {
+      attempt = attempt || 0;
+      if (!attempt && wifiScanRunning) return;
       wifiScanRunning = !0;
       fetch(`/scan`).then(function(r) {
         return r.json()
-      }).then(function(nets) {
+      }).then(function(res) {
+        // Backend now returns {scanning, networks} instead of a bare array,
+        // since the scan itself runs async on-device. While scanning is
+        // still true, poll again shortly instead of reading this as "0
+        // networks" - a scan in progress is not the same as an empty result.
+        if (res.scanning && attempt < 10) {
+          setTimeout(function() { doScanSilent(attempt + 1) }, 800);
+          return
+        }
         wifiScanRunning = !1;
+        var nets = res.networks || [];
         var nl = document.getElementById(`nlist`);
         var hint = nl.querySelector(`.scan-hint`);
         if (hint) {
@@ -8457,22 +8948,36 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       })
     }
 
-    function doScan() {
+    function doScan(attempt) {
+      attempt = attempt || 0;
+      if (!attempt) {
+        if (wifiScanRunning) return;
+        wifiScanRunning = !0
+      }
       var nl = document.getElementById(`nlist`);
       var scanBtn = document.getElementById(`scan-btn`);
-      if (scanBtn) {
-        scanBtn.disabled = !0;
-        scanBtn.style.opacity = `.5`;
-        scanBtn.style.pointerEvents = `none`
+      if (!attempt) {
+        if (scanBtn) {
+          scanBtn.disabled = !0;
+          scanBtn.style.opacity = `.5`;
+          scanBtn.style.pointerEvents = `none`
+        }
+        nl.innerHTML = `<div class="scan-hint"><span class="spin-ring"></span>Se cauta retele…</div>`, selSSID = ``
       }
-      nl.innerHTML = `<div class="scan-hint"><span class="spin-ring"></span>Se cauta retele…</div>`, selSSID = ``, wifiScanRunning = !1, fetch(`/scan`).then(function(r) {
+      fetch(`/scan`).then(function(r) {
         return r.json()
-      }).then(function(nets) {
+      }).then(function(res) {
+        if (res.scanning && attempt < 10) {
+          setTimeout(function() { doScan(attempt + 1) }, 800);
+          return
+        }
+        wifiScanRunning = !1;
         if (scanBtn) {
           scanBtn.disabled = !1;
           scanBtn.style.opacity = ``;
           scanBtn.style.pointerEvents = ``
         }
+        var nets = res.networks || [];
         if (!nets.length) {
           nl.innerHTML = `<div class="scan-hint">Nicio retea gasita</div>`;
           return
@@ -8493,6 +8998,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           })
         })
       }).catch(function() {
+        wifiScanRunning = !1;
         if (scanBtn) {
           scanBtn.disabled = !1;
           scanBtn.style.opacity = ``;
@@ -8740,6 +9246,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       })
     }
 
+    function toggleNpAdaptiveIcon() {
+      npAdaptiveIconV = !npAdaptiveIconV;
+      var cb = document.getElementById(`np-adaptive-icon-cb`);
+      if (cb) cb.checked = npAdaptiveIconV;
+      saveSettings()
+    }
+
     function toggleHideIcons() {
       hideTileIcons = !hideTileIcons;
       var cb = document.getElementById(`hide-icons-cb`);
@@ -8874,6 +9387,212 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       indivHideIcons[key] = !indivHideIcons[key];
       var cb = document.getElementById(`hideicon-cb-` + key);
       if (cb) cb.checked = indivHideIcons[key];
+      saveSettings()
+    }
+
+    // ===================== ICON SETTINGS =====================
+    var ICON_SETTINGS_TILES = [{
+        key: `reminder`,
+        label: `Reminder`,
+        cls: `lc-tea`,
+        svg: ISVG[5]
+      }, {
+        key: `notif`,
+        label: `PC Notifications`,
+        cls: `lc-pur`,
+        svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`
+      }, {
+        key: `nowplaying`,
+        label: `Now Playing`,
+        cls: `lc-amb`,
+        svg: ISVG[3]
+      }, {
+        key: `ip`,
+        label: `Show IP Address`,
+        cls: `lc-blu`,
+        svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
+      }
+    ];
+    var ICON_SETTINGS_WX = [{
+      key: `sunny`,
+      label: `Senin (zi)`
+    }, {
+      key: `night`,
+      label: `Senin (noapte)`
+    }, {
+      key: `cloud`,
+      label: `Innorat`
+    }, {
+      key: `rain`,
+      label: `Ploaie`
+    }, {
+      key: `storm`,
+      label: `Furtuna`
+    }, {
+      key: `snow`,
+      label: `Ninsoare`
+    }, {
+      key: `wind`,
+      label: `Vant / Ceata`
+    }];
+    var iconPickerScope = null,
+      iconPickerKey = null;
+
+    function getIconCatalogEntry(id) {
+      for (var i = 0; i < ICON_CATALOG.length; i++) {
+        if (ICON_CATALOG[i].id === id) return ICON_CATALOG[i]
+      }
+      return null
+    }
+
+    function renderIconDots(rows, dot, gap) {
+      dot = dot || 4;
+      gap = gap === void 0 ? 1.4 : gap;
+      var step = dot + gap,
+        size = step * 8 - gap,
+        svg = `<svg viewBox="0 0 ` + size + ` ` + size + `" width="` + (dot * 9) + `" height="` + (dot * 9) + `">`;
+      for (var r = 0; r < 8; r++) {
+        for (var c = 0; c < 8; c++) {
+          var on = (rows[r] & (0x80 >> c)) ? 1 : 0;
+          var cx = c * step + dot / 2,
+            cy = r * step + dot / 2;
+          svg += `<circle cx="` + cx + `" cy="` + cy + `" r="` + (dot / 2) + `" fill="` + (on ? `currentColor` : `var(--outline-var)`) + `" opacity="` + (on ? `1` : `0.35`) + `"/>`
+        }
+      }
+      svg += `</svg>`;
+      return svg
+    }
+
+    function defaultIconRowsFor(scope, key) {
+      if (scope === `wx`) {
+        var wxMap = { sunny: 9, night: 15, cloud: 10, rain: 11, storm: 12, snow: 13, wind: 14 };
+        var wxEntry = getIconCatalogEntry(wxMap[key] || 10);
+        return wxEntry ? wxEntry.rows : null
+      }
+      var trendId = function(trend) {
+        return trend > 0 ? 6 : trend < 0 ? 7 : 8
+      };
+      var idMap = {
+        date: 1,
+        temp: 2,
+        reminder: 3,
+        notif: 5,
+        nowplayingMusic: 4,
+        nowplayingVideo: 24,
+        pressure: trendId(pressureTrendV),
+        currency: trendId(currencyTrendV),
+        ip: 16
+      };
+      var entry = getIconCatalogEntry(idMap[key]);
+      return entry ? entry.rows : null
+    }
+
+    function iconPreviewFor(key, isWx) {
+      var selId = isWx ? indivWxIcon[key] : indivIcon[key];
+      if (selId) {
+        var entry = getIconCatalogEntry(selId);
+        if (entry) return `<div style="color:var(--on-surf)">` + renderIconDots(entry.rows, 3, 1) + `</div>`
+      }
+      var defRows = defaultIconRowsFor(isWx ? `wx` : `tile`, key);
+      if (!defRows) return `<span style="font-size:11px;color:var(--on-surf-var)">Auto</span>`;
+      return `<div style="color:var(--on-surf-var);opacity:0.55">` + renderIconDots(defRows, 3, 1) + `</div>`
+    }
+
+    function buildIconSettingsList() {
+      var c = document.getElementById(`iconsettings-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      ICON_SETTINGS_TILES.forEach(function(t) {
+        var isNpRow = t.key === `nowplaying`;
+        var row = document.createElement(`div`);
+        row.className = `li`;
+        row.style.cursor = `pointer`;
+        row.style.borderBottom = `none`;
+        row.onclick = function() {
+          if (isNpRow) openNpIconSettingsDlg();
+          else openIconPicker(`tile`, t.key, t.label)
+        };
+        var npCustom = isNpRow && !!(indivIcon.nowplayingMusic || indivIcon.nowplayingVideo);
+        var subText = isNpRow ? (npCustom ? `Iconita personalizata` : `Automat (implicit)`) : (indivIcon[t.key] ? `Iconita personalizata` : `Automat (implicit)`);
+        var previewHtml = isNpRow ? iconPreviewFor(`nowplayingMusic`, false) : iconPreviewFor(t.key, false);
+        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div><div class="li-sub" id="iconsettings-sub-` + t.key + `">` + subText + `</div></div><div class="li-trail" id="iconsettings-preview-` + t.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + previewHtml + `</div>`;
+        c.appendChild(row)
+      })
+    }
+
+    function buildIconSettingsWeatherList() {
+      var c = document.getElementById(`iconsettings-weather-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      ICON_SETTINGS_WX.forEach(function(w, i) {
+        var row = document.createElement(`div`);
+        row.className = `li`;
+        row.style.cursor = `pointer`;
+        row.style.borderBottom = `none`;
+        row.onclick = function() {
+          openIconPicker(`wx`, w.key, w.label)
+        };
+        row.innerHTML = `<div class="lic lc-grn">` + ISVG[4] + `</div><div class="li-body"><div class="li-head">` + w.label + `</div><div class="li-sub" id="iconsettings-wxsub-` + w.key + `">` + (indivWxIcon[w.key] ? `Iconita personalizata` : `Automat (implicit)`) + `</div></div><div class="li-trail" id="iconsettings-wxpreview-` + w.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + iconPreviewFor(w.key, true) + `</div>`;
+        c.appendChild(row)
+      })
+    }
+
+    function openIconPicker(scope, key, label) {
+      iconPickerScope = scope;
+      iconPickerKey = key;
+      var titleEl = document.getElementById(`iconpicker-title`);
+      if (titleEl) titleEl.textContent = `Iconita: ` + label;
+      var curSel = scope === `wx` ? indivWxIcon[key] : indivIcon[key];
+      var grid = document.getElementById(`iconpicker-grid`);
+      grid.innerHTML = ``;
+      var autoCell = document.createElement(`div`);
+      autoCell.onclick = function() {
+        selectIconValue(0)
+      };
+      autoCell.style.cssText = `display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 6px;border-radius:12px;cursor:pointer;border:2px solid ` + (curSel === 0 ? `var(--primary)` : `transparent`) + `;background:var(--surf-high);color:var(--on-surf-var)`;
+      var autoRows = defaultIconRowsFor(scope, key);
+      var autoIconHtml = autoRows ? renderIconDots(autoRows, 4, 1.4) : `<div style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-size:11px;text-align:center">Auto</div>`;
+      autoCell.innerHTML = `<div>` + autoIconHtml + `</div><div style="font-size:11px;text-align:center">Implicit</div>`;
+      grid.appendChild(autoCell);
+      ICON_CATALOG.forEach(function(entry) {
+        var cell = document.createElement(`div`);
+        cell.onclick = function() {
+          selectIconValue(entry.id)
+        };
+        cell.style.cssText = `display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 6px;border-radius:12px;cursor:pointer;border:2px solid ` + (curSel === entry.id ? `var(--primary)` : `transparent`) + `;background:var(--surf-high);color:var(--on-surf)`;
+        cell.innerHTML = `<div>` + renderIconDots(entry.rows, 4, 1.4) + `</div><div style="font-size:11px;text-align:center;color:var(--on-surf-var)">` + entry.n + `</div>`;
+        grid.appendChild(cell)
+      });
+      document.getElementById(`iconpicker-scrim`).classList.add(`open`);
+      document.getElementById(`iconpicker-dlg`).classList.add(`open`);
+      var pickerBody = document.querySelector(`#iconpicker-dlg .mdd-body`);
+      if (pickerBody) pickerBody.scrollTop = 0
+    }
+
+    function closeIconPicker() {
+      document.getElementById(`iconpicker-scrim`).classList.remove(`open`);
+      document.getElementById(`iconpicker-dlg`).classList.remove(`open`);
+      iconPickerScope = null;
+      iconPickerKey = null
+    }
+
+    function selectIconValue(id) {
+      if (!iconPickerScope || !iconPickerKey) return;
+      if (iconPickerScope === `wx`) {
+        indivWxIcon[iconPickerKey] = id;
+        var sub = document.getElementById(`iconsettings-wxsub-` + iconPickerKey);
+        if (sub) sub.textContent = id ? `Iconita personalizata` : `Automat (implicit)`;
+        var prev = document.getElementById(`iconsettings-wxpreview-` + iconPickerKey);
+        if (prev) prev.innerHTML = iconPreviewFor(iconPickerKey, true)
+      } else {
+        indivIcon[iconPickerKey] = id;
+        var sub2 = document.getElementById(`iconsettings-sub-` + iconPickerKey);
+        if (sub2) sub2.textContent = id ? `Iconita personalizata` : `Automat (implicit)`;
+        var prev2 = document.getElementById(`iconsettings-preview-` + iconPickerKey);
+        if (prev2) prev2.innerHTML = iconPreviewFor(iconPickerKey, false)
+      }
+      closeIconPicker();
+      if (document.getElementById(`iconsettings-list`)) buildIconSettingsList();
       saveSettings()
     }
 
@@ -9080,6 +9799,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function saveEts2Order() {
+      if (!stateLoadComplete || !priorityItems.length) return;
       var ord = priorityItems[0].id === `ets2` ? 1 : 0;
       fetch(`/ets2order`, {
         method: `POST`,
@@ -9087,6 +9807,14 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           "Content-Type": `application/x-www-form-urlencoded`
         },
         body: `first=` + ord
+      }).then(function(r) {
+        if (!r.ok) throw new Error(`save failed`)
+      }).catch(function() {
+        // Previously fire-and-forget: a rejected save left the UI showing
+        // the user's change while the device kept its old order. Tell the
+        // user and resync from the server instead of drifting silently.
+        showToast(`Nu s-a putut salva ordinea. Reincarca pagina.`);
+        loadHomeState()
       })
     }
 
@@ -9097,6 +9825,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function savePriorityOrder() {
+      if (!stateLoadComplete) return;
       var ord = priorityItems.map(function(it) {
         return it.id
       }).join(`,`);
@@ -9105,7 +9834,17 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         headers: {
           "Content-Type": `application/x-www-form-urlencoded`
         },
-        body: `order=` + encodeURIComponent(ord)
+        // npPriority is sent explicitly (rather than letting the backend
+        // infer it from whether "nowplaying" happens to appear in `order`)
+        // so an unrelated reorder can never silently flip Now Playing back
+        // into Circuit Tiles just because this particular save's snapshot
+        // of priorityItems didn't include it.
+        body: `order=` + encodeURIComponent(ord) + `&npPriority=` + (npIsPriority() ? 1 : 0)
+      }).then(function(r) {
+        if (!r.ok) throw new Error(`save failed`)
+      }).catch(function() {
+        showToast(`Nu s-a putut salva ordinea prioritara. Reincarca pagina.`);
+        loadHomeState()
       })
     }
 
@@ -9546,6 +10285,26 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }, 2600)
     }
 
+    function hasCompleteCircuitState(s) {
+      if (!s || !Array.isArray(s.items) || s.items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return !1;
+      var seen = {};
+      return s.items.every(function(it) {
+        return it && Number.isInteger(it.id) && !seen[it.id] && (seen[it.id] = !0) && Number.isInteger(it.dur) && it.dur > 0
+      })
+    }
+
+    function withInitialState(callback) {
+      if (window.octoglowInitialState) {
+        callback(window.octoglowInitialState);
+        return
+      }
+      window.addEventListener(`octoglow-state-ready`, function(e) {
+        callback(e.detail)
+      }, {
+        once: !0
+      })
+    }
+
     function countEnabledCircuitTiles() {
       return items.filter(function(it) {
         return it.enabled && !(it.id === 3 && npIsPriority())
@@ -9599,15 +10358,27 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     }
 
     function saveSettings() {
-      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0) + `&fontType=` + fontTypeV + `&fontTypeDate=` + indivFont.date + `&fontTypeTemp=` + indivFont.temp + `&fontTypeReminder=` + indivFont.reminder + `&fontTypeWeather=` + indivFont.weather + `&fontTypeNotif=` + indivFont.notif + `&fontTypeNowPlaying=` + indivFont.nowplaying + `&fontTypePressure=` + indivFont.pressure + `&fontTypeStopwatch=` + indivFont.stopwatch + `&fontTypeCurrency=` + indivFont.currency + `&fontTypeIp=` + (indivFont.ip || 0);
+      if (!stateLoadComplete || items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return;
+      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&npAdaptiveIcon=` + (npAdaptiveIconV ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0) + `&fontType=` + fontTypeV + `&fontTypeDate=` + indivFont.date + `&fontTypeTemp=` + indivFont.temp + `&fontTypeReminder=` + indivFont.reminder + `&fontTypeWeather=` + indivFont.weather + `&fontTypeNotif=` + indivFont.notif + `&fontTypeNowPlaying=` + indivFont.nowplaying + `&fontTypePressure=` + indivFont.pressure + `&fontTypeStopwatch=` + indivFont.stopwatch + `&fontTypeCurrency=` + indivFont.currency + `&fontTypeIp=` + (indivFont.ip || 0) + `&iconSelDate=` + (indivIcon.date || 0) + `&iconSelTemp=` + (indivIcon.temp || 0) + `&iconSelRem=` + (indivIcon.reminder || 0) + `&iconSelNotif=` + (indivIcon.notif || 0) + `&iconSelNpMusic=` + (indivIcon.nowplayingMusic || 0) + `&iconSelNpVideo=` + (indivIcon.nowplayingVideo || 0) + `&iconSelPress=` + (indivIcon.pressure || 0) + `&iconSelCurr=` + (indivIcon.currency || 0) + `&iconSelIp=` + (indivIcon.ip || 0) + `&iconWxSunny=` + (indivWxIcon.sunny || 0) + `&iconWxCloud=` + (indivWxIcon.cloud || 0) + `&iconWxRain=` + (indivWxIcon.rain || 0) + `&iconWxStorm=` + (indivWxIcon.storm || 0) + `&iconWxSnow=` + (indivWxIcon.snow || 0) + `&iconWxWind=` + (indivWxIcon.wind || 0) + `&iconWxNight=` + (indivWxIcon.night || 0);
       items.forEach(function(it, i) {
         p += `&id` + i + `=` + it.id + `&en` + i + `=` + (it.enabled ? 1 : 0) + `&dur` + i + `=` + it.dur
-      }), fetch(`/settings`, {
+      });
+      fetch(`/settings`, {
         method: `POST`,
         headers: {
           "Content-Type": `application/x-www-form-urlencoded`
         },
         body: p
+      }).then(function(r) {
+        if (!r.ok) throw new Error(`save failed`)
+      }).catch(function() {
+        // This POST used to be fire-and-forget. The backend legitimately
+        // rejects (400) an incomplete/invalid tile list rather than persist
+        // it - which is correct - but nothing told the frontend, so the UI
+        // kept showing the just-made change as if it had saved. Tell the
+        // user and pull the real, currently-persisted state back in.
+        showToast(`Nu s-au putut salva setarile tile-urilor. Reincarca pagina.`);
+        loadHomeState()
       })
     }
 
@@ -9755,6 +10526,42 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
     function closeNpSettingsDlg() {
       document.getElementById(`np-sett-scrim`).classList.remove(`open`);
       document.getElementById(`np-sett-dlg`).classList.remove(`open`)
+    }
+
+    var NP_ICON_SETTINGS_ROWS = [{
+      key: `nowplayingMusic`,
+      label: `Muzica`
+    }, {
+      key: `nowplayingVideo`,
+      label: `Video`
+    }];
+
+    function buildNpIconSettingsList() {
+      var c = document.getElementById(`np-icon-sett-list`);
+      if (!c) return;
+      c.innerHTML = ``;
+      NP_ICON_SETTINGS_ROWS.forEach(function(r) {
+        var row = document.createElement(`div`);
+        row.className = `li`;
+        row.style.cursor = `pointer`;
+        row.style.borderBottom = `none`;
+        row.onclick = function() {
+          openIconPicker(`tile`, r.key, r.label)
+        };
+        row.innerHTML = `<div class="li-body"><div class="li-head">` + r.label + `</div><div class="li-sub" id="iconsettings-sub-` + r.key + `">` + (indivIcon[r.key] ? `Iconita personalizata` : `Automat (implicit)`) + `</div></div><div class="li-trail" id="iconsettings-preview-` + r.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + iconPreviewFor(r.key, false) + `</div>`;
+        c.appendChild(row)
+      })
+    }
+
+    function openNpIconSettingsDlg() {
+      buildNpIconSettingsList();
+      document.getElementById(`np-icon-sett-scrim`).classList.add(`open`);
+      document.getElementById(`np-icon-sett-dlg`).classList.add(`open`)
+    }
+
+    function closeNpIconSettingsDlg() {
+      document.getElementById(`np-icon-sett-scrim`).classList.remove(`open`);
+      document.getElementById(`np-icon-sett-dlg`).classList.remove(`open`)
     }
 
     function pollNP() {
@@ -11226,6 +12033,10 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         if (_hap && s.apSsid) {
           _hap.textContent = s.ap ? `Activ - ` + s.apSsid : `SSID: ` + s.apSsid
         };
+        if (!hasCompleteCircuitState(s)) {
+          var itemsLen = s && Array.isArray(s.items) ? s.items.length : `n/a`;
+          throw new Error(`Stare Tile Manager incompleta (items.length=` + itemsLen + `, expected=` + EXPECTED_CIRCUIT_TILE_COUNT + `)`)
+        }
         items = s.items;
         if (s.lastTemp !== void 0) {
           lastTempV = s.lastTemp
@@ -11284,6 +12095,11 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           indivHideIcons.ip = s.hideIconIp !== void 0 ? s.hideIconIp : !1;
           refreshHideIconSwitches()
         }
+        if (s.npAdaptiveIcon !== void 0) {
+          npAdaptiveIconV = s.npAdaptiveIcon;
+          var _npaCb = document.getElementById(`np-adaptive-icon-cb`);
+          if (_npaCb) _npaCb.checked = npAdaptiveIconV
+        }
         if (s.scrollType !== void 0) {
           scrollTypeV = s.scrollType;
           applyScrollType()
@@ -11317,6 +12133,27 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           indivFont.currency = s.fontTypeCurrency !== void 0 ? s.fontTypeCurrency : 0;
           indivFont.ip = s.fontTypeIp !== void 0 ? s.fontTypeIp : 0;
           refreshFontTypeSelects()
+        }
+        if (s.iconSelDate !== void 0) {
+          indivIcon.date = s.iconSelDate || 0;
+          indivIcon.temp = s.iconSelTemp || 0;
+          indivIcon.reminder = s.iconSelReminder || 0;
+          indivIcon.notif = s.iconSelNotif || 0;
+          indivIcon.nowplayingMusic = s.iconSelNpMusic || 0;
+          indivIcon.nowplayingVideo = s.iconSelNpVideo || 0;
+          indivIcon.pressure = s.iconSelPressure || 0;
+          indivIcon.currency = s.iconSelCurrency || 0;
+          indivIcon.ip = s.iconSelIp || 0;
+          indivWxIcon.sunny = s.iconWxSunny || 0;
+          indivWxIcon.cloud = s.iconWxCloud || 0;
+          indivWxIcon.rain = s.iconWxRain || 0;
+          indivWxIcon.storm = s.iconWxStorm || 0;
+          indivWxIcon.snow = s.iconWxSnow || 0;
+          indivWxIcon.wind = s.iconWxWind || 0;
+          indivWxIcon.night = s.iconWxNight || 0;
+          if (document.getElementById(`iconsettings-list`)) buildIconSettingsList();
+          if (document.getElementById(`iconsettings-weather-list`)) buildIconSettingsWeatherList();
+          if (document.getElementById(`np-icon-sett-list`)) buildNpIconSettingsList()
         }
         if (s.notifEnabled !== void 0) {
           notifEn = s.notifEnabled;
@@ -11378,41 +12215,29 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         if (s.evSndTouch) evSndTouch = s.evSndTouch;
         if (s.touchTapAction !== void 0) touchTapAction = s.touchTapAction;
         if (s.touchDoubleTapAction !== void 0) touchDoubleTapAction = s.touchDoubleTapAction;
-      }).catch(function() {
+        // Rebuild only after both the circuit and priority state are known.
+        // The previous early build could briefly retain the default priority
+        // list while the circuit list came from the server.
+        buildGrid();
+        buildPriorityGrid();
+        stateLoadComplete = !0;
+        window.octoglowInitialState = s;
+        window.dispatchEvent(new CustomEvent(`octoglow-state-ready`, {
+          detail: s
+        }))
+      }).catch(function(err) {
+        // Previously silent about *why* a load failed - network error, JSON
+        // parse failure, and the hasCompleteCircuitState throw all looked
+        // identical from here, which is a big part of why this was hard to
+        // pin down. Logging the real cause costs nothing and doesn't change
+        // the retry/toast behavior the user sees.
+        console.error(`[octoglow] /state load attempt`, stateLoadAttempt + 1, `failed:`, err && err.message ? err.message : err);
         if (stateLoadAttempt < 4) {
           stateLoadAttempt++;
           setTimeout(loadHomeState, 500 * stateLoadAttempt);
           return
         }
-        items = [{
-          id: 0,
-          enabled: !0,
-          dur: 5
-        }, {
-          id: 1,
-          enabled: !0,
-          dur: 4
-        }, {
-          id: 2,
-          enabled: !0,
-          dur: 4
-        }, {
-          id: 3,
-          enabled: !1,
-          dur: 8
-        }, {
-          id: 4,
-          enabled: !1,
-          dur: 8
-        }, {
-          id: 5,
-          enabled: !1,
-          dur: 8
-        }, {
-          id: 6,
-          enabled: !1,
-          dur: 8
-        }], bOn = !0, buildGrid()
+        showToast(`Nu s-au putut incarca tile-urile. Reincarca pagina.`)
       })
       }
       var stateLoadAttempt = 0;
@@ -11645,7 +12470,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
         });
       };
       saveSettings = function() {
-        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0) + "&fontType=" + fontTypeV + "&fontTypeDate=" + indivFont.date + "&fontTypeTemp=" + indivFont.temp + "&fontTypeReminder=" + indivFont.reminder + "&fontTypeWeather=" + indivFont.weather + "&fontTypeNotif=" + indivFont.notif + "&fontTypeNowPlaying=" + indivFont.nowplaying + "&fontTypePressure=" + indivFont.pressure + "&fontTypeStopwatch=" + indivFont.stopwatch + "&fontTypeTimer=" + (indivFont.timer || 0) + "&fontTypeCurrency=" + (indivFont.currency || 0) + "&fontTypeIp=" + (indivFont.ip || 0);
+        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&npAdaptiveIcon=" + (npAdaptiveIconV ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0) + "&fontType=" + fontTypeV + "&fontTypeDate=" + indivFont.date + "&fontTypeTemp=" + indivFont.temp + "&fontTypeReminder=" + indivFont.reminder + "&fontTypeWeather=" + indivFont.weather + "&fontTypeNotif=" + indivFont.notif + "&fontTypeNowPlaying=" + indivFont.nowplaying + "&fontTypePressure=" + indivFont.pressure + "&fontTypeStopwatch=" + indivFont.stopwatch + "&fontTypeTimer=" + (indivFont.timer || 0) + "&fontTypeCurrency=" + (indivFont.currency || 0) + "&fontTypeIp=" + (indivFont.ip || 0) + "&iconSelDate=" + (indivIcon.date || 0) + "&iconSelTemp=" + (indivIcon.temp || 0) + "&iconSelRem=" + (indivIcon.reminder || 0) + "&iconSelNotif=" + (indivIcon.notif || 0) + "&iconSelNpMusic=" + (indivIcon.nowplayingMusic || 0) + "&iconSelNpVideo=" + (indivIcon.nowplayingVideo || 0) + "&iconSelPress="+ (indivIcon.pressure || 0) + "&iconSelCurr=" + (indivIcon.currency || 0) + "&iconSelIp=" + (indivIcon.ip || 0) + "&iconWxSunny=" + (indivWxIcon.sunny || 0) + "&iconWxCloud=" + (indivWxIcon.cloud || 0) + "&iconWxRain=" + (indivWxIcon.rain || 0) + "&iconWxStorm=" + (indivWxIcon.storm || 0) + "&iconWxSnow=" + (indivWxIcon.snow || 0) + "&iconWxWind=" + (indivWxIcon.wind || 0) + "&iconWxNight=" + (indivWxIcon.night || 0);
         items.forEach(function(it, i) {
           p += "&id" + i + "=" + it.id + "&en" + i + "=" + (it.enabled ? 1 : 0) + "&dur" + i + "=" + it.dur;
         });
@@ -11853,16 +12678,14 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       };
 
       function initTimerFeature() {
-        fetch("/state").then(function(r) {
-          return r.json();
-        }).then(function(s) {
+        withInitialState(function(s) {
           if (s.timerDurationSec !== undefined) timerDurationSec = s.timerDurationSec;
           if (s.timerPreset !== undefined) timerPresetV = s.timerPreset;
           if (s.scrollTypeTimer !== undefined) indivScroll.timer = s.scrollTypeTimer;
           if (s.evSndTimer) evSndTimer = s.evSndTimer;
           buildPriorityGrid();
           pollTimerState();
-        }).catch(function() {});
+        })
       }
       if (document.readyState === "complete") initTimerFeature();
       else window.addEventListener("load", initTimerFeature);
@@ -12102,14 +12925,13 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
       }
       var _origSaveSettings2 = saveSettings;
       saveSettings = function() {
+        if (!stateLoadComplete || !Array.isArray(items) || items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return;
         _origSaveSettings2();
         saveTransitionSettings();
       };
 
       function initTileTransitionFeature() {
-        fetch("/state").then(function(r) {
-          return r.json();
-        }).then(function(s) {
+        withInitialState(function(s) {
           if (s.tileTransGlobal !== undefined) tileTransitionGlobal = s.tileTransGlobal;
           if (s.tileTransHour !== undefined) indivTransCircuit[0] = s.tileTransHour;
           if (s.tileTransDate !== undefined) indivTransCircuit[1] = s.tileTransDate;
@@ -12132,7 +12954,7 @@ const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
           if (s.tileTransC2P !== undefined) transC2P = s.tileTransC2P;
           if (s.tileTransP2C !== undefined) transP2C = s.tileTransP2C;
           applyTileTransitionGlobal();
-        }).catch(function() {});
+        })
       }
       if (document.readyState === "complete") initTileTransitionFeature();
       else window.addEventListener("load", initTileTransitionFeature);
@@ -12890,7 +13712,25 @@ void handleSettings() {
   if (server.hasArg("hideIconPressure"))   { bool v = (server.arg("hideIconPressure")   == "1"); if (v != hideIconPressure)   hideIconTouched = true; hideIconPressure   = v; }
   if (server.hasArg("hideIconCurrency"))   { bool v = (server.arg("hideIconCurrency")   == "1"); if (v != hideIconCurrency)   hideIconTouched = true; hideIconCurrency   = v; }
   if (server.hasArg("hideIconIp"))         { bool v = (server.arg("hideIconIp")         == "1"); if (v != hideIconIp)         hideIconTouched = true; hideIconIp         = v; }
-  bool scrollTypeTouched = hideIconTouched;
+  if (server.hasArg("npAdaptiveIcon"))     { npAdaptiveIcon = (server.arg("npAdaptiveIcon") == "1"); }
+  bool iconSelTouched = false;
+  if (server.hasArg("iconSelDate"))  { int v = server.arg("iconSelDate").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelDate)       iconSelTouched = true; iconSelDate       = (uint8_t)v; } }
+  if (server.hasArg("iconSelTemp"))  { int v = server.arg("iconSelTemp").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelTemp)       iconSelTouched = true; iconSelTemp       = (uint8_t)v; } }
+  if (server.hasArg("iconSelRem"))   { int v = server.arg("iconSelRem").toInt();   if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelReminder)   iconSelTouched = true; iconSelReminder   = (uint8_t)v; } }
+  if (server.hasArg("iconSelNotif")) { int v = server.arg("iconSelNotif").toInt(); if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelNotif)      iconSelTouched = true; iconSelNotif      = (uint8_t)v; } }
+  if (server.hasArg("iconSelNpMusic")) { int v = server.arg("iconSelNpMusic").toInt(); if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelNpMusic) iconSelTouched = true; iconSelNpMusic = (uint8_t)v; } }
+  if (server.hasArg("iconSelNpVideo")) { int v = server.arg("iconSelNpVideo").toInt(); if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelNpVideo) iconSelTouched = true; iconSelNpVideo = (uint8_t)v; } }
+  if (server.hasArg("iconSelPress")) { int v = server.arg("iconSelPress").toInt(); if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelPressure)   iconSelTouched = true; iconSelPressure   = (uint8_t)v; } }
+  if (server.hasArg("iconSelCurr"))  { int v = server.arg("iconSelCurr").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelCurrency)   iconSelTouched = true; iconSelCurrency   = (uint8_t)v; } }
+  if (server.hasArg("iconSelIp"))    { int v = server.arg("iconSelIp").toInt();    if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelIp)         iconSelTouched = true; iconSelIp         = (uint8_t)v; } }
+  if (server.hasArg("iconWxSunny"))  { int v = server.arg("iconWxSunny").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxSunny)       iconSelTouched = true; iconWxSunny       = (uint8_t)v; } }
+  if (server.hasArg("iconWxCloud"))  { int v = server.arg("iconWxCloud").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxCloud)       iconSelTouched = true; iconWxCloud       = (uint8_t)v; } }
+  if (server.hasArg("iconWxRain"))   { int v = server.arg("iconWxRain").toInt();   if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxRain)        iconSelTouched = true; iconWxRain        = (uint8_t)v; } }
+  if (server.hasArg("iconWxStorm"))  { int v = server.arg("iconWxStorm").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxStorm)       iconSelTouched = true; iconWxStorm       = (uint8_t)v; } }
+  if (server.hasArg("iconWxSnow"))   { int v = server.arg("iconWxSnow").toInt();   if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxSnow)        iconSelTouched = true; iconWxSnow        = (uint8_t)v; } }
+  if (server.hasArg("iconWxWind"))   { int v = server.arg("iconWxWind").toInt();   if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxWind)        iconSelTouched = true; iconWxWind        = (uint8_t)v; } }
+  if (server.hasArg("iconWxNight"))  { int v = server.arg("iconWxNight").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconWxNight)       iconSelTouched = true; iconWxNight       = (uint8_t)v; } }
+  bool scrollTypeTouched = hideIconTouched || iconSelTouched;
   if (server.hasArg("scrollType")) {
     int st = server.arg("scrollType").toInt();
 
@@ -13029,7 +13869,7 @@ void handleSettings() {
       else if (cur.id == ITEM_WEATHER)    weatherInit();
       else if (cur.id == ITEM_MEMENTO)    mementoInit();
       else if (cur.id == ITEM_DATE)       dateInit();
-      else if (cur.id == ITEM_TEMP)       tempInit(lastTemp);
+      else if (cur.id == ITEM_TEMP && lastTemp != -999) tempInit(lastTemp);
       else if (cur.id == ITEM_PRESSURE)   pressureInit((int)round(lastPressureHpa));
       else if (cur.id == ITEM_CURRENCY)   currencyInit();
     }
@@ -13049,7 +13889,7 @@ void handleSettings() {
       else if (cur.id == ITEM_WEATHER)    weatherInit();
       else if (cur.id == ITEM_MEMENTO)    mementoInit();
       else if (cur.id == ITEM_DATE)       dateInit();
-      else if (cur.id == ITEM_TEMP)       tempInit(lastTemp);
+      else if (cur.id == ITEM_TEMP && lastTemp != -999) tempInit(lastTemp);
       else if (cur.id == ITEM_PRESSURE)   pressureInit((int)round(lastPressureHpa));
       else if (cur.id == ITEM_CURRENCY)   currencyInit();
     }
@@ -13077,20 +13917,34 @@ void handleSettings() {
   if (server.hasArg("tileTransC2P"))    { int t = server.arg("tileTransC2P").toInt();    if (t >= 0 && t <= 9) tileTransC2P    = (uint8_t)t; }
   if (server.hasArg("tileTransP2C"))    { int t = server.arg("tileTransP2C").toInt();    if (t >= 0 && t <= 9) tileTransP2C    = (uint8_t)t; }
 
-  int count = 0;
-  CycleItem newItems[NUM_ITEMS];
-  for (int i = 0; i < NUM_ITEMS; i++) {
-    String idKey  = "id"  + String(i);
-    String enKey  = "en"  + String(i);
-    String durKey = "dur" + String(i);
-    if (!server.hasArg(idKey)) break;
-    newItems[i].id          = (uint8_t)server.arg(idKey).toInt();
-    newItems[i].enabled     = (server.arg(enKey) == "1");
-    newItems[i].durationSec = (uint16_t)server.arg(durKey).toInt();
-    newItems[i].order       = i;
-    count++;
+  // Settings-only requests (for example transition settings) contain no tile
+  // payload. If a tile payload is present, it must contain the entire valid
+  // circuit list; never persist a partially received/retry-corrupted list.
+  if (server.hasArg("id0")) {
+    CycleItem newItems[NUM_ITEMS];
+    bool seenIds[16] = { false };
+    for (int i = 0; i < NUM_ITEMS; i++) {
+      String idKey  = "id"  + String(i);
+      String enKey  = "en"  + String(i);
+      String durKey = "dur" + String(i);
+      if (!server.hasArg(idKey) || !server.hasArg(enKey) || !server.hasArg(durKey)) {
+        server.send(400, "text/plain", "Lista de tile-uri este incompleta");
+        return;
+      }
+      int id = server.arg(idKey).toInt();
+      int duration = server.arg(durKey).toInt();
+      if (id < 0 || id >= 16 || !isValidCircuitItemId((uint8_t)id) || seenIds[id] || duration < 1 || duration > 3600) {
+        server.send(400, "text/plain", "Lista de tile-uri este invalida");
+        return;
+      }
+      seenIds[id] = true;
+      newItems[i].id          = (uint8_t)id;
+      newItems[i].enabled     = (server.arg(enKey) == "1");
+      newItems[i].durationSec = (uint16_t)duration;
+      newItems[i].order       = i;
+    }
+    for (int i = 0; i < NUM_ITEMS; i++) items[i] = newItems[i];
   }
-  for (int i = 0; i < count; i++) items[i] = newItems[i];
 
   repairItemIds();
   saveSettings();
@@ -13210,6 +14064,37 @@ void handleAccentSett() {
   server.send(200, "text/plain", "OK");
 }
 
+// Escapes a string for safe embedding inside a JSON string literal.
+// Several /state fields (WiFi SSID, memento text, custom AP name, weather
+// city, ...) are free text the user can set to almost anything, including
+// double quotes or backslashes. Without escaping, a single " in e.g. a
+// memento note corrupts the entire JSON payload and every /state fetch on
+// the dashboard fails to parse (silently retried, then surfaced as
+// "Nu s-au putut incarca tile-urile. Reincarca pagina.").
+String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
 void handleState() {
   if (!checkAuth()) return;
   prefs.begin("wifi", true);
@@ -13218,119 +14103,291 @@ void handleState() {
 
   String localIP = provisionMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 
-  String json = "{\"buzzer\":" + String(buzzerOn ? "true" : "false") +
-                ",\"buzzerVolume\":" + String(buzzerVolume) +
-                ",\"buzzerPreset\":\"" + String(buzzerPreset) + "\"" +
-                ",\"ssid\":\"" + ssid + "\"" +
-                ",\"ip\":\"" + localIP + "\"" +
-                ",\"ap\":" + String(provisionMode ? "true" : "false") +
-                ",\"apSsid\":\"" + getApSsid() + "\"" +
-                ",\"version\":\"" + FW_VERSION + "\"" +
-                ",\"uptime\":" + String(millis() / 1000) +
-                ",\"lastTemp\":" + String(lastTemp) +
-                ",\"items\":[";
+  // /state is the largest response in the portal. Each field is appended
+  // individually (rather than one long chained `+` expression) so every += only
+  // needs one small temporary String for its right-hand side. The previous single
+  // chained expression created a cascade of growing temporary String allocations
+  // while being evaluated (one per `+`), which is what was actually fragmenting
+  // the heap and occasionally truncating this response - reserve() alone only
+  // protects the final `json` buffer, not those intermediate temporaries.
+  String json;
+  json.reserve(6144); // ~2.1x the measured typical payload (~2.8KB); headroom for long SSID/city/memento/canvas values
+  json = "{\"buzzer\":";
+  json += String(buzzerOn ? "true" : "false");
+  json += ",\"buzzerVolume\":";
+  json += String(buzzerVolume);
+  json += ",\"buzzerPreset\":\"";
+  json += String(buzzerPreset);
+  json += "\"";
+  json += ",\"ssid\":\"";
+  json += jsonEscape(ssid);
+  json += "\"";
+  json += ",\"ip\":\"";
+  json += localIP;
+  json += "\"";
+  json += ",\"ap\":";
+  json += String(provisionMode ? "true" : "false");
+  json += ",\"apSsid\":\"";
+  json += jsonEscape(getApSsid());
+  json += "\"";
+  json += ",\"version\":\"";
+  json += FW_VERSION;
+  json += "\"";
+  json += ",\"uptime\":";
+  json += String(millis() / 1000);
+  json += ",\"lastTemp\":";
+  json += String(lastTemp);
+  json += ",\"items\":[";
   for (int i = 0; i < NUM_ITEMS; i++) {
     if (i > 0) json += ",";
-    json += "{\"id\":" + String(items[i].id) +
-            ",\"enabled\":" + (items[i].enabled ? "true" : "false") +
-            ",\"dur\":" + String(items[i].durationSec) + "}";
+    json += "{\"id\":";
+    json += String(items[i].id);
+    json += ",\"enabled\":";
+    json += (items[i].enabled ? "true" : "false");
+    json += ",\"dur\":";
+    json += String(items[i].durationSec);
+    json += "}";
   }
   json += "]";
   char tFrom[6], tTo[6];
   snprintf(tFrom, 6, "%02d:%02d", dimFromH, dimFromM);
   snprintf(tTo,   6, "%02d:%02d", dimToH,   dimToM);
-  json += ",\"bright\":" + String(curBrightness) +
-          ",\"dimAuto\":" + String(dimAutoOn ? "true" : "false") +
-          ",\"dimFrom\":\"" + String(tFrom) + "\"" +
-          ",\"dimTo\":\"" + String(tTo) + "\"" +
-          ",\"dimLevel\":" + String(dimLevel) +
-          ",\"tempunit\":" + String(tempUnit) +
-          ",\"hourformat\":" + String(hourFormat) +
-          ",\"dateformat\":" + String(dateFormat) +
-          ",\"datelang\":" + String(dateLang) +
-          ",\"customdatefmt\":\"" + String(customDateFmt) + "\"" +
-          ",\"wxCity\":\"" + String(weatherCity) + "\"" +
-          ",\"wxLang\":\"" + String(weatherLang) + "\"" +
-          ",\"wxHasKey\":" + String(strlen(weatherApiKey) > 0 ? "true" : "false") +
-          ",\"currencyBase\":\"" + String(currencyBase) + "\"" +
-          ",\"currencyQuote\":\"" + String(currencyQuote) + "\"" +
-          ",\"currencyCompare\":" + String(currencyCompareEnabled ? "true" : "false") +
-          ",\"notifEnabled\":" + String(notifEnabled ? "true" : "false") +
-          ",\"ets2Enabled\":" + String(ets2Enabled ? "true" : "false") +
-          ",\"ets2OrderFirst\":" + String(ets2OrderFirst ? "true" : "false") +
-          ",\"nowPlayingIsPriority\":" + String(nowPlayingIsPriority ? "true" : "false") +
-          ",\"priorityOrder\":\"" + priorityOrderToString() + "\"" +
-          ",\"hideIcons\":" + String(hideTileIcons ? "true" : "false") +
-          ",\"hideIconDate\":" + String(hideIconDate ? "true" : "false") +
-          ",\"hideIconTemp\":" + String(hideIconTemp ? "true" : "false") +
-          ",\"hideIconReminder\":" + String(hideIconReminder ? "true" : "false") +
-          ",\"hideIconWeather\":" + String(hideIconWeather ? "true" : "false") +
-          ",\"hideIconNotif\":" + String(hideIconNotif ? "true" : "false") +
-          ",\"hideIconNowPlaying\":" + String(hideIconNowPlaying ? "true" : "false") +
-          ",\"hideIconPressure\":" + String(hideIconPressure ? "true" : "false") +
-          ",\"hideIconCurrency\":" + String(hideIconCurrency ? "true" : "false") +
-          ",\"hideIconIp\":" + String(hideIconIp ? "true" : "false") +
-          ",\"scrollType\":" + String(scrollType) +
-          ",\"scrollTypeDate\":" + String(scrollTypeDate) +
-          ",\"scrollTypeTemp\":" + String(scrollTypeTemp) +
-          ",\"scrollTypeReminder\":" + String(scrollTypeReminder) +
-          ",\"scrollTypeWeather\":" + String(scrollTypeWeather) +
-          ",\"scrollTypeNotif\":" + String(scrollTypeNotif) +
-          ",\"scrollTypeNowPlaying\":" + String(scrollTypeNowPlaying) +
-          ",\"scrollTypePressure\":" + String(scrollTypePressure) +
-          ",\"scrollTypeStopwatch\":" + String(scrollTypeStopwatch) +
-          ",\"scrollTypeCurrency\":" + String(scrollTypeCurrency) +
-          ",\"scrollTypeTimer\":" + String(scrollTypeTimer) +
-          ",\"scrollTypeIp\":" + String(scrollTypeIp) +
-          ",\"fontType\":" + String(fontType) +
-          ",\"fontTypeDate\":" + String(fontTypeDate) +
-          ",\"fontTypeTemp\":" + String(fontTypeTemp) +
-          ",\"fontTypeReminder\":" + String(fontTypeReminder) +
-          ",\"fontTypeWeather\":" + String(fontTypeWeather) +
-          ",\"fontTypeNotif\":" + String(fontTypeNotif) +
-          ",\"fontTypeNowPlaying\":" + String(fontTypeNowPlaying) +
-          ",\"fontTypePressure\":" + String(fontTypePressure) +
-          ",\"fontTypeStopwatch\":" + String(fontTypeStopwatch) +
-          ",\"fontTypeCurrency\":" + String(fontTypeCurrency) +
-          ",\"fontTypeTimer\":" + String(fontTypeTimer) +
-          ",\"fontTypeIp\":" + String(fontTypeIp) +
-          ",\"tileTransGlobal\":" + String(tileTransGlobal) +
-          ",\"tileTransHour\":" + String(tileTransHour) +
-          ",\"tileTransDate\":" + String(tileTransDate) +
-          ",\"tileTransTemp\":" + String(tileTransTemp) +
-          ",\"tileTransNp\":" + String(tileTransNp) +
-          ",\"tileTransWx\":" + String(tileTransWx) +
-          ",\"tileTransRem\":" + String(tileTransRem) +
-          ",\"tileTransCanvas\":" + String(tileTransCanvas) +
-          ",\"tileTransPress\":" + String(tileTransPress) +
-          ",\"tileTransSs\":" + String(tileTransSs) +
-          ",\"tileTransCurr\":" + String(tileTransCurr) +
-          ",\"tileTransNotif\":" + String(tileTransNotif) +
-          ",\"tileTransEts2\":" + String(tileTransEts2) +
-          ",\"tileTransSw\":" + String(tileTransSw) +
-          ",\"tileTransTmr\":" + String(tileTransTmr) +
-          ",\"tileTransIp\":" + String(tileTransIp) +
-          ",\"tileTransC2P\":" + String(tileTransC2P) +
-          ",\"tileTransP2C\":" + String(tileTransP2C) +
-          ",\"timerDurationSec\":" + String(timerDurationSec) +
-          ",\"timerPreset\":" + String(timerPreset) +
-          ",\"pressureHpa\":" + String((int)round(lastPressureHpa)) +
-          ",\"pressureTrend\":" + String(pressureTrend) +
-          ",\"currencyValid\":" + String(currencyValid ? "true" : "false") +
-          ",\"currencyRate\":" + String(currencyRateNow, 4) +
-          ",\"currencyTrend\":" + String(currencyTrend) +
-          ",\"mementoText\":\"" + String(mementoBuf) + "\"" +
-          ",\"canvasBmp\":\"" + canvasBitmapToHex() + "\"" +
-          ",\"evSndTile\":\""  + String(eventSoundTile)  + "\"" +
-          ",\"evSndWifi\":\""  + String(eventSoundWifi)  + "\"" +
-          ",\"evSndNotif\":\"" + String(eventSoundNotif) + "\"" +
-          ",\"evSndEts2\":\""  + String(eventSoundEts2)  + "\"" +
-          ",\"evSndTouch\":\"" + String(eventSoundTouch) + "\"" +
-          ",\"evSndTimer\":\"" + String(eventSoundTimer) + "\"" +
-          ",\"touchTapAction\":" + String(touchTapAction) +
-          ",\"touchDoubleTapAction\":" + String(touchDoubleTapAction) +
-          ",\"accentColor\":\"" + String(accentColor) + "\"" +
-          ",\"ssAnim\":" + String(ssAnimSelected) + "}";
+  json += ",\"bright\":";
+  json += String(curBrightness);
+  json += ",\"dimAuto\":";
+  json += String(dimAutoOn ? "true" : "false");
+  json += ",\"dimFrom\":\"";
+  json += String(tFrom);
+  json += "\"";
+  json += ",\"dimTo\":\"";
+  json += String(tTo);
+  json += "\"";
+  json += ",\"dimLevel\":";
+  json += String(dimLevel);
+  json += ",\"tempunit\":";
+  json += String(tempUnit);
+  json += ",\"hourformat\":";
+  json += String(hourFormat);
+  json += ",\"dateformat\":";
+  json += String(dateFormat);
+  json += ",\"datelang\":";
+  json += String(dateLang);
+  json += ",\"customdatefmt\":\"";
+  json += jsonEscape(String(customDateFmt));
+  json += "\"";
+  json += ",\"wxCity\":\"";
+  json += jsonEscape(String(weatherCity));
+  json += "\"";
+  json += ",\"wxLang\":\"";
+  json += jsonEscape(String(weatherLang));
+  json += "\"";
+  json += ",\"wxHasKey\":";
+  json += String(strlen(weatherApiKey) > 0 ? "true" : "false");
+  json += ",\"currencyBase\":\"";
+  json += String(currencyBase);
+  json += "\"";
+  json += ",\"currencyQuote\":\"";
+  json += String(currencyQuote);
+  json += "\"";
+  json += ",\"currencyCompare\":";
+  json += String(currencyCompareEnabled ? "true" : "false");
+  json += ",\"notifEnabled\":";
+  json += String(notifEnabled ? "true" : "false");
+  json += ",\"ets2Enabled\":";
+  json += String(ets2Enabled ? "true" : "false");
+  json += ",\"ets2OrderFirst\":";
+  json += String(ets2OrderFirst ? "true" : "false");
+  json += ",\"nowPlayingIsPriority\":";
+  json += String(nowPlayingIsPriority ? "true" : "false");
+  json += ",\"priorityOrder\":\"";
+  json += priorityOrderToString();
+  json += "\"";
+  json += ",\"hideIcons\":";
+  json += String(hideTileIcons ? "true" : "false");
+  json += ",\"hideIconDate\":";
+  json += String(hideIconDate ? "true" : "false");
+  json += ",\"hideIconTemp\":";
+  json += String(hideIconTemp ? "true" : "false");
+  json += ",\"hideIconReminder\":";
+  json += String(hideIconReminder ? "true" : "false");
+  json += ",\"hideIconWeather\":";
+  json += String(hideIconWeather ? "true" : "false");
+  json += ",\"hideIconNotif\":";
+  json += String(hideIconNotif ? "true" : "false");
+  json += ",\"hideIconNowPlaying\":";
+  json += String(hideIconNowPlaying ? "true" : "false");
+  json += ",\"hideIconPressure\":";
+  json += String(hideIconPressure ? "true" : "false");
+  json += ",\"hideIconCurrency\":";
+  json += String(hideIconCurrency ? "true" : "false");
+  json += ",\"hideIconIp\":";
+  json += String(hideIconIp ? "true" : "false");
+  json += ",\"npAdaptiveIcon\":";
+  json += String(npAdaptiveIcon ? "true" : "false");
+  json += ",\"iconSelDate\":";
+  json += String(iconSelDate);
+  json += ",\"iconSelTemp\":";
+  json += String(iconSelTemp);
+  json += ",\"iconSelReminder\":";
+  json += String(iconSelReminder);
+  json += ",\"iconSelNotif\":";
+  json += String(iconSelNotif);
+  json += ",\"iconSelNpMusic\":";
+  json += String(iconSelNpMusic);
+  json += ",\"iconSelNpVideo\":";
+  json += String(iconSelNpVideo);
+  json += ",\"iconSelPressure\":";
+  json += String(iconSelPressure);
+  json += ",\"iconSelCurrency\":";
+  json += String(iconSelCurrency);
+  json += ",\"iconSelIp\":";
+  json += String(iconSelIp);
+  json += ",\"iconWxSunny\":";
+  json += String(iconWxSunny);
+  json += ",\"iconWxCloud\":";
+  json += String(iconWxCloud);
+  json += ",\"iconWxRain\":";
+  json += String(iconWxRain);
+  json += ",\"iconWxStorm\":";
+  json += String(iconWxStorm);
+  json += ",\"iconWxSnow\":";
+  json += String(iconWxSnow);
+  json += ",\"iconWxWind\":";
+  json += String(iconWxWind);
+  json += ",\"iconWxNight\":";
+  json += String(iconWxNight);
+  json += ",\"scrollType\":";
+  json += String(scrollType);
+  json += ",\"scrollTypeDate\":";
+  json += String(scrollTypeDate);
+  json += ",\"scrollTypeTemp\":";
+  json += String(scrollTypeTemp);
+  json += ",\"scrollTypeReminder\":";
+  json += String(scrollTypeReminder);
+  json += ",\"scrollTypeWeather\":";
+  json += String(scrollTypeWeather);
+  json += ",\"scrollTypeNotif\":";
+  json += String(scrollTypeNotif);
+  json += ",\"scrollTypeNowPlaying\":";
+  json += String(scrollTypeNowPlaying);
+  json += ",\"scrollTypePressure\":";
+  json += String(scrollTypePressure);
+  json += ",\"scrollTypeStopwatch\":";
+  json += String(scrollTypeStopwatch);
+  json += ",\"scrollTypeCurrency\":";
+  json += String(scrollTypeCurrency);
+  json += ",\"scrollTypeTimer\":";
+  json += String(scrollTypeTimer);
+  json += ",\"scrollTypeIp\":";
+  json += String(scrollTypeIp);
+  json += ",\"fontType\":";
+  json += String(fontType);
+  json += ",\"fontTypeDate\":";
+  json += String(fontTypeDate);
+  json += ",\"fontTypeTemp\":";
+  json += String(fontTypeTemp);
+  json += ",\"fontTypeReminder\":";
+  json += String(fontTypeReminder);
+  json += ",\"fontTypeWeather\":";
+  json += String(fontTypeWeather);
+  json += ",\"fontTypeNotif\":";
+  json += String(fontTypeNotif);
+  json += ",\"fontTypeNowPlaying\":";
+  json += String(fontTypeNowPlaying);
+  json += ",\"fontTypePressure\":";
+  json += String(fontTypePressure);
+  json += ",\"fontTypeStopwatch\":";
+  json += String(fontTypeStopwatch);
+  json += ",\"fontTypeCurrency\":";
+  json += String(fontTypeCurrency);
+  json += ",\"fontTypeTimer\":";
+  json += String(fontTypeTimer);
+  json += ",\"fontTypeIp\":";
+  json += String(fontTypeIp);
+  json += ",\"tileTransGlobal\":";
+  json += String(tileTransGlobal);
+  json += ",\"tileTransHour\":";
+  json += String(tileTransHour);
+  json += ",\"tileTransDate\":";
+  json += String(tileTransDate);
+  json += ",\"tileTransTemp\":";
+  json += String(tileTransTemp);
+  json += ",\"tileTransNp\":";
+  json += String(tileTransNp);
+  json += ",\"tileTransWx\":";
+  json += String(tileTransWx);
+  json += ",\"tileTransRem\":";
+  json += String(tileTransRem);
+  json += ",\"tileTransCanvas\":";
+  json += String(tileTransCanvas);
+  json += ",\"tileTransPress\":";
+  json += String(tileTransPress);
+  json += ",\"tileTransSs\":";
+  json += String(tileTransSs);
+  json += ",\"tileTransCurr\":";
+  json += String(tileTransCurr);
+  json += ",\"tileTransNotif\":";
+  json += String(tileTransNotif);
+  json += ",\"tileTransEts2\":";
+  json += String(tileTransEts2);
+  json += ",\"tileTransSw\":";
+  json += String(tileTransSw);
+  json += ",\"tileTransTmr\":";
+  json += String(tileTransTmr);
+  json += ",\"tileTransIp\":";
+  json += String(tileTransIp);
+  json += ",\"tileTransC2P\":";
+  json += String(tileTransC2P);
+  json += ",\"tileTransP2C\":";
+  json += String(tileTransP2C);
+  json += ",\"timerDurationSec\":";
+  json += String(timerDurationSec);
+  json += ",\"timerPreset\":";
+  json += String(timerPreset);
+  json += ",\"pressureHpa\":";
+  json += String((int)round(lastPressureHpa));
+  json += ",\"pressureTrend\":";
+  json += String(pressureTrend);
+  json += ",\"currencyValid\":";
+  json += String(currencyValid ? "true" : "false");
+  json += ",\"currencyRate\":";
+  json += String((currencyValid && !isnan(currencyRateNow)) ? currencyRateNow : 0.0f, 4);
+  json += ",\"currencyTrend\":";
+  json += String(currencyTrend);
+  json += ",\"mementoText\":\"";
+  json += jsonEscape(String(mementoBuf));
+  json += "\"";
+  json += ",\"canvasBmp\":\"";
+  json += canvasBitmapToHex();
+  json += "\"";
+  json += ",\"evSndTile\":\"";
+  json += jsonEscape(String(eventSoundTile));
+  json += "\"";
+  json += ",\"evSndWifi\":\"";
+  json += jsonEscape(String(eventSoundWifi));
+  json += "\"";
+  json += ",\"evSndNotif\":\"";
+  json += jsonEscape(String(eventSoundNotif));
+  json += "\"";
+  json += ",\"evSndEts2\":\"";
+  json += jsonEscape(String(eventSoundEts2));
+  json += "\"";
+  json += ",\"evSndTouch\":\"";
+  json += jsonEscape(String(eventSoundTouch));
+  json += "\"";
+  json += ",\"evSndTimer\":\"";
+  json += jsonEscape(String(eventSoundTimer));
+  json += "\"";
+  json += ",\"touchTapAction\":";
+  json += String(touchTapAction);
+  json += ",\"touchDoubleTapAction\":";
+  json += String(touchDoubleTapAction);
+  json += ",\"accentColor\":\"";
+  json += jsonEscape(String(accentColor));
+  json += "\"";
+  json += ",\"ssAnim\":";
+  json += String(ssAnimSelected);
+  json += "}";
   server.send(200, "application/json", json);
 }
 
@@ -13519,11 +14576,11 @@ void handleCurrencySett() {
 
 void handleCurrencyState() {
   if (!checkAuth()) return;
-  String json = "{\"base\":\"" + String(currencyBase) + "\"" +
-                ",\"quote\":\"" + String(currencyQuote) + "\"" +
+  String json = "{\"base\":\"" + jsonEscape(String(currencyBase)) + "\"" +
+                ",\"quote\":\"" + jsonEscape(String(currencyQuote)) + "\"" +
                 ",\"compare\":" + String(currencyCompareEnabled ? "true" : "false") +
                 ",\"valid\":" + String(currencyValid ? "true" : "false") +
-                ",\"rate\":" + String(currencyRateNow, 4) +
+                ",\"rate\":" + String((currencyValid && !isnan(currencyRateNow)) ? currencyRateNow : 0.0f, 4) +
                 ",\"trend\":" + String(currencyTrend) + "}";
   server.send(200, "application/json", json);
 }
@@ -13531,6 +14588,12 @@ void handleCurrencyState() {
 void handleNowPlaying() {
   if (!checkAuth()) return;
   bool updated = false;
+
+  // Optional playback-source classification from Octoglow Sender: "video"
+  // or "music" (anything else / missing => treat as music/unknown).
+  if (server.hasArg("kind")) {
+    npIsVideoSource = (server.arg("kind") == "video");
+  }
 
   if (server.hasArg("artist") && server.hasArg("title")) {
     server.arg("artist").toCharArray(nowArtist, sizeof(nowArtist));
@@ -13896,7 +14959,20 @@ void handlePriorityOrder() {
     return;
   }
   for (int i = 0; i < NUM_PRIORITY_IDS; i++) priorityOrder[i] = newOrder[i];
-  nowPlayingIsPriority = sawNowPlaying;
+  // nowPlayingIsPriority used to be inferred purely from whether "nowplaying"
+  // appeared in the submitted order string. That made it collateral damage of
+  // ANY priority-list save that didn't happen to include nowplaying (e.g. the
+  // client's hardcoded default priorityItems before /state has loaded, or a
+  // stale client copy left over from a failed /state fetch) - such a save
+  // would silently flip Now Playing back into Circuit Tiles even though the
+  // user never touched it. The client now sends an explicit npPriority flag
+  // reflecting its actual current UI state; fall back to the old inference
+  // only if an older/other client omits it, for backward compatibility.
+  if (server.hasArg("npPriority")) {
+    nowPlayingIsPriority = server.arg("npPriority") == "1";
+  } else {
+    nowPlayingIsPriority = sawNowPlaying;
+  }
   if (!nowPlayingIsPriority) npPriorityWasActive = false;
 
   int notifRank = -1, ets2Rank = -1;
@@ -13989,7 +15065,6 @@ void handleTempUnit() {
     uint8_t u = (uint8_t)server.arg("unit").toInt();
     if (u <= 1) {
       tempUnit = u;
-      lastTemp = -999;
       saveSettings();
     }
     server.send(200, "text/plain", "OK");

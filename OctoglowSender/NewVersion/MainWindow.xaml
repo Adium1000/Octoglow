@@ -1,0 +1,31 @@
+<Window x:Class="OctoglowSender.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="using:OctoglowSender"
+        Title="Octoglow Connect">
+    <Grid Background="{ThemeResource AppShellBackgroundBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="48" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid x:Name="AppTitleBar" Padding="20,0,168,0">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <Image Source="ms-appx:///Assets/octoglow_logo.svg" Width="24" Height="24" />
+                <TextBlock x:Name="WindowTitle" Text="Octoglow Connect" Style="{ThemeResource SubtitleTextBlockStyle}" />
+            </StackPanel>
+        </Grid>
+        <NavigationView x:Name="RootNavigation" Grid.Row="1" Background="Transparent" PaneDisplayMode="Left" IsSettingsVisible="False"
+                        IsBackButtonVisible="Collapsed"
+                        OpenPaneLength="240" CompactPaneLength="52"
+                        SelectionChanged="RootNavigation_SelectionChanged">
+            <NavigationView.MenuItems>
+                <NavigationViewItem x:Name="ConnectionNavItem" Content="Conexiune" Tag="connection" Icon="Globe" IsSelected="True" HorizontalContentAlignment="Left"/>
+                <NavigationViewItem x:Name="CustomizeNavItem" Content="Customize" Tag="customize" Icon="Edit" HorizontalContentAlignment="Left"/>
+                <NavigationViewItem x:Name="LogsNavItem" Content="Jurnal activitate" Tag="logs" Icon="Document" HorizontalContentAlignment="Left"/>
+                <NavigationViewItem x:Name="AboutNavItem" Content="Despre" Tag="about" Icon="Help" HorizontalContentAlignment="Left"/>
+                <NavigationViewItem x:Name="SettingsNavItem" Content="Setări" Tag="settings" Icon="Setting" HorizontalContentAlignment="Left"/>
+            </NavigationView.MenuItems>
+            <Frame x:Name="ContentFrame"/>
+        </NavigationView>
+    </Grid>
+</Window>

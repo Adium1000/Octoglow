@@ -1,0 +1,53 @@
+<Page x:Class="OctoglowSender.SettingsPage" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer><StackPanel Spacing="12" Padding="32" Width="620" HorizontalAlignment="Left">
+        <TextBlock x:Name="PageTitle" Style="{ThemeResource TitleTextBlockStyle}"/>
+        <TextBlock x:Name="LanguageTitle" Style="{ThemeResource SubtitleTextBlockStyle}"/>
+        <ComboBox x:Name="LanguageBox">
+            <ComboBoxItem x:Name="LanguageSystemItem" Tag="system"/>
+            <ComboBoxItem Tag="ro">Română</ComboBoxItem>
+            <ComboBoxItem Tag="en">English</ComboBoxItem>
+        </ComboBox>
+        <TextBlock x:Name="ThemeTitle" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,12,0,0"/>
+        <ComboBox x:Name="ThemeBox">
+            <ComboBoxItem x:Name="ThemeSystemItem" Tag="system"/>
+            <ComboBoxItem x:Name="ThemeLightItem" Tag="light"/>
+            <ComboBoxItem x:Name="ThemeDarkItem" Tag="dark"/>
+        </ComboBox>
+        <TextBlock x:Name="BackdropTitle" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,12,0,0"/>
+        <ComboBox x:Name="BackdropBox">
+            <ComboBoxItem x:Name="BackdropNoneItem" Tag="none"/>
+            <ComboBoxItem x:Name="BackdropMicaItem" Tag="mica"/>
+            <ComboBoxItem x:Name="BackdropMicaAltItem" Tag="micaalt"/>
+            <ComboBoxItem x:Name="BackdropAcrylicItem" Tag="acrylic"/>
+        </ComboBox>
+        <TextBlock x:Name="AppBehaviorTitle" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,12,0,0"/>
+        <ToggleSwitch x:Name="StartupSwitch"/>
+        <ToggleSwitch x:Name="TraySwitch"/>
+        <TextBlock x:Name="Ets2Title" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,12,0,0"/>
+        <ToggleSwitch x:Name="Ets2StopPriorityTileSwitch"/>
+        <TextBlock x:Name="NowPlayingTitle" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,12,0,0"/>
+        <TextBlock x:Name="NowPlayingDescription" TextWrapping="Wrap"/>
+        <ToggleSwitch x:Name="KeepNowPlayingWhenPausedSwitch" Margin="0,4,0,0"/>
+        <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Margin="0,8,0,0">
+            <Grid RowSpacing="0"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Grid Padding="16,12"><StackPanel Orientation="Horizontal" Spacing="10"><FontIcon Glyph="&#xE714;" FontSize="16"/><TextBlock x:Name="VideoPlayersLabel" Style="{ThemeResource SubtitleTextBlockStyle}"/></StackPanel></Grid>
+                <ListView x:Name="VideoPlayersList" Grid.Row="1" MaxHeight="160" SelectionMode="None" Background="Transparent" BorderThickness="0">
+                    <ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="0"/></Style></ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate><DataTemplate><Border Padding="16,8" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock Text="{Binding Name}" VerticalAlignment="Center"/><Button Grid.Column="1" Tag="{Binding}" Click="DeleteVideoPlayer_Click" ToolTipService.ToolTip="Delete" Width="32" Height="32" Padding="0" Background="Transparent"><FontIcon Glyph="&#xE74D;" FontSize="12" Foreground="{ThemeResource DeleteIconBrush}"/></Button></Grid></Border></DataTemplate></ListView.ItemTemplate>
+                </ListView>
+                <Grid Grid.Row="2" Padding="12" ColumnSpacing="8" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="VideoPlayerNameBox"/><Button Grid.Column="1" Click="AddVideoPlayer_Click"><StackPanel Orientation="Horizontal" Spacing="6"><FontIcon Glyph="&#xE710;"/><TextBlock x:Name="AddVideoButtonText"/></StackPanel></Button></Grid>
+            </Grid>
+        </Border>
+        <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
+            <Grid RowSpacing="0"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Grid Padding="16,12"><StackPanel Orientation="Horizontal" Spacing="10"><FontIcon Glyph="&#xE8D6;" FontSize="16"/><TextBlock x:Name="MusicPlayersLabel" Style="{ThemeResource SubtitleTextBlockStyle}"/></StackPanel></Grid>
+                <ListView x:Name="MusicPlayersList" Grid.Row="1" MaxHeight="160" SelectionMode="None" Background="Transparent" BorderThickness="0">
+                    <ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="0"/></Style></ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate><DataTemplate><Border Padding="16,8" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock Text="{Binding Name}" VerticalAlignment="Center"/><Button Grid.Column="1" Tag="{Binding}" Click="DeleteMusicPlayer_Click" ToolTipService.ToolTip="Delete" Width="32" Height="32" Padding="0" Background="Transparent"><FontIcon Glyph="&#xE74D;" FontSize="12" Foreground="{ThemeResource DeleteIconBrush}"/></Button></Grid></Border></DataTemplate></ListView.ItemTemplate>
+                </ListView>
+                <Grid Grid.Row="2" Padding="12" ColumnSpacing="8" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="MusicPlayerNameBox"/><Button Grid.Column="1" Click="AddMusicPlayer_Click"><StackPanel Orientation="Horizontal" Spacing="6"><FontIcon Glyph="&#xE710;"/><TextBlock x:Name="AddMusicButtonText"/></StackPanel></Button></Grid>
+            </Grid>
+        </Border>
+        <Button x:Name="RestoreDefaultsButton" Click="RestoreDefaults_Click" HorizontalAlignment="Left" Margin="0,12,0,0"/>
+    </StackPanel></ScrollViewer>
+</Page>

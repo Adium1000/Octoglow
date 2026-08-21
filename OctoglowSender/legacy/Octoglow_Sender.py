@@ -149,6 +149,10 @@ LANG = {
         "lang_popup_title": "Alege limba",
         "lang_popup_ro": "Română",
         "lang_popup_en": "Engleză",
+        "np_popup_title": "Detectare Video Now Playing",
+        "np_section_video": "Video Players",
+        "np_section_music": "Music Players",
+        "np_add_btn": "Adaugă",
     },
     "en": {
         "app_title": "Octoglow Sender",
@@ -175,6 +179,10 @@ LANG = {
         "lang_popup_title": "Choose language",
         "lang_popup_ro": "Romanian",
         "lang_popup_en": "English",
+        "np_popup_title": "Now Playing Video Detection",
+        "np_section_video": "Video Players",
+        "np_section_music": "Music Players",
+        "np_add_btn": "Add",
     },
 }
 
@@ -204,6 +212,18 @@ DEFAULT_CONFIG = {
     "send_interval": 10,
     "notif_max_chars": 110,
     "ets2_poll_interval": 0.5,
+    "np_video_players": [
+        {"name": "Google Chrome", "match": "chrome", "enabled": True, "builtin": True},
+        {"name": "Microsoft Edge", "match": "msedge", "enabled": True, "builtin": True},
+        {"name": "Opera", "match": "opera", "enabled": True, "builtin": True},
+        {"name": "Firefox", "match": "firefox", "enabled": True, "builtin": True},
+        {"name": "Brave", "match": "brave", "enabled": True, "builtin": True},
+    ],
+    "np_music_players": [
+        {"name": "Apple Music", "match": "applemusic", "enabled": True, "builtin": True},
+        {"name": "SoundCloud", "match": "soundcloud", "enabled": True, "builtin": True},
+        {"name": "Spotify", "match": "spotify", "enabled": True, "builtin": True},
+    ],
 }
 
 
@@ -489,38 +509,65 @@ class SenderBackend:
         self.threads.append(t)
         return True
 
+    @staticmethod
+    def _classify_np_source(source_app: str, cfg: dict) -> str:
+        """Classifies the reported media-session source app as 'video',
+        'music', or '' (unknown) using the user-configured player lists."""
+        if not source_app:
+            return ""
+        s = source_app.lower()
+        for entry in cfg.get("np_video_players", []):
+            match = (entry.get("match") or "").lower()
+            if entry.get("enabled", True) and match and match in s:
+                return "video"
+        for entry in cfg.get("np_music_players", []):
+            match = (entry.get("match") or "").lower()
+            if entry.get("enabled", True) and match and match in s:
+                return "music"
+        return ""
+
     async def _fetch_np(self):
         mgr = await MediaManager.request_async()
         session = mgr.get_current_session()
         if session is None:
-            return None
+            return None, ""
         props = await session.try_get_media_properties_async()
         if props is None:
-            return None
+            return None, ""
         title = (props.title or "").strip()
         artist = (props.artist or "").strip()
         if not title:
-            return None
-        return f"{artist} - {title}" if artist else title
+            return None, ""
+        text = f"{artist} - {title}" if artist else title
+        source_app = ""
+        try:
+            source_app = session.source_app_user_model_id or ""
+        except Exception:
+            source_app = ""
+        kind = self._classify_np_source(source_app, self.cfg)
+        return text, kind
 
     def get_now_playing(self):
         if not HAVE_WINRT_MEDIA:
-            return None
+            return None, ""
         try:
             return asyncio.run(self._fetch_np())
         except Exception as e:
             self.log(f"[WARN] NP: {e}")
-            return None
+            return None, ""
 
-    def send_nowplaying(self, text: str):
+    def send_nowplaying(self, text: str, kind: str = ""):
         url = f"{self.base_url}/nowplaying"
+        data = {"text": text}
+        if kind:
+            data["kind"] = kind
         try:
-            r = self.session.post(url, data={"text": text}, timeout=3)
+            r = self.session.post(url, data=data, timeout=3)
             if r.status_code == 200:
                 self.log(f"[NP] {text}")
             elif r.status_code == 401:
                 if self._ensure_session(r):
-                    r2 = self.session.post(url, data={"text": text}, timeout=3)
+                    r2 = self.session.post(url, data=data, timeout=3)
                     if r2.status_code == 200:
                         self.log(f"[NP] {text}")
             else:
@@ -532,17 +579,21 @@ class SenderBackend:
 
     def _nowplaying_loop(self):
         last_sent_text = None
+        last_sent_kind = None
         last_send_time = 0
         while not self.stop_event.is_set():
-            now_playing = self.get_now_playing()
+            now_playing, kind = self.get_now_playing()
             now = time.time()
             if now_playing:
-                if now_playing != last_sent_text or (now - last_send_time) >= self.cfg["send_interval"]:
-                    self.send_nowplaying(now_playing)
+                if (now_playing != last_sent_text or kind != last_sent_kind
+                        or (now - last_send_time) >= self.cfg["send_interval"]):
+                    self.send_nowplaying(now_playing, kind)
                     last_sent_text = now_playing
+                    last_sent_kind = kind
                     last_send_time = now
             else:
                 last_sent_text = None
+                last_sent_kind = None
             self.stop_event.wait(self.cfg["poll_interval"])
 
     def send_ets2_speed(self, speed_kmh: int):
@@ -695,6 +746,21 @@ def _draw_icon(kind: str, color, size: int) -> Image.Image:
             [(size * 0.20, size * 0.52), (size * 0.42, size * 0.76), (size * 0.82, size * 0.26)],
             fill=color, width=w, joint="curve",
         )
+    elif kind == "gear":  # settings button
+        for i in range(3):
+            y = size * (0.26 + i * 0.24)
+            d.rounded_rectangle([size * 0.16, y, size * 0.84, y + w], radius=w / 2, fill=color)
+            kx = size * (0.30 if i != 1 else 0.62)
+            r = size * 0.08
+            d.ellipse([kx - r, y + w / 2 - r, kx + r, y + w / 2 + r], fill=color)
+    elif kind == "plus":  # add entry
+        cx = cy = size / 2
+        d.rounded_rectangle([cx - w / 2, size * 0.16, cx + w / 2, size * 0.84], radius=w / 2, fill=color)
+        d.rounded_rectangle([size * 0.16, cy - w / 2, size * 0.84, cy + w / 2], radius=w / 2, fill=color)
+    elif kind == "trash":  # remove entry
+        pad = size * 0.20
+        d.rounded_rectangle([pad, size * 0.30, size - pad, size * 0.86], radius=size * 0.05, fill=color)
+        d.rectangle([size * 0.36, size * 0.16, size * 0.64, size * 0.26], fill=color)
     return img
 
 
@@ -704,6 +770,20 @@ def _make_icon(kind: str, color, size: int = 22) -> ctk.CTkImage:
     big = _draw_icon(kind, color, size * supersample)
     img = big.resize((size, size), Image.LANCZOS)
     return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+
+def _rounded_rect_image(width: int, height: int, radius: int, color) -> ctk.CTkImage:
+    """Anti-aliased rounded-rectangle fill rendered with Pillow. Used for
+    hover/rest highlights where swapping a CTkFrame's fg_color after
+    creation doesn't reliably keep its corner rounding (customtkinter only
+    redraws the rounded shape on the very first non-transparent color)."""
+    supersample = 4
+    w, h, r = width * supersample, height * supersample, radius * supersample
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=color)
+    img = img.resize((width, height), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
 
 
 def _hex_to_rgba(hex_color: str, alpha: int) -> tuple:
@@ -875,6 +955,7 @@ class App:
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.tray_icon = None
         self.lang_popup = None
+        self.np_popup = None
         self._log_line_n = 0
 
         _set_theme("dark" if self.cfg.get("dark_mode") else "light")
@@ -1000,6 +1081,14 @@ class App:
             fg_color=MD3["on_primary_container"], hover_color=MD3["primary_container"],
         )
         self.theme_button.pack(side="right", padx=(0, 8))
+
+        self.np_settings_button = ctk.CTkButton(
+            self.appbar, text="", command=self.open_np_settings_popup,
+            image=_make_icon("gear", MD3["on_primary"], size=20),
+            width=36, height=36, corner_radius=18,
+            fg_color=MD3["on_primary_container"], hover_color=MD3["primary_container"],
+        )
+        self.np_settings_button.pack(side="right", padx=(0, 8))
 
         body = ctk.CTkScrollableFrame(
             self.root, fg_color=MD3["surface"],
@@ -1149,36 +1238,53 @@ class App:
         list_card = ctk.CTkFrame(popup, fg_color=MD3["surface_container"], corner_radius=16)
         list_card.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
+        row_width = width - 2 * 16 - 2 * 6  # popup width minus list_card padx minus row padx
         for code, label in options:
-            self._add_list_row(list_card, label, code == current_lang, lambda c=code: self._select_language(c, popup))
+            self._add_list_row(list_card, label, code == current_lang, lambda c=code: self._select_language(c, popup), row_width)
 
         popup.after(10, popup.grab_set)
         popup.protocol("WM_DELETE_WINDOW", lambda: self._close_language_popup(popup))
         self.lang_popup = popup
 
-    def _add_list_row(self, parent, text, is_selected, on_select):
-        """One clickable Material-3-style list item (used by the language popup)."""
-        row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=12, height=44)
-        row.pack(fill="x", padx=6, pady=4)
+    def _add_list_row(self, parent, text, is_selected, on_select, row_width=216):
+        """One clickable Material-3-style list item (used by the language popup).
+        Uses Pillow-rendered rounded-rect images for the hover/rest background
+        instead of a CTkFrame color swap, so the corners stay properly rounded."""
+        row_h = 44
+        radius = 12
+        rest_img = _rounded_rect_image(row_width, row_h, radius, MD3["surface_container"])
+        hover_img = _rounded_rect_image(row_width, row_h, radius, MD3["surface_container_high"])
+
+        row = ctk.CTkFrame(parent, fg_color="transparent", width=row_width, height=row_h)
+        row.pack(padx=6, pady=4)
         row.pack_propagate(False)
 
+        bg_lbl = ctk.CTkLabel(row, text="", image=rest_img)
+        bg_lbl.place(x=0, y=0, relwidth=1, relheight=1)
+
         lbl = ctk.CTkLabel(
-            row, text=text, text_color=MD3["on_surface"], anchor="w",
+            row, text=text, text_color=MD3["on_surface"], fg_color="transparent",
             font=ctk.CTkFont(size=13, weight="bold" if is_selected else "normal"),
         )
-        lbl.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        lbl.place(x=14, rely=0.5, anchor="w")
 
-        widgets = [row, lbl]
+        widgets = [row, bg_lbl, lbl]
         if is_selected:
-            check_lbl = ctk.CTkLabel(row, text="", image=_make_icon("check", MD3["primary"], size=16))
-            check_lbl.pack(side="right", padx=(0, 14))
+            check_lbl = ctk.CTkLabel(row, text="", image=_make_icon("check", MD3["primary"], size=16), fg_color="transparent")
+            check_lbl.place(relx=1.0, x=-14, rely=0.5, anchor="e")
             widgets.append(check_lbl)
 
         def on_enter(_e=None):
-            row.configure(fg_color=MD3["surface_container_high"])
+            bg_lbl.configure(image=hover_img)
 
         def on_leave(_e=None):
-            row.configure(fg_color="transparent")
+            bg_lbl.configure(image=rest_img)
+
+        for w in widgets:
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<Button-1>", lambda _e=None: on_select())
+            w.configure(cursor="hand2")
 
         for w in widgets:
             w.bind("<Enter>", on_enter)
@@ -1201,6 +1307,138 @@ class App:
         save_config(self.cfg)
         self.strings = LANG[lang]
         self.retranslate()
+
+    # now-playing video/music detection 
+    def open_np_settings_popup(self):
+        if self.np_popup is not None and self.np_popup.winfo_exists():
+            self.np_popup.lift()
+            self.np_popup.focus_force()
+            return
+
+        s = self.strings
+        width, height = 400, 560
+
+        popup = ctk.CTkToplevel(self.root)
+        popup.title(s["np_popup_title"])
+        popup.configure(fg_color=MD3["surface"])
+        popup.resizable(False, True)
+        popup.transient(self.root)
+        popup.geometry(f"{width}x{height}")
+        self._apply_app_icon(popup)
+
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
+        popup.geometry(f"+{x}+{y}")
+
+        title_lbl = ctk.CTkLabel(
+            popup, text=s["np_popup_title"], text_color=MD3["on_surface"],
+            font=ctk.CTkFont(size=15, weight="bold"), anchor="w",
+        )
+        title_lbl.pack(fill="x", padx=20, pady=(18, 10))
+
+        body = ctk.CTkScrollableFrame(popup, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self._build_np_section(body, s["np_section_video"], "np_video_players")
+        self._build_np_section(body, s["np_section_music"], "np_music_players")
+
+        popup.after(10, popup.grab_set)
+        popup.protocol("WM_DELETE_WINDOW", lambda: self._close_np_settings_popup(popup))
+        self.np_popup = popup
+
+    def _close_np_settings_popup(self, popup):
+        if popup is not None and popup.winfo_exists():
+            popup.grab_release()
+            popup.destroy()
+        self.np_popup = None
+
+    def _build_np_section(self, parent, title, cfg_key):
+        s = self.strings
+        section = ctk.CTkFrame(parent, fg_color="transparent")
+        section.pack(fill="x", pady=(0, 18))
+
+        lbl = self._section_label(section, title)
+        lbl.pack(fill="x", pady=(0, 6))
+
+        list_card = ctk.CTkFrame(section, fg_color=MD3["surface_container"], corner_radius=16)
+        list_card.pack(fill="x")
+
+        rows_frame = ctk.CTkFrame(list_card, fg_color="transparent")
+        rows_frame.pack(fill="x", padx=4, pady=4)
+
+        add_row = ctk.CTkFrame(section, fg_color="transparent")
+        add_row.pack(fill="x", pady=(8, 0))
+        entry_var = tk.StringVar()
+        entry = self._md3_entry(add_row, entry_var, width=240)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        def refresh():
+            for w in rows_frame.winfo_children():
+                w.destroy()
+            for i, item in enumerate(self.cfg.get(cfg_key, [])):
+                self._add_np_row(rows_frame, cfg_key, i, item, refresh)
+
+        def add_entry():
+            name = entry_var.get().strip()
+            if not name:
+                return
+            match = "".join(ch for ch in name.lower() if ch.isalnum())
+            if not match:
+                return
+            self.cfg.setdefault(cfg_key, []).append(
+                {"name": name, "match": match, "enabled": True, "builtin": False}
+            )
+            save_config(self.cfg)
+            entry_var.set("")
+            refresh()
+
+        entry.bind("<Return>", lambda _e: add_entry())
+
+        add_btn = ctk.CTkButton(
+            add_row, text=s["np_add_btn"], command=add_entry,
+            image=_make_icon("plus", MD3["on_primary"], size=14),
+            compound="left", width=90, height=36, corner_radius=18,
+            fg_color=MD3["primary"], hover_color=MD3["on_primary_container"],
+            text_color=MD3["on_primary"], font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        add_btn.pack(side="right")
+
+        refresh()
+        return section
+
+    def _add_np_row(self, parent, cfg_key, idx, item, on_change):
+        row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=12, height=40)
+        row.pack(fill="x", padx=2, pady=2)
+        row.pack_propagate(False)
+
+        var = tk.BooleanVar(value=item.get("enabled", True))
+
+        def toggle():
+            self.cfg[cfg_key][idx]["enabled"] = var.get()
+            save_config(self.cfg)
+
+        cb = ctk.CTkCheckBox(
+            row, text=item.get("name", ""), variable=var, command=toggle,
+            text_color=MD3["on_surface"], font=ctk.CTkFont(size=13),
+            fg_color=MD3["primary"], hover_color=MD3["on_primary_container"],
+        )
+        cb.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        if not item.get("builtin", False):
+            def remove():
+                del self.cfg[cfg_key][idx]
+                save_config(self.cfg)
+                on_change()
+
+            del_btn = ctk.CTkButton(
+                row, text="", command=remove,
+                image=_make_icon("trash", MD3["error"], size=14),
+                width=28, height=28, corner_radius=14,
+                fg_color="transparent", hover_color=MD3["error_container"],
+            )
+            del_btn.pack(side="right", padx=(0, 4))
+
     def toggle_dark_mode(self):
         self.cfg = self._collect_cfg_from_ui()
         self.cfg["dark_mode"] = not self.cfg.get("dark_mode", False)

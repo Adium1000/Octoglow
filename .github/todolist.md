@@ -5,7 +5,7 @@ Welcome to my todo list
 
 ~~2 Fix icoana de luminozitate~~(2.8.26)
 
-3. fix language piker on touch in sender
+~~3. fix language piker on touch in sender~~ FUCIN NEW C# VERSION CUZE OF THAT
 
 ~~4. Fix number font~~ (3.8.26)
 
@@ -35,7 +35,7 @@ Welcome to my todo list
 
 ~~17. Scrolling freeze bugs~~
 
-18. AP scrolling Ip adress
+~~18. AP scrolling Ip adress~~ Why did I added this?
 
 19. AP settings one time show
 
@@ -56,3 +56,4 @@ Welcome to my todo list
 ~~27. Data formatting DD/MM/YYY~~
 
 ~~28.Design Flow in tile manager settings~~
+
