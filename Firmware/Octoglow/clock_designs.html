@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fețe de ceas 8×32</title>
+<style>
+  :root {
+    --bg: #141218;
+    --surf-con: #211f26;
+    --surf-high: #2b2930;
+    --on: #e6e1e5;
+    --on-var: #cac4d0;
+    --outline: #938f99;
+    --outline-var: #49454f;
+    --pri: #d0bcff;
+    --pri-con: #4f378b;
+    --on-pri-con: #eaddff;
+    --grn: #6dd7a1;
+    --grn-con: #003824;
+    --err: #f2b8b5;
+    --err-con: #8c1d18;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--on); }
+  body { font: 15px/1.55 "Google Sans", "Segoe UI", Roboto, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 44px 24px 72px; }
+
+  .eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--pri); margin-bottom: 10px; }
+  h1 { font-size: clamp(24px, 3.2vw, 32px); font-weight: 500; letter-spacing: -.01em; margin: 0 0 10px; }
+  .lede { margin: 0; color: var(--on-var); max-width: 76ch; }
+  code { font-family: var(--mono); font-size: .88em; background: var(--surf-high); color: var(--on-pri-con); padding: 1px 6px; border-radius: 6px; }
+
+  .controls { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; margin: 28px -24px 0; padding: 14px 24px 18px; background: linear-gradient(var(--bg) 78%, rgba(20, 18, 24, 0)); }
+  .ctl { display: flex; align-items: center; gap: 10px; }
+  .lbl { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--outline); }
+  .seg { display: inline-flex; border: 1px solid var(--outline-var); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 13px; color: var(--on-var); background: none; border: 0; padding: 6px 14px; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--outline-var); }
+  .seg button[aria-pressed="true"] { background: var(--pri-con); color: var(--on-pri-con); }
+  .chk { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--on-var); cursor: pointer; user-select: none; }
+  .chk input { accent-color: var(--pri); width: 16px; height: 16px; margin: 0; }
+  .sw { display: inline-flex; gap: 9px; }
+  .sw button { width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: var(--c); box-shadow: 0 0 10px -2px var(--c); cursor: pointer; outline-offset: 3px; }
+  .sw button[aria-pressed="true"] { outline: 2px solid var(--on); }
+  button:focus-visible { outline: 2px solid var(--pri); outline-offset: 2px; }
+  .readout { margin-left: auto; display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 13px; color: var(--on-var); }
+
+  section { margin-top: 34px; }
+  h2 { font-size: 20px; font-weight: 500; margin: 0 0 6px; }
+  section > p { margin: 0 0 18px; color: var(--on-var); max-width: 82ch; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 500px), 1fr)); gap: 18px; }
+
+  .card { background: var(--surf-con); border: 1px solid rgba(147, 143, 153, .16); border-radius: 20px; padding: 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card-hd { display: flex; align-items: center; gap: 10px; }
+  .num { font-family: var(--mono); font-size: 12px; color: var(--outline); }
+  h3 { margin: 0; font-size: 17px; font-weight: 500; flex: 1; }
+  .fit { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--surf-high); color: var(--on-var); white-space: nowrap; }
+  .fit.ok { background: var(--grn-con); color: var(--grn); }
+  .fit.bad { background: var(--err-con); color: var(--err); }
+  canvas.mx { display: block; width: 100%; aspect-ratio: 33.6 / 9.6; border-radius: 12px; }
+  .desc { margin: 0; font-size: 14px; color: var(--on-var); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+  .meta li { font-size: 12px; color: var(--on-var); background: var(--surf-high); border-radius: 8px; padding: 3px 9px; }
+  .meta b { font-weight: 500; color: var(--on); margin-right: 4px; }
+
+  .tiles { display: flex; flex-wrap: wrap; gap: 10px 8px; }
+  .tile { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .tile canvas { display: block; border-radius: 6px; }
+  .tile span { font-family: var(--mono); font-size: 11px; color: var(--outline); }
+  details summary { cursor: pointer; font-size: 13px; color: var(--pri); width: max-content; }
+  .code { position: relative; margin-top: 10px; }
+  pre { margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--on-var); background: #0e0d11; border: 1px solid var(--outline-var); border-radius: 12px; padding: 14px 16px; overflow: auto; max-height: 340px; }
+  .copy { position: absolute; top: 8px; right: 8px; font: inherit; font-size: 12px; color: var(--on-pri-con); background: var(--pri-con); border: 0; border-radius: 999px; padding: 4px 12px; cursor: pointer; }
+  footer { margin-top: 44px; font-size: 13px; color: var(--outline); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Octoglow · MAX7219 · 4 module FC16</div>
+    <h1>Fețe de ceas pentru matricea 8×32</h1>
+    <p class="lede">Douăsprezece variante compacte: oră + ziua săptămânii și oră + dată. Fiecare cadru e desenat din 32 de
+      coloane de câte 8 biți, exact cum le trimite firmware-ul cu <code>mx.setColumn(31 − col, val)</code>, cu fonturile
+      din Octoglow.ino (TIKO 3×7, Mako 4×7 și 5×7) plus două fonturi mici noi, cu codul C la final.</p>
+  </header>
+
+  <div class="controls" role="toolbar" aria-label="Setări previzualizare">
+    <div class="ctl"><span class="lbl">Limbă</span>
+      <div class="seg" data-k="lang"><button type="button" data-v="ro">RO</button><button type="button" data-v="en">EN</button></div></div>
+    <div class="ctl"><span class="lbl">Format</span>
+      <div class="seg" data-k="h12"><button type="button" data-v="0">24h</button><button type="button" data-v="1">12h</button></div></div>
+    <div class="ctl"><span class="lbl">Timp</span>
+      <div class="seg" data-k="demo"><button type="button" data-v="0">Acum</button><button type="button" data-v="1">Demo rapid</button></div></div>
+    <label class="chk"><input type="checkbox" data-k="blink"> „:” clipește</label>
+    <label class="chk"><input type="checkbox" data-k="lz"> Zero în față</label>
+    <div class="ctl"><span class="lbl">LED</span><div class="sw" id="sw"></div></div>
+    <div class="readout"><span class="lbl">Afișat</span><span id="readout"></span></div>
+  </div>
+
+  <section>
+    <h2>Oră + ziua săptămânii</h2>
+    <p>Toate încap fără derulare. Insigna verde e verificată automat pe toate combinațiile: RO/EN, 24h/12h, cu și fără
+      zero în față, fiecare zi a săptămânii. Bara și cursorul încep cu luni.</p>
+    <div class="grid" id="g-day"></div>
+  </section>
+
+  <section>
+    <h2>Oră + dată</h2>
+    <p>Ora și data completă nu încap lizibil una lângă alta: chiar și cu cifre de 3×5, „12:45 11.09” are nevoie de 36 de
+      coloane. De aceea variantele de mai jos arată doar ziua lunii sau alternează.</p>
+    <div class="grid" id="g-date"></div>
+  </section>
+
+  <section>
+    <h2>Fonturi noi</h2>
+    <p>TIKO 3×7, Mako 4×7 și 5×7 există deja în Octoglow.ino. Variantele compacte mai au nevoie de două fonturi mici, în același
+      format: un octet pe coloană, bitul 0 = rândul de sus.</p>
+    <div class="grid" id="fonts"></div>
+  </section>
+
+  <footer>Fișier de referință: build_web.py împachetează doar portal.html și auth.html, deci pagina asta nu ajunge în firmware.</footer>
+</div>
+
+<script>
+'use strict';
+
+/* ---------- Fonts ----------
+   One byte per column, bit 0 = top row: the same encoding as FONT[] and
+   TIKO_FONT in Octoglow.ino, so every frame below is exactly the 32 bytes the
+   firmware would push with mx.setColumn(31 - col, val). */
+
+function fromRows(space, rows) {
+  const g = {};
+  let h = 0;
+  for (const [ch, r] of Object.entries(rows)) {
+    h = r.length;
+    const cols = [];
+    for (let c = 0; c < r[0].length; c++) {
+      let v = 0;
+      for (let y = 0; y < r.length; y++) if (r[y][c] === '#') v |= 1 << y;
+      cols.push(v);
+    }
+    g[ch] = cols;
+  }
+  g[' '] = new Array(space).fill(0);
+  return { h, g };
+}
+
+// Copied from Octoglow.ino: FONT[][5], CHAR_COLON, CHAR_DOT.
+const F57 = { h: 7, g: {
+  '0': [0x3E, 0x51, 0x49, 0x45, 0x3E], '1': [0x00, 0x42, 0x7F, 0x40, 0x00], '2': [0x42, 0x61, 0x51, 0x49, 0x46],
+  '3': [0x21, 0x41, 0x45, 0x4B, 0x31], '4': [0x18, 0x14, 0x12, 0x7F, 0x10], '5': [0x27, 0x45, 0x45, 0x45, 0x39],
+  '6': [0x3C, 0x4A, 0x49, 0x49, 0x30], '7': [0x01, 0x71, 0x09, 0x05, 0x03], '8': [0x36, 0x49, 0x49, 0x49, 0x36],
+  '9': [0x06, 0x49, 0x49, 0x29, 0x1E], ':': [0x36, 0x36], '.': [0x40], ' ': [0, 0, 0],
+} };
+
+// Copied from Octoglow.ino: TIKO_FONT (3x7).
+const TIKO = { h: 7, g: {
+  '0': [0x3E, 0x41, 0x3E], '1': [0x42, 0x7F, 0x40], '2': [0x62, 0x51, 0x4E], '3': [0x41, 0x49, 0x3E],
+  '4': [0x0F, 0x08, 0x7F], '5': [0x4F, 0x49, 0x31], '6': [0x3E, 0x49, 0x30], '7': [0x01, 0x71, 0x0F],
+  '8': [0x3E, 0x49, 0x3E], '9': [0x06, 0x49, 0x3E],
+  'A': [0x7E, 0x09, 0x7E], 'B': [0x7F, 0x49, 0x3E], 'C': [0x3E, 0x41, 0x41], 'D': [0x7F, 0x41, 0x3E],
+  'E': [0x7F, 0x49, 0x41], 'F': [0x7F, 0x09, 0x01], 'G': [0x3E, 0x41, 0x70], 'H': [0x7F, 0x08, 0x7F],
+  'I': [0x00, 0x7F, 0x00], 'J': [0x40, 0x3F, 0x00], 'K': [0x7F, 0x10, 0x6C], 'L': [0x3F, 0x40, 0x40],
+  'M': [0x7F, 0x02, 0x7F], 'N': [0x7F, 0x01, 0x7E], 'O': [0x3E, 0x41, 0x3E], 'P': [0x7F, 0x09, 0x06],
+  'Q': [0x1E, 0x21, 0x5E], 'R': [0x7F, 0x09, 0x76], 'S': [0x4E, 0x49, 0x31], 'T': [0x01, 0x7F, 0x01],
+  'U': [0x3F, 0x40, 0x3F], 'V': [0x3F, 0x60, 0x3F], 'W': [0x3F, 0x40, 0x38, 0x40, 0x3F], 'X': [0x67, 0x18, 0x67],
+  'Y': [0x07, 0x78, 0x07], 'Z': [0x47, 0x4D, 0x71], ':': [0x00, 0x36, 0x00], '.': [0x00, 0x20, 0x00], ' ': [0, 0],
+} };
+
+// Copied from Octoglow.ino: MAKO_FONT (4x7). Only the digits and the colon -
+// the designs that use it write the weekday in Micro.
+const MAKO = { h: 7, g: {
+  '0': [0x3E, 0x41, 0x41, 0x3E], '1': [0x00, 0x42, 0x7F, 0x40], '2': [0x62, 0x51, 0x49, 0x46],
+  '3': [0x41, 0x49, 0x49, 0x36], '4': [0x0C, 0x0A, 0x09, 0x7F], '5': [0x27, 0x45, 0x45, 0x39],
+  '6': [0x3E, 0x49, 0x49, 0x30], '7': [0x01, 0x71, 0x09, 0x07], '8': [0x36, 0x49, 0x49, 0x36],
+  '9': [0x06, 0x49, 0x49, 0x3E], ':': [0x36], '.': [0x40], ' ': [0, 0],
+} };
+
+// New: Micro 3x5. M and W take 5 columns, N takes 4, everything else 3.
+const MICRO = fromRows(2, {
+  '0': ['###', '#.#', '#.#', '#.#', '###'], '1': ['.#.', '##.', '.#.', '.#.', '###'],
+  '2': ['###', '..#', '###', '#..', '###'], '3': ['###', '..#', '.##', '..#', '###'],
+  '4': ['#.#', '#.#', '###', '..#', '..#'], '5': ['###', '#..', '###', '..#', '###'],
+  '6': ['###', '#..', '###', '#.#', '###'], '7': ['###', '..#', '..#', '.#.', '.#.'],
+  '8': ['###', '#.#', '###', '#.#', '###'], '9': ['###', '#.#', '###', '..#', '###'],
+  'A': ['.#.', '#.#', '###', '#.#', '#.#'], 'B': ['##.', '#.#', '##.', '#.#', '##.'],
+  'C': ['.##', '#..', '#..', '#..', '.##'], 'D': ['##.', '#.#', '#.#', '#.#', '##.'],
+  'E': ['###', '#..', '##.', '#..', '###'], 'F': ['###', '#..', '##.', '#..', '#..'],
+  'G': ['.##', '#..', '#.#', '#.#', '.##'], 'H': ['#.#', '#.#', '###', '#.#', '#.#'],
+  'I': ['###', '.#.', '.#.', '.#.', '###'], 'J': ['..#', '..#', '..#', '#.#', '.#.'],
+  'K': ['#.#', '#.#', '##.', '#.#', '#.#'], 'L': ['#..', '#..', '#..', '#..', '###'],
+  'M': ['#...#', '##.##', '#.#.#', '#...#', '#...#'], 'N': ['#..#', '##.#', '#.##', '#..#', '#..#'],
+  'O': ['.#.', '#.#', '#.#', '#.#', '.#.'], 'P': ['##.', '#.#', '##.', '#..', '#..'],
+  'Q': ['.#.', '#.#', '#.#', '##.', '.##'], 'R': ['##.', '#.#', '##.', '#.#', '#.#'],
+  'S': ['.##', '#..', '.#.', '..#', '##.'], 'T': ['###', '.#.', '.#.', '.#.', '.#.'],
+  'U': ['#.#', '#.#', '#.#', '#.#', '###'], 'V': ['#.#', '#.#', '#.#', '#.#', '.#.'],
+  'W': ['#...#', '#...#', '#.#.#', '##.##', '#...#'], 'X': ['#.#', '#.#', '.#.', '#.#', '#.#'],
+  'Y': ['#.#', '#.#', '.#.', '.#.', '.#.'], 'Z': ['###', '..#', '.#.', '#..', '###'],
+  ':': ['.', '#', '.', '#', '.'], '.': ['.', '.', '.', '.', '#'],
+});
+
+// New: Mid 4x6 clock digits.
+const MID = fromRows(2, {
+  '0': ['.##.', '#..#', '#..#', '#..#', '#..#', '.##.'], '1': ['..#.', '.##.', '..#.', '..#.', '..#.', '.###'],
+  '2': ['.##.', '#..#', '...#', '..#.', '.#..', '####'], '3': ['###.', '...#', '.##.', '...#', '...#', '###.'],
+  '4': ['#..#', '#..#', '#..#', '####', '...#', '...#'], '5': ['####', '#...', '###.', '...#', '...#', '###.'],
+  '6': ['.##.', '#...', '###.', '#..#', '#..#', '.##.'], '7': ['####', '...#', '..#.', '.#..', '.#..', '.#..'],
+  '8': ['.##.', '#..#', '.##.', '#..#', '#..#', '.##.'], '9': ['.##.', '#..#', '#..#', '.###', '...#', '.##.'],
+  ':': ['.', '#', '.', '.', '#', '.'],
+});
+
+// Calendar page header: rings on row 0, bar on row 1.
+const CAL_HEADER = [0x02, 0x02, 0x03, 0x02, 0x02, 0x02, 0x03, 0x02, 0x02];
+
+// The panel's outline, clockwise from the top-left corner: 76 pixels, which
+// is the lap the minute dot below walks through in 60 seconds.
+const RING = (() => {
+  const p = [];
+  for (let x = 0; x < 32; x++) p.push([x, 0]);
+  for (let y = 1; y < 8; y++) p.push([31, y]);
+  for (let x = 30; x >= 0; x--) p.push([x, 7]);
+  for (let y = 6; y >= 1; y--) p.push([0, y]);
+  return p;
+})();
+
+// Same names as WEEKDAY_NAMES_RO / _EN in the firmware, upper-cased for the pixel fonts.
+const DAY3 = { ro: ['DUM', 'LUN', 'MAR', 'MIE', 'JOI', 'VIN', 'SAM'], en: ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'] };
+const DAY2 = { ro: ['DU', 'LU', 'MA', 'MI', 'JO', 'VI', 'SA'], en: ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] };
+const MON3 = {
+  ro: ['IAN', 'FEB', 'MAR', 'APR', 'MAI', 'IUN', 'IUL', 'AUG', 'SEP', 'OCT', 'NOI', 'DEC'],
+  en: ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'],
+};
+
+/* ---------- Drawing into a 32-byte frame ---------- */
+
+let OVF = false;   // set whenever something lands outside the 32x8 panel (read by the fit check)
+
+// Digits keep their full width so the time never jitters; everything else is
+// trimmed to its lit columns (TIKO's I and : are 3 wide with blank sides).
+function glyph(font, ch) {
+  const g = font.g[ch] || font.g[ch.toUpperCase()];
+  if (!g) return [];
+  if (ch >= '0' && ch <= '9') return g;
+  let a = 0, z = g.length;
+  while (a < z && !g[a]) a++;
+  while (z > a && !g[z - 1]) z--;
+  return a === z ? g : g.slice(a, z);
+}
+
+function blit(b, x, y, cols, clear) {
+  for (let i = 0; i < cols.length; i++) {
+    const v = cols[i] << y, c = x + i;
+    if (!v) continue;
+    if (c < 0 || c > 31 || v > 0xFF) OVF = true;
+    if (c < 0 || c > 31) continue;
+    if (clear) b[c] &= ~v; else b[c] |= v;
+  }
+}
+function px(b, x, y) {
+  if (x < 0 || x > 31 || y < 0 || y > 7) { OVF = true; return; }
+  b[x] |= 1 << y;
+}
+function unpx(b, x, y) { if (x >= 0 && x < 32) b[x] &= ~(1 << y); }
+function fill(b, x0, y0, x1, y1) { for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) px(b, x, y); }
+
+function textW(font, s) {
+  let w = -1;
+  for (const ch of s) w += glyph(font, ch).length + 1;
+  return Math.max(w, 0);
+}
+// Returns the first column after the text.
+function text(b, x, y, s, font, clear) {
+  let first = true;
+  for (const ch of s) {
+    if (!first) x++;
+    const g = glyph(font, ch);
+    blit(b, x, y, g, clear);
+    x += g.length;
+    first = false;
+  }
+  return x;
+}
+
+const pad2 = n => String(n).padStart(2, '0');
+function hm(T, o) {
+  let h = T.h;
+  if (o.h12) h = h % 12 || 12;
+  return [o.lz || h > 9 ? pad2(h) : String(h), pad2(T.m)];
+}
+function timeW(font, T, o) {
+  const [H, M] = hm(T, o);
+  return textW(font, H) + 1 + glyph(font, ':').length + 1 + textW(font, M);
+}
+// Colon blinks on odd seconds, like drawHour().
+function time(b, x, y, font, T, o) {
+  const [H, M] = hm(T, o), colon = glyph(font, ':');
+  x = text(b, x, y, H, font) + 1;
+  if (!o.blink || T.s % 2 === 0) blit(b, x, y, colon);
+  text(b, x + colon.length + 1, y, M, font);
+}
+
+// Seven 3-column slots, Monday first: today is a full dash, the other days a dot.
+function weekBar(b, x, y, wd) {
+  const today = (wd + 6) % 7;
+  for (let i = 0; i < 7; i++) {
+    if (i === today) fill(b, x + 3 * i, y, x + 3 * i + 2, y);
+    else px(b, x + 3 * i + 1, y);
+  }
+}
+
+// 9x8 calendar page in columns 0..8 with the day of month under the header.
+function calendar(b, md) {
+  blit(b, 0, 0, CAL_HEADER);
+  const d = String(md);
+  text(b, 1 + Math.floor((7 - textW(MICRO, d)) / 2), 3, d, MICRO);
+}
+
+const ease = t => t < .5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t);
+
+// Holds each state for its duration, then slides the next one up from below
+// inside columns x0..x1. With o.state set it just draws that state (fit check).
+function rotate(b, o, now, durs, slideMs, put, x0, x1) {
+  if (o.state != null) { put(b, o.state); return; }
+  const total = durs.reduce((a, c) => a + c, 0);
+  let t = now % total, i = 0;
+  while (t >= durs[i]) t -= durs[i++];
+  const left = durs[i] - t;
+  if (left > slideMs) { put(b, i); return; }
+  const off = Math.round(ease(1 - left / slideMs) * 8);
+  const A = new Uint8Array(32), B = new Uint8Array(32);
+  put(A, i);
+  put(B, (i + 1) % durs.length);
+  for (let c = x0; c <= x1; c++) b[c] |= (A[c] >> off) | (B[c] << (8 - off));
+}
+
+/* ---------- The designs ---------- */
+
+const DESIGNS = [
+  {
+    group: 'day', name: 'Tiko în linie',
+    desc: 'Ora și ziua pe același rând, ambele cu fontul Tiko pe 7 rânduri — cea mai lizibilă de la distanță. Singura diferență față de ceasul de acum: „:” ocupă o coloană în loc de trei, altfel „12:45 WED” n-ar încăpea.',
+    meta: ['<b>Font</b>TIKO 3×7 (există)', '<b>Lățime</b>oră 17 · pauză 2 · zi ≤ 13'],
+    draw(b, T, o) {
+      const day = DAY3[o.lang][T.wd], tw = timeW(TIKO, T, o);
+      const x = Math.floor((32 - (tw + 2 + textW(TIKO, day))) / 2);
+      time(b, x, 0, TIKO, T, o);
+      text(b, x + tw + 2, 0, day, TIKO);
+    },
+  },
+  {
+    group: 'day', name: 'Bara zilelor',
+    desc: 'Cifre de 4×6 pentru oră, iar pe ultimul rând șapte segmente, de luni până duminică. Ziua de azi e liniuța plină, celelalte sunt puncte.',
+    meta: ['<b>Font</b>Mediu 4×6 (nou)', '<b>Coloane</b>oră 5–25 · rândul 7 = L M M J V S D'],
+    draw(b, T, o) {
+      time(b, Math.floor((32 - timeW(MID, T, o)) / 2), 0, MID, T, o);
+      weekBar(b, 5, 7, T.wd);
+    },
+  },
+  {
+    group: 'day', name: 'Zi mică + secunde',
+    desc: 'Ora mare în stânga, ziua scrisă mic în dreapta sus și, sub ea, o bară care se umple pe parcursul minutului.',
+    meta: ['<b>Font</b>TIKO 3×7 + Micro 3×5 (nou)', '<b>Coloane</b>oră 0–16 · zi și secunde 19–31'],
+    draw(b, T, o) {
+      time(b, 17 - timeW(TIKO, T, o), 0, TIKO, T, o);
+      // Day centred in columns 19..31; only "MON" (14 wide) borrows column 18.
+      const d = DAY3[o.lang][T.wd];
+      text(b, Math.max(18, 19 + Math.floor((13 - textW(MICRO, d)) / 2)), 0, d, MICRO);
+      fill(b, 19, 6, 19 + Math.floor(T.s * 13 / 60), 6);
+    },
+  },
+  {
+    group: 'day', name: 'Ceas mare + cursor',
+    desc: 'Ceasul cu cifrele 5×7 de acum, mutat cu două coloane spre stânga, plus un cursor pe marginea dreaptă: sus e luni, jos duminică. Nu scrie ziua, dar după o zi-două îl citești dintr-o privire.',
+    meta: ['<b>Font</b>5×7 (există)', '<b>Coloane</b>oră 1–26 · cursor 29–31'],
+    draw(b, T, o) {
+      time(b, Math.floor((28 - timeW(F57, T, o)) / 2), 0, F57, T, o);
+      for (let y = 0; y < 7; y++) px(b, 31, y);
+      const today = (T.wd + 6) % 7;
+      px(b, 29, today);
+      px(b, 30, today);
+    },
+  },
+  {
+    group: 'day', name: 'Etichetă inversată',
+    desc: 'Ziua pe două litere, decupată dintr-un bloc aprins, lângă ora Tiko. Arată ca o etichetă și nu se confundă cu cifrele.',
+    meta: ['<b>Font</b>Micro 3×5 în negativ + TIKO 3×7', '<b>Lățime</b>etichetă 11 · pauză 2 · oră 17'],
+    draw(b, T, o) {
+      const x = Math.floor((32 - (11 + 2 + timeW(TIKO, T, o))) / 2);
+      fill(b, x, 0, x + 10, 6);
+      unpx(b, x, 0); unpx(b, x + 10, 0); unpx(b, x, 6); unpx(b, x + 10, 6);
+      const d = DAY2[o.lang][T.wd];
+      text(b, x + Math.floor((11 - textW(MICRO, d)) / 2), 1, d, MICRO, true);
+      time(b, x + 13, 0, TIKO, T, o);
+    },
+  },
+  {
+    group: 'day', name: 'Ocol de minut',
+    desc: 'Ora și ziua pe două litere, cu colțurile aprinse ca un cadru și un punct care dă ocol panoului o dată pe minut. Conturul are 76 de puncte, așa că punctul se mută aproape la fiecare secundă, iar restul ecranului rămâne curat.',
+    meta: ['<b>Font</b>Micro 3×5 (nou)', '<b>Ocol</b>76 de puncte pe minut', '<b>Interior</b>coloanele 1–30'],
+    draw(b, T, o) {
+      // The corners mark the panel; the dot laps the outline once a minute.
+      px(b, 0, 0); px(b, 31, 0); px(b, 0, 7); px(b, 31, 7);
+      const pos = Math.floor(T.s * RING.length / 60);
+      for (let i = 0; i < 3; i++) {
+        const q = RING[(pos - i + RING.length) % RING.length];
+        px(b, q[0], q[1]);
+      }
+      const d = DAY2[o.lang][T.wd], tw = timeW(MICRO, T, o);
+      const x = 1 + Math.floor((30 - (tw + 2 + textW(MICRO, d))) / 2);
+      time(b, x, 1, MICRO, T, o);
+      text(b, x + tw + 2, 1, d, MICRO);
+    },
+  },
+  {
+    group: 'day', name: 'Mako + zi',
+    desc: 'Cifrele Mako de 4×7, fontul din firmware, cu ziua pe două litere lângă ele. La mijloc între Tiko, care e mic, și 5×7, care nu lasă loc de zi.',
+    meta: ['<b>Font</b>Mako 4×7 (există) + Micro 3×5', '<b>Lățime</b>oră 21 · pauză 2 · zi 7–9'],
+    draw(b, T, o) {
+      const d = DAY2[o.lang][T.wd], tw = timeW(MAKO, T, o);
+      const x = Math.floor((32 - (tw + 2 + textW(MICRO, d))) / 2);
+      time(b, x, 0, MAKO, T, o);
+      text(b, x + tw + 2, 1, d, MICRO);
+    },
+  },
+  {
+    group: 'date', name: 'Pagină de calendar', mday: true,
+    desc: 'O filă de calendar cu ziua lunii, ora în 4×6 și bara zilelor dedesubt — data, ora și ziua săptămânii într-un singur cadru, fără animație.',
+    meta: ['<b>Font</b>Micro 3×5 + Mediu 4×6 (noi)', '<b>Coloane</b>calendar 0–8 · oră și bară 11–31'],
+    draw(b, T, o) {
+      calendar(b, T.md);
+      time(b, 11 + Math.floor((21 - timeW(MID, T, o)) / 2), 0, MID, T, o);
+      weekBar(b, 11, 7, T.wd);
+    },
+  },
+  {
+    group: 'date', name: 'Etichetă rotativă', states: 3, months: true, mday: true,
+    desc: 'Ora stă pe loc; în dreapta se rotesc ziua săptămânii, ziua lunii și luna, fiecare urcând peste cea dinainte. Într-un ciclu citești „LUN · 11 · SEP”.',
+    meta: ['<b>Font</b>TIKO 3×7 (există)', '<b>Coloane</b>oră 0–16 · etichetă 19–31', '<b>Ciclu</b>2,6 s + 2 s + 2 s'],
+    draw(b, T, o, now) {
+      time(b, 17 - timeW(TIKO, T, o), 0, TIKO, T, o);
+      rotate(b, o, now, [2600, 2000, 2000], 300, (buf, k) => {
+        const s = k === 0 ? DAY3[o.lang][T.wd] : k === 1 ? String(T.md) : MON3[o.lang][T.mon];
+        text(buf, 19 + Math.floor((13 - textW(TIKO, s)) / 2), 0, s, TIKO);
+      }, 19, 31);
+    },
+  },
+  {
+    group: 'date', name: 'Alternare pe tot ecranul', states: 2, mday: true,
+    desc: 'Ora 6 secunde, apoi data 3 secunde, cu glisare pe verticală. Cifrele rămân mari (5×7), dar data nu e vizibilă tot timpul.',
+    meta: ['<b>Font</b>5×7 (există)', '<b>Ciclu</b>oră 6 s → dată 3 s'],
+    draw(b, T, o, now) {
+      rotate(b, o, now, [6000, 3000], 380, (buf, k) => {
+        if (k === 0) {
+          time(buf, Math.floor((32 - timeW(F57, T, o)) / 2), 0, F57, T, o);
+        } else {
+          const s = pad2(T.md) + '.' + pad2(T.mon + 1);
+          text(buf, Math.floor((32 - textW(F57, s)) / 2), 0, s, F57);
+        }
+      }, 0, 31);
+    },
+  },
+  {
+    group: 'date', name: 'Luna pe ultimul rând', months: true, mday: true,
+    desc: 'Ora în cifre de 4×6, iar pe ultimul rând toată luna: un punct pe zi, aprinse până azi. Duminicile rămân stinse, așa că se văd săptămânile și numeri ușor în ce zi ești.',
+    meta: ['<b>Font</b>Mediu 4×6 (nou)', '<b>Rândul 7</b>o zi = un punct · duminicile stinse'],
+    draw(b, T, o) {
+      time(b, Math.floor((32 - timeW(MID, T, o)) / 2), 0, MID, T, o);
+      const days = new Date(T.year, T.mon + 1, 0).getDate();
+      const x0 = Math.floor((32 - days) / 2);
+      for (let i = 1; i <= T.md; i++) {
+        // Day i's weekday, counted back from today; Sunday (0) stays dark.
+        if ((((T.wd - (T.md - i)) % 7) + 7) % 7 === 0) continue;
+        px(b, x0 + i - 1, 7);
+      }
+    },
+  },
+  {
+    group: 'date', name: 'Panou complet', mday: true,
+    desc: 'Tot ce încape într-un cadru, mărunt: ora în stânga, ziua lunii în dreapta, bara zilelor dedesubt. Nimic nu se mișcă și nimic nu se derulează.',
+    meta: ['<b>Font</b>Micro 3×5 (nou)', '<b>Coloane</b>oră 0–16 · dată la dreapta · bară 5–25'],
+    draw(b, T, o) {
+      time(b, 0, 0, MICRO, T, o);
+      const d = String(T.md) + '.';
+      text(b, 32 - textW(MICRO, d), 0, d, MICRO);
+      weekBar(b, 5, 7, T.wd);
+    },
+  },
+];
+
+// Renders every design across languages, formats, weekdays and awkward times,
+// and reports whether anything ever left the panel plus the widest frame seen.
+function fitCheck(d) {
+  const b = new Uint8Array(32);
+  const hours = [[0, 0], [1, 11], [9, 5], [10, 10], [12, 59], [18, 48], [20, 8], [23, 58]];
+  const mons = d.months ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] : [8];
+  const mdays = d.mday ? [1, 28] : [11];
+  let bad = false, maxW = 0;
+  for (const lang of ['ro', 'en']) for (const h12 of [false, true]) for (const lz of [false, true])
+    for (let wd = 0; wd < 7; wd++) for (const mon of mons) for (const md of mdays) for (const [h, m] of hours)
+      for (let st = 0; st < (d.states || 1); st++) {
+        b.fill(0);
+        OVF = false;
+        d.draw(b, { h, m, s: 59, wd, md, mon, year: 2026 }, { lang, h12, lz, blink: false, state: st }, 0);
+        if (OVF) bad = true;
+        let lo = -1, hi = -1;
+        for (let c = 0; c < 32; c++) if (b[c]) { if (lo < 0) lo = c; hi = c; }
+        if (lo >= 0) maxW = Math.max(maxW, hi - lo + 1);
+      }
+  return { bad, maxW };
+}
+
+/* ---------- LED painter ---------- */
+
+const COLORS = {
+  red:   { name: 'Roșu',       on: [255, 52, 36],   core: [255, 214, 200], off: '#2a1512' },
+  green: { name: 'Verde',      on: [40, 255, 110],  core: [210, 255, 225], off: '#0f2618' },
+  blue:  { name: 'Albastru',   on: [60, 145, 255],  core: [215, 232, 255], off: '#121c30' },
+  white: { name: 'Alb',        on: [226, 232, 255], core: [255, 255, 255], off: '#202228' },
+  amber: { name: 'Chihlimbar', on: [255, 170, 30],  core: [255, 235, 190], off: '#2b2011' },
+};
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const M = 0.8;   // frame margin around the LEDs, in LED pitches
+
+const spriteCache = new Map();
+function sprites(p) {
+  const key = S.color + '|' + p.toFixed(2);
+  let s = spriteCache.get(key);
+  if (s) return s;
+  if (spriteCache.size > 24) spriteCache.clear();
+  const c = COLORS[S.color];
+
+  const gs = Math.ceil(p * 2.6), glow = document.createElement('canvas');
+  glow.width = glow.height = gs;
+  let g = glow.getContext('2d'), m = gs / 2;
+  let gr = g.createRadialGradient(m, m, 0, m, m, m);
+  gr.addColorStop(0, rgba(c.on, .5));
+  gr.addColorStop(.25, rgba(c.on, .26));
+  gr.addColorStop(.55, rgba(c.on, .07));
+  gr.addColorStop(1, rgba(c.on, 0));
+  g.fillStyle = gr;
+  g.fillRect(0, 0, gs, gs);
+
+  const bs = Math.ceil(p) + 2, body = document.createElement('canvas');
+  body.width = body.height = bs;
+  g = body.getContext('2d');
+  m = bs / 2;
+  const r = p * .37;
+  gr = g.createRadialGradient(m - r * .25, m - r * .25, 0, m, m, r);
+  gr.addColorStop(0, rgba(c.core, 1));
+  gr.addColorStop(.5, rgba(c.on, 1));
+  gr.addColorStop(1, rgba(c.on.map(v => v * .82), 1));
+  g.fillStyle = gr;
+  g.beginPath();
+  g.arc(m, m, r, 0, Math.PI * 2);
+  g.fill();
+
+  s = { glow, gs, body, bs };
+  spriteCache.set(key, s);
+  return s;
+}
+
+function paintLeds(ctx, W, H, cols, w, h, modules) {
+  const p = W / (w + 2 * M), c = COLORS[S.color], sp = sprites(p);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#08070a';
+  ctx.fillRect(0, 0, W, H);
+  if (modules) {
+    ctx.fillStyle = '#121015';
+    for (let k = 0; k < w / 8; k++) {
+      const x = (M + 8 * k + .06) * p, y = (M + .06) * p, s = 7.88 * p;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, y, s, s, .25 * p); else ctx.rect(x, y, s, s);
+      ctx.fill();
+    }
+  }
+  const r = p * .37, on = [];
+  ctx.fillStyle = c.off;
+  ctx.beginPath();
+  for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) {
+    const cx = (M + x + .5) * p, cy = (M + y + .5) * p;
+    if ((cols[x] >> y) & 1) on.push(cx, cy);
+    else { ctx.moveTo(cx + r, cy); ctx.arc(cx, cy, r, 0, Math.PI * 2); }
+  }
+  ctx.fill();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < on.length; i += 2) ctx.drawImage(sp.glow, on[i] - sp.gs / 2, on[i + 1] - sp.gs / 2);
+  ctx.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < on.length; i += 2) ctx.drawImage(sp.body, on[i] - sp.bs / 2, on[i + 1] - sp.bs / 2);
+}
+
+/* ---------- State ---------- */
+
+const S = { lang: 'ro', h12: false, demo: false, blink: true, lz: false, color: 'red' };
+const KEY = 'octoglow-clock-designs';
+try {
+  const saved = JSON.parse(localStorage.getItem(KEY) || '{}');
+  for (const k of ['lang', 'h12', 'blink', 'lz', 'color']) if (k in saved) S[k] = saved[k];
+} catch (e) { /* storage blocked: defaults are fine */ }
+if (!COLORS[S.color]) S.color = 'red';
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify({ lang: S.lang, h12: S.h12, blink: S.blink, lz: S.lz, color: S.color })); }
+  catch (e) { /* ignore */ }
+}
+
+// "Demo rapid" jumps one day and 67 minutes every 1.5 s so every weekday and
+// both digit widths come around; the seconds stay real so the colon still blinks.
+let demoStart = 0;
+function nowT() {
+  let d = new Date();
+  if (S.demo) d = new Date(d.getTime() + Math.floor((performance.now() - demoStart) / 1500) * (86400000 + 67 * 60000));
+  return { h: d.getHours(), m: d.getMinutes(), s: d.getSeconds(), wd: d.getDay(), md: d.getDate(), mon: d.getMonth(), year: d.getFullYear() };
+}
+
+/* ---------- Build the page ---------- */
+
+const cards = DESIGNS.map((d, i) => {
+  const el = document.createElement('article');
+  el.className = 'card';
+  el.innerHTML = `
+    <div class="card-hd"><span class="num">${pad2(i + 1)}</span><h3>${d.name}</h3><span class="fit">verific…</span></div>
+    <canvas class="mx" role="img" aria-label="Previzualizare: ${d.name}"></canvas>
+    <p class="desc">${d.desc}</p>
+    <ul class="meta">${d.meta.map(m => `<li>${m}</li>`).join('')}</ul>`;
+  document.getElementById(d.group === 'day' ? 'g-day' : 'g-date').appendChild(el);
+  const cv = el.querySelector('canvas');
+  return { d, cv, ctx: cv.getContext('2d'), buf: new Uint8Array(32), last: new Uint8Array(32), dirty: true, fitEl: el.querySelector('.fit') };
+});
+
+const resizer = new ResizeObserver(entries => {
+  const dpr = window.devicePixelRatio || 1;
+  for (const e of entries) {
+    const c = cards.find(x => x.cv === e.target);
+    c.cv.width = Math.round(c.cv.clientWidth * dpr);
+    c.cv.height = Math.round(c.cv.clientHeight * dpr);
+    c.dirty = true;
+  }
+});
+cards.forEach(c => resizer.observe(c.cv));
+
+// Glyph sheets for the new fonts.
+const tiles = [];
+function tile(parent, cols, h, label) {
+  const P = 9, dpr = window.devicePixelRatio || 1;
+  const cw = (cols.length + 2 * M) * P, chh = (h + 2 * M) * P;
+  const wrap = document.createElement('div');
+  wrap.className = 'tile';
+  const cv = document.createElement('canvas');
+  cv.style.width = cw + 'px';
+  cv.style.height = chh + 'px';
+  cv.width = Math.round(cw * dpr);
+  cv.height = Math.round(chh * dpr);
+  const lab = document.createElement('span');
+  lab.textContent = label;
+  wrap.append(cv, lab);
+  parent.append(wrap);
+  tiles.push({ cv, ctx: cv.getContext('2d'), cols, h });
+}
+function paintTiles() { for (const t of tiles) paintLeds(t.ctx, t.cv.width, t.cv.height, t.cols, t.cols.length, t.h, false); }
+
+const hex = v => '0x' + v.toString(16).toUpperCase().padStart(2, '0');
+function fontCard(title, note, fill, code) {
+  const el = document.createElement('article');
+  el.className = 'card';
+  el.innerHTML = `
+    <div class="card-hd"><h3>${title}</h3></div>
+    <p class="desc">${note}</p>
+    <div class="tiles"></div>
+    <details><summary>Cod C pentru Octoglow.ino</summary>
+      <div class="code"><button class="copy" type="button">Copiază</button><pre></pre></div></details>`;
+  fill(el.querySelector('.tiles'));
+  const pre = el.querySelector('pre'), btn = el.querySelector('.copy');
+  pre.textContent = code;
+  btn.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(code); }
+    catch (e) {
+      const r = document.createRange(), sel = getSelection();
+      r.selectNodeContents(pre); sel.removeAllRanges(); sel.addRange(r);
+      document.execCommand('copy'); sel.removeAllRanges();
+    }
+    btn.textContent = 'Copiat';
+    setTimeout(() => { btn.textContent = 'Copiază'; }, 1400);
+  });
+  document.getElementById('fonts').appendChild(el);
+}
+
+const MICRO_ORDER = [...'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:.'];
+fontCard('Micro 3×5',
+  'Cifre, A–Z, „:” și „.”. M și W au 5 coloane, N are 4, restul 3 — încap toate în structura TikoGlyph existentă.',
+  box => MICRO_ORDER.forEach(ch => tile(box, MICRO.g[ch], MICRO.h, ch)),
+  [
+    '// Micro 3x5 font for the compact clock faces. Same layout as TIKO_FONT:',
+    '// one byte per column, bit 0 = top row. M and W are 5 columns, N is 4,',
+    '// so every glyph still fits TIKO_MAX_COLS and the TikoGlyph struct.',
+    'const TikoGlyph MICRO_FONT[] = {',
+    ...MICRO_ORDER.map(ch => `  { '${ch}', ${MICRO.g[ch].length}, { ${MICRO.g[ch].map(hex).join(', ')} } },`),
+    '};',
+    'const uint8_t MICRO_FONT_COUNT = sizeof(MICRO_FONT) / sizeof(MICRO_FONT[0]);',
+  ].join('\n'));
+
+const calSample = new Uint8Array(32);
+calendar(calSample, 11);
+fontCard('Mediu 4×6 + calendar',
+  'Cifrele de oră pentru „Bara zilelor” și „Pagină de calendar”, plus antetul filei de calendar (inele pe rândul 0, bară pe rândul 1).',
+  box => {
+    [...'0123456789:'].forEach(ch => tile(box, MID.g[ch], MID.h, ch));
+    tile(box, [...calSample.slice(0, 9)], 8, 'calendar');
+  },
+  [
+    '// Mid 4x6 clock digits: one byte per column, bit 0 = top row (same as FONT[]).',
+    'const uint8_t MID_DIGITS[10][4] = {',
+    ...[...'0123456789'].map(ch => `  { ${MID.g[ch].map(hex).join(', ')} },  // ${ch}`),
+    '};',
+    `const uint8_t MID_COLON[1] = { ${hex(MID.g[':'][0])} };`,
+    '',
+    '// Calendar page header above the day of month: rings on row 0, bar on row 1.',
+    `const uint8_t CAL_HEADER[9] = { ${CAL_HEADER.map(hex).join(', ')} };`,
+  ].join('\n'));
+
+/* ---------- Controls ---------- */
+
+const sw = document.getElementById('sw');
+for (const [k, c] of Object.entries(COLORS)) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.dataset.v = k;
+  btn.title = c.name;
+  btn.setAttribute('aria-label', 'LED ' + c.name);
+  btn.style.setProperty('--c', `rgb(${c.on})`);
+  sw.append(btn);
+}
+
+function syncUI() {
+  document.querySelectorAll('.seg').forEach(seg => {
+    const k = seg.dataset.k;
+    seg.querySelectorAll('button').forEach(btn => {
+      const v = k === 'lang' ? btn.dataset.v : btn.dataset.v === '1';
+      btn.setAttribute('aria-pressed', String(S[k] === v));
+    });
+  });
+  document.querySelectorAll('.chk input').forEach(i => { i.checked = S[i.dataset.k]; });
+  sw.querySelectorAll('button').forEach(btn => btn.setAttribute('aria-pressed', String(btn.dataset.v === S.color)));
+}
+
+document.querySelectorAll('.seg').forEach(seg => seg.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const k = seg.dataset.k;
+  S[k] = k === 'lang' ? btn.dataset.v : btn.dataset.v === '1';
+  if (k === 'demo') demoStart = performance.now();
+  syncUI();
+  save();
+}));
+document.querySelectorAll('.chk input').forEach(i => i.addEventListener('change', () => { S[i.dataset.k] = i.checked; save(); }));
+sw.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  S.color = btn.dataset.v;
+  spriteCache.clear();
+  cards.forEach(c => { c.dirty = true; });
+  paintTiles();
+  syncUI();
+  save();
+});
+syncUI();
+paintTiles();
+
+/* ---------- Loop ---------- */
+
+const WEEKDAY_LONG = {
+  ro: ['duminică', 'luni', 'marți', 'miercuri', 'joi', 'vineri', 'sâmbătă'],
+  en: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+};
+const readEl = document.getElementById('readout');
+let lastRead = '';
+
+function tick() {
+  try {
+    const T = nowT(), now = performance.now();
+    const o = { lang: S.lang, h12: S.h12, lz: S.lz, blink: S.blink, state: null };
+    for (const c of cards) {
+      // A canvas the layout has not sized yet has no pixels to paint into, and
+      // drawing there throws. Skip it and come back when the observer sizes it.
+      if (!c.cv.width || !c.cv.height) { c.dirty = true; continue; }
+      c.buf.fill(0);
+      c.d.draw(c.buf, T, o, now);
+      let changed = c.dirty;
+      for (let i = 0; !changed && i < 32; i++) changed = c.buf[i] !== c.last[i];
+      if (changed) {
+        paintLeds(c.ctx, c.cv.width, c.cv.height, c.buf, 32, 8, true);
+        c.last.set(c.buf);
+        c.dirty = false;
+      }
+    }
+    const r = `${WEEKDAY_LONG[S.lang][T.wd]} ${pad2(T.md)}.${pad2(T.mon + 1)} · ${pad2(T.h)}:${pad2(T.m)}:${pad2(T.s)}`;
+    if (r !== lastRead) { readEl.textContent = r; lastRead = r; }
+  } finally {
+    // Scheduling here rather than at the end of the body: one bad frame used to
+    // stop the clock on every card for good.
+    requestAnimationFrame(tick);
+  }
+}
+requestAnimationFrame(tick);
+
+// Fit checks run one card per task so the first paint is not held up.
+let fitIdx = 0;
+function nextFit() {
+  const c = cards[fitIdx++];
+  if (!c) return;
+  const r = fitCheck(c.d);
+  c.fitEl.textContent = r.bad ? '✗ iese din ecran' : `✓ încape · max ${r.maxW}/32`;
+  c.fitEl.className = 'fit ' + (r.bad ? 'bad' : 'ok');
+  c.fitEl.title = 'Verificat pe RO/EN, 24h/12h, cu și fără zero în față, toate zilele săptămânii' + (c.d.months ? ' și toate lunile' : '');
+  setTimeout(nextFit, 0);
+}
+setTimeout(nextFit, 60);
+</script>
+</body>
+</html>

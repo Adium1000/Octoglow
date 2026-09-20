@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" role="img" aria-labelledby="title desc">
+  <title id="title">Octoglow Macro</title>
+  <desc id="desc">Polished three-quarter view of the Octoglow seven-key macro pad with rotary knob on a transparent canvas.</desc>
+  <defs>
+    <linearGradient id="macro-body-top" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#2c2d35"/>
+      <stop offset="0.5" stop-color="#171820"/>
+      <stop offset="1" stop-color="#0d0e14"/>
+    </linearGradient>
+    <linearGradient id="macro-body-edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#15161d"/>
+      <stop offset="1" stop-color="#05060a"/>
+    </linearGradient>
+    <linearGradient id="macro-key-top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#373842"/>
+      <stop offset="0.45" stop-color="#202129"/>
+      <stop offset="1" stop-color="#111219"/>
+    </linearGradient>
+    <linearGradient id="macro-key-edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171820"/>
+      <stop offset="1" stop-color="#08090d"/>
+    </linearGradient>
+    <linearGradient id="macro-knob" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#454750"/>
+      <stop offset="0.4" stop-color="#24252d"/>
+      <stop offset="1" stop-color="#0e0f15"/>
+    </linearGradient>
+    <linearGradient id="macro-knob-side" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0b0c11"/>
+      <stop offset="0.5" stop-color="#30313a"/>
+      <stop offset="1" stop-color="#090a0f"/>
+    </linearGradient>
+    <linearGradient id="macro-switch" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7f5ff"/>
+      <stop offset="1" stop-color="#b9b5c8"/>
+    </linearGradient>
+    <pattern id="macro-texture" width="10" height="10" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="3" r="0.8" fill="#ffffff" opacity="0.07"/>
+      <circle cx="8" cy="6" r="0.7" fill="#000000" opacity="0.32"/>
+      <path d="M1 9 9 1" stroke="#ffffff" stroke-width="0.45" opacity="0.025"/>
+    </pattern>
+    <g id="macro-switch-base">
+      <path d="M13 67 105 72 99 100 18 96Z" fill="url(#macro-switch)"/>
+      <path d="M18 89 99 93 97 101 20 97Z" fill="#817b95" opacity="0.58"/>
+      <path d="M24 70 94 74 90 84 27 81Z" fill="#ffffff" opacity="0.56"/>
+    </g>
+    <g id="macro-key">
+      <path d="M10 16 112 21 104 92Q103 102 93 102L23 98Q12 97 11 87Z" fill="url(#macro-key-edge)"/>
+      <path d="M19 2 103 6Q113 7 111 17L104 74Q103 83 94 82L28 79Q18 78 17 68L12 15Q11 4 19 2Z" fill="url(#macro-key-top)" stroke="#474852" stroke-width="1.5"/>
+      <path d="M22 8 98 12Q105 12 106 19" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.12"/>
+    </g>
+    <g id="macro-screw">
+      <circle r="10" fill="#07080c" stroke="#50515c" stroke-width="2"/>
+      <circle r="5.5" fill="#23242c"/>
+      <path d="M-4-4 4 4M4-4-4 4" stroke="#777985" stroke-width="1.6" stroke-linecap="round"/>
+    </g>
+  </defs>
+
+  <!-- Transparent canvas with only a product contact shadow. -->
+  <ellipse cx="474" cy="532" rx="386" ry="35" fill="#090a12" opacity="0.22"/>
+
+  <!-- Layered 3D-printed enclosure. -->
+  <path d="M82 375 867 416 866 478Q866 497 846 497L128 460Q105 458 100 438Z" fill="url(#macro-body-edge)"/>
+  <path d="M100 434 854 473v12L125 448Q108 447 104 432Z" fill="#000000" opacity="0.34"/>
+  <path d="M99 449 852 487" fill="none" stroke="#2e2f38" stroke-width="3" opacity="0.65"/>
+  <path d="M132 117 783 150Q811 152 818 178L876 405Q884 438 851 441L116 403Q89 402 83 377L38 177Q31 150 57 140L103 121Q117 116 132 117Z" fill="url(#macro-body-top)" stroke="#07080d" stroke-width="4"/>
+  <path d="M132 117 783 150Q811 152 818 178L876 405Q884 438 851 441L116 403Q89 402 83 377L38 177Q31 150 57 140L103 121Q117 116 132 117Z" fill="url(#macro-texture)" opacity="0.82"/>
+  <path d="M104 135 780 169Q796 170 801 187" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.10"/>
+  <path d="M111 389 853 427" fill="none" stroke="#6750a4" stroke-width="3" opacity="0.38"/>
+
+  <!-- Purple switch glows, visible only in the gaps around the caps. -->
+  <g fill="#8668c9" opacity="0.26">
+    <ellipse cx="217" cy="279" rx="62" ry="18"/><ellipse cx="394" cy="288" rx="62" ry="18"/><ellipse cx="571" cy="297" rx="62" ry="18"/>
+    <ellipse cx="175" cy="396" rx="66" ry="18"/><ellipse cx="362" cy="406" rx="66" ry="18"/><ellipse cx="549" cy="415" rx="66" ry="18"/><ellipse cx="736" cy="425" rx="66" ry="18"/>
+  </g>
+
+  <!-- Rear row: media controls. -->
+  <g transform="translate(154 170) scale(.94)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+  <g transform="translate(331 179) scale(.94)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+  <g transform="translate(508 188) scale(.94)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+
+  <!-- Front row: app and utility shortcuts. -->
+  <g transform="translate(111 280)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+  <g transform="translate(298 290)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+  <g transform="translate(485 300)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+  <g transform="translate(672 310)"><use href="#macro-switch-base"/><use href="#macro-key"/></g>
+
+  <!-- Knurled rotary encoder. -->
+  <path d="M699 185c0-21 27-35 61-33s58 19 56 40l-7 82c-2 22-29 37-62 35s-59-20-57-41Z" fill="url(#macro-knob-side)"/>
+  <g fill="none" stroke="#737581" stroke-width="3" opacity="0.52">
+    <path d="m705 201 84 79"/><path d="m704 218 70 66"/><path d="m702 237 51 48"/><path d="m716 180 94 88"/>
+    <path d="m803 204-99 69"/><path d="m806 222-82 58"/><path d="m808 241-59 42"/><path d="m790 184-91 64"/>
+  </g>
+  <ellipse cx="758" cy="188" rx="59" ry="37" transform="rotate(3 758 188)" fill="url(#macro-knob)" stroke="#50515c" stroke-width="2"/>
+  <ellipse cx="751" cy="180" rx="35" ry="17" transform="rotate(3 751 180)" fill="#ffffff" opacity="0.07"/>
+  <path d="M757 164v14" stroke="#9c82db" stroke-width="5" stroke-linecap="round" opacity="0.88"/>
+
+  <!-- Key legends: familiar, driver-friendly line icons. -->
+  <g fill="none" stroke="#c9bddf" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
+    <!-- Previous -->
+    <g transform="translate(210 210) rotate(3)">
+      <path d="M-16-14v28M13-13-8 0l21 13Z"/>
+    </g>
+    <!-- Play -->
+    <path d="m375 196 28 20-31 17Z"/>
+    <!-- Next -->
+    <g transform="translate(565 229) rotate(3)">
+      <path d="M16-14v28M-13-13 8 0l-21 13Z"/>
+    </g>
+    <!-- Folder -->
+    <g transform="translate(169 322) rotate(3)">
+      <path d="M-27-12h20l7 8h28v31h-55Z"/>
+      <path d="M-20 7h41" opacity="0.65"/>
+    </g>
+    <!-- Light / brightness -->
+    <g transform="translate(356 333) rotate(3)">
+      <circle r="12"/>
+      <path d="M0-27v7M0 20v7M-27 0h7M20 0h7M-19-19l5 5M14 14l5 5M19-19l-5 5M-14 14l-5 5"/>
+    </g>
+    <!-- Repeat -->
+    <g transform="translate(543 343) rotate(3)">
+      <path d="M-25-4c5-13 22-18 35-10l7 5"/>
+      <path d="m10-18 9 10-13 5"/>
+      <path d="M25 4C20 17 3 22-10 14l-7-5"/>
+      <path d="m-10 18-9-10 13-5"/>
+    </g>
+    <!-- Microphone mute -->
+    <g transform="translate(730 353) rotate(3)">
+      <rect x="-9" y="-24" width="18" height="31" rx="9"/>
+      <path d="M-21 2c0 15 10 22 21 22S21 17 21 2M0 24v10M-13 34h26M-27-25 27 30"/>
+    </g>
+  </g>
+
+  <!-- Enclosure hardware. -->
+  <use href="#macro-screw" x="86" y="170"/>
+  <use href="#macro-screw" x="792" y="188"/>
+  <use href="#macro-screw" x="126" y="382"/>
+  <use href="#macro-screw" x="843" y="419"/>
+</svg>

@@ -19,6 +19,9 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <StreamString.h>
+#include <esp_sntp.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
 #include "mbedtls/sha256.h"
 #include "mbedtls/md.h"
 
@@ -33,6 +36,7 @@ void startProvisionMode();
 void handleStartAp();
 void handleApState();
 void handleApSett();
+void handleTimeSett();
 void handleApPass();
 void handleStopAp();
 String getApSsid();
@@ -51,6 +55,8 @@ bool checkAuth();
 // SOFTWARE UPDATE (OTA)
 void handleSwUpdateUpload();
 void handleSwUpdateUploadDone();
+void handleBackupRestore();
+void handleFactoryReset();
 void loadSettings();
 void advanceSlot();
 void retreatSlot();
@@ -59,7 +65,7 @@ void enterSlot(bool playTransition = true);
 void drawCircuitTileFrame();
 void resumeCircuitTileFromPriority();
 void beginC2PCapture();
-void finishC2PTransition();
+void finishC2PTransition(uint8_t tileTrans = 0, uint8_t tileSpd = 0);
 void beginP2CCapture();
 void finishP2CTransition();
 void registerTouchTap();
@@ -88,6 +94,8 @@ bool   canvasBitmapFromHex(const String& hex);
 void   ssInit();
 void   ssTick();
 void   handleScreensaverSett();
+String urlEncode(const String& s);
+
 // STOPWATCH
 void swInit();
 bool swPriorityTick();
@@ -103,6 +111,22 @@ void handleTimerSett();
 void handleTimerStart();
 void handleTimerPause();
 void handleTimerState();
+
+// POWER
+void handleWifiInfo();
+void handlePower();
+void noteActivity();
+void sleepWake();
+void sleepEnter();
+bool powerOffNow();
+
+// ALARM
+void alarmInit();
+bool alarmPriorityTick();
+void alarmStopRinging();
+void handleAlarmSett();
+void handleAlarmStop();
+void handleAlarmState();
 
 // DISPLAY
 #define CLK_PIN      3
@@ -131,6 +155,13 @@ uint8_t  dimLevel  = 1;
 
 // BUZZER
 #define BUZZER_PIN 12
+// Which volume a sound answers to. NONE is the main volume, heard only in the
+// main slider's own preview; the other four can be set apart.
+#define BZ_CAT_NONE  0
+#define BZ_CAT_NOTIF 1
+#define BZ_CAT_AUTO  2
+#define BZ_CAT_ALARM 3
+#define BZ_CAT_TOUCH 4
 
 // AP CONFIG
 #define AP_SSID "Adrian's Octoglow"
@@ -334,9 +365,10 @@ void autoDetectTimezone() {
 #define ITEM_NOTIF       7
 #define ITEM_PRESSURE    8
 #define ITEM_SCREENSAVER 9
-
+#define ITEM_HOURWEEK    10
 #define ITEM_CURRENCY    11
-#define NUM_ITEMS        10
+#define ITEM_YOUTUBE     12
+#define NUM_ITEMS        12
 #define CANVAS_COLS      32
 
 // SCREEN SAVER 
@@ -357,11 +389,19 @@ struct CycleItem {
 MD_Parola         P  = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 MD_MAX72XX        mx = MD_MAX72XX(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 bool gSuppressHwFlash = false;
+void screenStreamTick();
 static inline void mxCommit() {
   mx.update(gSuppressHwFlash ? MD_MAX72XX::OFF : MD_MAX72XX::ON);
+  // The live copy for a subscribed Octoglow Connect; nothing when nobody is.
+  screenStreamTick();
 }
 
+// The level the panel is running at right now, 0 meaning shut down. /getscreen
+// reads it: a panel in shutdown keeps its frame in the buffer but lights none of it.
+uint8_t mxPanelLevel = 0;
+
 void applyMaxBrightness(uint8_t uiLevel) {
+  mxPanelLevel = uiLevel;
   if (uiLevel == 0) {
     mx.control(MD_MAX72XX::SHUTDOWN, true);
   } else {
@@ -562,7 +602,46 @@ CycleItem items[NUM_ITEMS] = {
   { ITEM_PRESSURE,    false, 8,  7 },
   { ITEM_SCREENSAVER, false, 15,  8 },
   { ITEM_CURRENCY,    false, 8,  9 },
+  { ITEM_YOUTUBE,     false, 8, 10 },
+  { ITEM_HOURWEEK,    false, 5, 11 },
 };
+
+// TILES REMOVED FROM THE MANAGER
+//
+// One bit per tile: set means the row is not in the Tile Manager, and the tile
+// can only come back through the "add" picker. tileHiddenMask is indexed by
+// circuit tile id (ITEM_*), prioHiddenMask by PRIORITY_ID_*.
+//
+// PRIORITY_ID_NOWPLAYING's bit is deliberately never used: Now Playing is one
+// tile that lives in either list, so its presence is the ITEM_NOW_PLAYING bit
+// in tileHiddenMask no matter which list is showing it, and npIsPriority only
+// says which.
+uint16_t tileHiddenMask = 0;
+uint8_t  prioHiddenMask = 0;
+
+// Whether a circuit tile is in the Tile Manager at all - the same thing as "not
+// offered by the add picker". A tile that is not there has nothing to draw on,
+// so nothing needs fetching for it.
+static inline bool tileInManager(uint8_t id) {
+  return !(tileHiddenMask & (1u << id));
+}
+
+// A removed tile has no switch left to turn it off with, so removing one has to
+// turn it off too. Kept here rather than only in the browser so a restored
+// backup, or a client that predates this, cannot leave a tile cycling on the
+// panel with no row to stop it from.
+static void applyTileHiddenMask() {
+  bool anyVisible = false;
+  for (int i = 0; i < NUM_ITEMS; i++) {
+    if (!(tileHiddenMask & (1u << items[i].id))) { anyVisible = true; break; }
+  }
+  // Emptying the circuit list entirely would leave the panel with nothing to
+  // show and the interface with nothing to put back, so that mask is refused.
+  if (!anyVisible) tileHiddenMask = 0;
+  for (int i = 0; i < NUM_ITEMS; i++) {
+    if (tileHiddenMask & (1u << items[i].id)) items[i].enabled = false;
+  }
+}
 
 // CANVAS TILE
 
@@ -570,32 +649,174 @@ uint8_t canvasBitmap[CANVAS_COLS] = {0};
 
 uint8_t       currentSlot      = 0;
 unsigned long slotStartMs      = 0;
+
+// What the panel is showing at this instant, for the Tile Manager's live
+// marker. gLiveTileId is a circuit tile id (ITEM_*) or -1; gLivePrio is the
+// wire name of the priority tile that took the frame, or "" when none did.
+// Both are set from loop(), where the decision is actually made.
+int8_t        gLiveTileId      = -1;
+const char*   gLivePrio        = "";
 bool          inScrollAnim     = false;
 bool          inFadeOut        = false;
 bool          inFadeIn         = false;
-int           lastTemp         = -999;
+// Sentinel for "the BMP280 has never given us a usable reading".
+#define TEMP_NO_READING (-999)
+int           lastTemp         = TEMP_NO_READING;
 unsigned long lastTempSampleMs = 0;
 #define TEMP_SAMPLE_INTERVAL_MS 5000UL
+
+// Value currently rendered on the temperature tile, so loop() can tell the
+// "--" placeholder apart from a real number and swap it out in place.
+int           gTempShownValue  = TEMP_NO_READING;
+
+// BMP280 HEALTH
+//
+// The sensor used to be initialised exactly once in setup() and never checked
+// again: if bmp.begin() lost the race at power-up, or the I2C bus later got
+// wedged by a slave holding SDA low, every read failed forever and only a
+// reboot brought the temperature back. These track the failure state so the
+// sensor can be recovered while the clock keeps running.
+bool          bmpOk              = false;
+uint8_t       bmpFailStreak      = 0;
+unsigned long bmpNextRetryMs     = 0;
+unsigned long bmpRetryBackoffMs  = 3000UL;
+unsigned long lastPressureReadMs = 0;
+#define BMP_FAIL_LIMIT       3        // consecutive bad reads before re-init
+#define BMP_RETRY_MIN_MS     3000UL
+#define BMP_RETRY_MAX_MS     60000UL
+#define BMP_READ_INTERVAL_MS 5000UL
 
 unsigned long gLastStaticDrawMs = 0;
 bool          gStaticDrawDone   = false;
 
-char     nowPlayingBuf[128]    = "";
-char     nowArtist[64]         = "";
-char     nowTitle[64]          = "";
+// HARDWARE MONITOR - main loop instrumentation
+//
+// The ESP32 exposes no readable CPU-usage counter without enabling the FreeRTOS
+// run-time-stats sdkconfig options (off by default in the Arduino core), so no
+// usage percentage is reported - inventing one from the loop rate would only
+// look precise. What is measured instead is genuinely useful on its own:
+// loop() here is a non-blocking state machine, so its iteration rate and, more
+// importantly, its worst iteration period tell you directly when something is
+// blocking the main loop - which is exactly what makes the web UI sluggish.
+unsigned long hwLastLoopUs   = 0;   // timestamp of the previous loop() entry
+unsigned long hwLoopCount    = 0;   // iterations in the window being measured
+unsigned long hwWindowStart  = 0;
+unsigned long hwLoopMaxUs    = 0;   // worst iteration period in the current window
+uint32_t      hwLoopsPerSec  = 0;   // last completed window
+uint32_t      hwLoopMaxUsLast = 0;
+
+// HTTP TIMING (diagnostic)
+//
+// server.handleClient() runs the whole request inline, so however long a
+// response takes to push is time loop() is not animating the matrix. These
+// record the worst offender since boot so it can be read back from /hwstate.
+uint32_t      hwHttpMaxUs     = 0;    // longest single handleClient() call
+char          hwHttpMaxUri[28] = "";  // which request that was
+uint32_t      hwLoopMaxUsEver = 0;    // worst loop iteration since boot
+uint32_t      hwPageFull      = 0;    // dashboard sent in full
+uint32_t      hwPage304       = 0;    // dashboard answered with a 304
+uint32_t      hwPageUs        = 0;    // longest page send
+uint32_t      hwStateBuildUs  = 0;    // /state: time spent building + flushing
+
+uint32_t      hwStateUs       = 0;    // longest /state build+send
+bool          hwPeaksCleared  = false;
+
+// The configured network name, kept in RAM. /state used to re-open the NVS
+// "wifi" namespace on every request just to read this back, which is by far the
+// most expensive thing that endpoint did.
+String        gWifiSsidCached;
+
+void refreshWifiSsidCache() {
+  prefs.begin("wifi", true);
+  gWifiSsidCached = prefs.getString("ssid", "");
+  prefs.end();
+}
+
+// Boot is legitimately busy - WiFi association, NTP, the first weather and
+// currency fetches - and those spikes swamped the numbers we actually care
+// about. Drop everything recorded in the first 30 seconds, once.
+static void hwClearPeaksAfterBoot() {
+  if (hwPeaksCleared || millis() < 30000UL) return;
+  hwPeaksCleared  = true;
+  hwHttpMaxUs     = 0;
+  hwLoopMaxUsEver = 0;
+  hwPageUs        = 0;
+  hwStateUs       = 0;
+  hwStateBuildUs  = 0;
+  hwHttpMaxUri[0] = '\0';
+}
+
+// The peaks above are worst-since-boot, which is the wrong window for chasing
+// a stall that happens now and then: one bad moment hours ago hides every later
+// one. This lets the interface start a fresh window right before reproducing it.
+static void hwResetPeaks() {
+  hwHttpMaxUs     = 0;
+  hwLoopMaxUsEver = 0;
+  hwPageUs        = 0;
+  hwStateUs       = 0;
+  hwStateBuildUs  = 0;
+  hwHttpMaxUri[0] = '\0';
+}
+
+// Wraps every handleClient() call in loop() so the cost is attributed.
+static void serviceHttp() {
+  uint32_t t0 = micros();
+  server.handleClient();
+  uint32_t dt = micros() - t0;
+  if (dt > hwHttpMaxUs) {
+    hwHttpMaxUs = dt;
+    String u = server.uri();
+    // Left empty when there is no URI to name: the interface words that itself,
+    // in the language it is showing, where "(fara cerere)" went out as-is.
+    strncpy(hwHttpMaxUri, u.c_str(), sizeof(hwHttpMaxUri) - 1);
+    hwHttpMaxUri[sizeof(hwHttpMaxUri) - 1] = '\0';
+  }
+}
+
+// Called at the top of every loop() iteration; a few microseconds of work.
+inline void hwMonitorTick() {
+  unsigned long nowUs = micros();
+  if (hwLastLoopUs) {
+    unsigned long dt = nowUs - hwLastLoopUs;
+    if (dt > hwLoopMaxUs) hwLoopMaxUs = dt;
+    if (dt > hwLoopMaxUsEver) hwLoopMaxUsEver = (uint32_t)dt;
+  }
+  hwLastLoopUs = nowUs;
+  hwLoopCount++;
+
+  unsigned long nowMs = millis();
+  if (nowMs - hwWindowStart >= 1000) {
+    hwLoopsPerSec   = hwLoopCount;
+    hwLoopMaxUsLast = hwLoopMaxUs;
+    hwLoopCount   = 0;
+    hwLoopMaxUs   = 0;
+    hwWindowStart = nowMs;
+  }
+}
+
+
+
+char     nowPlayingBuf[300]    = "";  // "artist - title", and both can be long
+char     nowArtist[128]        = "";
+char     nowTitle[160]         = "";
 unsigned long lastNowPlayingMs = 0;
 bool     nowPlayingActive      = false;
 
 uint8_t  npDisplayMode         = 0;
 
 // Adaptive icon: shows a "video" glyph instead of the music note when the
-// detected playback source is a video player (set by Octoglow Sender).
+// detected playback source is a video player (set by Octoglow Connect).
 bool     npAdaptiveIcon        = true;
 bool     npIsVideoSource       = false;
 
 // NOTIFICATIONS 
 char     notifBuf[204]         = "";
 bool     notifActive           = false;
+// When set, this replaces the notification tile's usual glyph for the current
+// message only, and is cleared as soon as that message ends.
+const uint8_t* notifIconOverride = nullptr;
+// True only while the "web interface accessed" alert is the message on screen.
+bool     webAccessAlertActive  = false;
 bool     hideTileIcons         = false;
 bool     notifEnabled          = true;
 
@@ -607,6 +828,8 @@ bool     hideIconNotif         = false;
 bool     hideIconNowPlaying    = false;
 bool     hideIconPressure      = false;
 bool     hideIconCurrency      = false;
+bool     hideIconYoutube       = false;
+bool     hideIconWebAccess     = false;
 bool     hideIconIp            = false;
 
 // TILE ICON OVERRIDES (0 = Auto/Default -> tile's own built-in icon)
@@ -640,11 +863,13 @@ uint8_t  scrollTypeNotif        = 0;
 uint8_t  scrollTypeNowPlaying   = 0;
 uint8_t  scrollTypePressure     = 0;
 uint8_t  scrollTypeCurrency     = 0;
+uint8_t  scrollTypeYoutube      = 0;
+uint8_t  scrollTypeWebAccess    = 0;
 uint8_t  scrollTypeStopwatch    = 0;
 uint8_t  scrollTypeTimer        = 0;
 uint8_t  scrollTypeIp           = 0;
 
-// FONT TYPE (0 = Marymba/default, 1 = Tiko 3x7)
+// FONT TYPE (0 = Marymba/default, 1 = Tiko 3x7, 2 = Mako 4x7)
 uint8_t  fontType               = 0;
 
 uint8_t  fontTypeDate           = 0;
@@ -655,6 +880,8 @@ uint8_t  fontTypeNotif          = 0;
 uint8_t  fontTypeNowPlaying     = 0;
 uint8_t  fontTypePressure       = 0;
 uint8_t  fontTypeCurrency       = 0;
+uint8_t  fontTypeYoutube        = 0;
+uint8_t  fontTypeWebAccess      = 0;
 uint8_t  fontTypeStopwatch      = 0;
 uint8_t  fontTypeTimer          = 0;
 uint8_t  fontTypeIp             = 0;
@@ -671,16 +898,130 @@ uint8_t  tileTransCanvas       = 0;
 uint8_t  tileTransPress        = 0;
 uint8_t  tileTransSs           = 0;
 uint8_t  tileTransCurr         = 0;
+uint8_t  tileTransYt           = 0;
+uint8_t  tileTransHw           = 0;
+uint8_t  tileTransWeb          = 0;
 uint8_t  tileTransNotif        = 0;
 uint8_t  tileTransEts2         = 0;
 uint8_t  tileTransSw           = 0;
 uint8_t  tileTransTmr          = 0;
+uint8_t  tileTransAlarm        = 0;
 uint8_t  tileTransIp           = 0;
 uint8_t  tileTransC2P          = 0; // Circuit Tile -> Priority Tile
 uint8_t  tileTransP2C          = 0; // Priority Tile -> Circuit Tile
 
+// TILE TRANSITION SPEED
+//
+// How fast a transition plays, in percent of the pace its effect was drawn
+// at: 100 is unchanged, 200 twice as fast, 50 half as fast. Every tileTrans*
+// setting above has its own, so whichever setting picked an effect also sets
+// its pace; the global slider re-applies one value to all of them. Kept in one
+// NVS blob ("trSpeeds") rather than 21 more keys.
+#define TRSPD_DEFAULT  100
+#define TRSPD_MIN       50
+#define TRSPD_MAX      250
+#define TRSPD_HOUR      0
+#define TRSPD_DATE      1
+#define TRSPD_TEMP      2
+#define TRSPD_NP        3
+#define TRSPD_WX        4
+#define TRSPD_REM       5
+#define TRSPD_CANVAS    6
+#define TRSPD_PRESS     7
+#define TRSPD_SS        8
+#define TRSPD_CURR      9
+#define TRSPD_YT       10
+#define TRSPD_HW       11
+#define TRSPD_WEB      12
+#define TRSPD_NOTIF    13
+#define TRSPD_ETS2     14
+#define TRSPD_SW       15
+#define TRSPD_TMR      16
+#define TRSPD_ALARM    17
+#define TRSPD_IP       18
+#define TRSPD_C2P      19
+#define TRSPD_P2C      20
+#define TRSPD_COUNT    21
+
+// Suffix of the /state field and the POST argument, "tileTransSpd" + key - the
+// same names the effects carry after "tileTrans".
+static const char* const TRSPD_KEYS[TRSPD_COUNT] = {
+  "Hour", "Date", "Temp", "Np", "Wx", "Rem", "Canvas", "Press", "Ss", "Curr",
+  "Yt", "Hw", "Web", "Notif", "Ets2", "Sw", "Tmr", "Alarm", "Ip", "C2P", "P2C"
+};
+
+uint8_t  tileTransSpeed        = TRSPD_DEFAULT;  // the global slider
+uint8_t  tileTransSpd[TRSPD_COUNT];              // one per setting, filled by loadSettings()
+
 static inline bool scrollIconInBuffer(uint8_t st) { return st == 2 || st == 3; }
 static inline bool scrollIsWrap(uint8_t st)       { return st == 1 || st == 3; }
+
+// Key, drawn for the "web interface accessed" alert.
+// SCROLL SPEED
+//
+// Milliseconds between one column step and the next - lower is faster. Every
+// tile that can scroll has its own, defaulting to the constant above so nothing
+// changes until the user moves a slider.
+#define SCROLL_SPEED_DEFAULT 40
+#define SCROLL_SPEED_MIN     10
+#define SCROLL_SPEED_MAX     120
+#define SPD_DATE        0
+#define SPD_TEMP        1
+#define SPD_REMINDER    2
+#define SPD_WEATHER     3
+#define SPD_NOTIF       4
+#define SPD_NOWPLAYING  5
+#define SPD_PRESSURE    6
+#define SPD_CURRENCY    7
+#define SPD_YOUTUBE     8
+#define SPD_WEBACCESS   9
+#define SPD_STOPWATCH  10
+#define SPD_IP         11
+#define SPD_TIMER      12
+#define SCROLL_SPEED_COUNT 13
+
+// Suffix used for the NVS key, the /state field and the POST argument, so the
+// three stay in step by construction instead of by hand.
+static const char* const SPD_KEYS[SCROLL_SPEED_COUNT] = {
+  "Date", "Temp", "Reminder", "Weather", "Notif", "NowPlaying", "Pressure",
+  "Currency", "Youtube", "WebAccess", "Stopwatch", "Ip", "Timer"
+};
+
+uint8_t scrollSpeed = SCROLL_SPEED_DEFAULT;                 // the global slider
+uint8_t scrollSpeedTile[SCROLL_SPEED_COUNT] = {
+  SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT,
+  SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT,
+  SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT, SCROLL_SPEED_DEFAULT,
+  SCROLL_SPEED_DEFAULT
+};
+
+static inline unsigned long spd(uint8_t i) { return (unsigned long)scrollSpeedTile[i]; }
+
+// The alert borrows the notification tile's renderer but has its own look, so
+// these pick which set of settings applies to the message currently on screen.
+static inline uint8_t notifScrollType() {
+  return webAccessAlertActive ? scrollTypeWebAccess : scrollTypeNotif;
+}
+static inline uint8_t notifFontType() {
+  return webAccessAlertActive ? fontTypeWebAccess : fontTypeNotif;
+}
+static inline bool notifHideIcon() {
+  return webAccessAlertActive ? hideIconWebAccess : hideIconNotif;
+}
+static inline unsigned long notifScrollSpeed() {
+  return spd(webAccessAlertActive ? SPD_WEBACCESS : SPD_NOTIF);
+}
+
+const uint8_t keyIcon[8] = {
+  0b00000000,
+  0b01100000,
+  0b10010000,
+  0b10011111,
+  0b10010011,
+  0b01100010,
+  0b00000000,
+  0b00000000
+};
 
 const uint8_t notifIcon[8] = {
   0b00000000,
@@ -718,8 +1059,63 @@ bool     ets2OrderFirst        = false;
 #define PRIORITY_ID_NOWPLAYING 2
 #define PRIORITY_ID_STOPWATCH  3
 #define PRIORITY_ID_TIMER      4
-#define NUM_PRIORITY_IDS       5
-uint8_t  priorityOrder[NUM_PRIORITY_IDS] = { PRIORITY_ID_NOTIF, PRIORITY_ID_ETS2, PRIORITY_ID_NOWPLAYING, PRIORITY_ID_STOPWATCH, PRIORITY_ID_TIMER };
+#define PRIORITY_ID_WEB        5
+#define PRIORITY_ID_ALARM      6
+#define NUM_PRIORITY_IDS       7
+// The alarm starts out at the top: it is the one tile that goes off on its own,
+// while you are somewhere else, and an alarm ringing behind another tile is an
+// alarm you can hear but cannot read. The order stays the user's to change.
+uint8_t  priorityOrder[NUM_PRIORITY_IDS] = { PRIORITY_ID_ALARM, PRIORITY_ID_NOTIF, PRIORITY_ID_ETS2, PRIORITY_ID_NOWPLAYING, PRIORITY_ID_STOPWATCH, PRIORITY_ID_TIMER, PRIORITY_ID_WEB };
+
+// ALARM
+//
+// Three independent alarms. Each has a time, the weekdays it repeats on, a tone
+// and a switch. One rings when the clock enters its minute on one of its days,
+// and goes on ringing until the touch sensor or the interface stops it.
+#define ALARM_COUNT 3
+
+// Days are one bit each, bit 0 = Monday through bit 6 = Sunday. struct tm counts
+// from Sunday, so the two are bridged in exactly one place: ALARM_WDAY_BIT.
+#define ALARM_WDAY_BIT(tm_wday) ((uint8_t)(1 << (((tm_wday) + 6) % 7)))
+#define ALARM_ALL_DAYS 0x7F
+
+// Ringing forever would hold the panel and the buzzer for the rest of the day
+// when nobody is there to stop it. After this it gives up on its own; the alarm
+// still rings at its next slot.
+#define ALARM_MAX_RING_MS 900000UL
+// Silence between one pass of the tone and the next.
+#define ALARM_TONE_GAP_MS 700UL
+
+struct AlarmCfg {
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t days;
+  bool    enabled;
+  // Whether this slot holds an alarm at all. Absent is not the same as switched
+  // off: an alarm that is off is one you keep and will want again, an absent
+  // one is a card that never appears.
+  bool    present;
+  char    tone[16];
+};
+
+AlarmCfg alarms[ALARM_COUNT] = {
+  { 7, 30, 0x1F,           false, false, "classic" },
+  { 8,  0, 0x60,           false, false, "chimes"  },
+  { 9,  0, ALARM_ALL_DAYS, false, false, "morning" },
+};
+
+bool          alarmRinging     = false;
+int8_t        alarmRingingIdx  = -1;
+unsigned long alarmRingStartMs = 0;
+bool          alarmWasActive   = false;
+unsigned long alarmToneNextMs  = 0;
+
+// One latch per alarm, held for as long as the clock is inside that alarm's
+// minute. loop() runs thousands of times a second, so without it an alarm would
+// re-fire on every pass; clearing it the moment the minute passes is also what
+// lets the same alarm ring again tomorrow, and again next week.
+bool          alarmFired[ALARM_COUNT] = { false, false, false };
+bool     webAccessEnabled = true;
 bool     nowPlayingIsPriority  = false;
 
 bool     npPriorityWasActive   = false;
@@ -787,7 +1183,7 @@ void timerCheckExpiry() {
     timerFinished = true;
     timerBlinkOn = true;
     timerBlinkLastMs = millis();
-    nbPlayPreset(eventSoundTimer);
+    nbPlayPreset(eventSoundTimer, BZ_CAT_AUTO);
   }
 }
 
@@ -824,10 +1220,32 @@ void swFormatAdaptive(char* out, size_t outSize, unsigned long ms) {
 // WEATHER
 char     weatherCity[64]       = "Baia Mare";
 char     weatherApiKey[64]     = "";
+
+// OpenWeather keys are 32 hex characters. Rather than pin it to that and break
+// the day they change format, this only insists on something a key could be:
+// printable ASCII, no spaces, and short enough to store whole. That is already
+// enough to reject the bullet characters a masked field used to post back.
+static bool wxKeyLooksValid(const String& k) {
+  if (k.length() < 8 || k.length() >= sizeof(weatherApiKey)) return false;
+  for (unsigned int i = 0; i < k.length(); i++) {
+    char c = k[i];
+    if (c <= ' ' || c > '~') return false;
+  }
+  return true;
+}
 char     weatherLang[8]        = "en";
 float    weatherLat            = 47.6575f;
 float    weatherLon            = 23.5689f;
 char     weatherBuf[128]       = "";
+// Which parts of the reading the tile draws. Stored as flags rather than an
+// index so the seven combinations need no lookup table, and so the default (all
+// three) is the same value the tile behaved as before this existed.
+#define WX_SHOW_TEMP 0x01
+#define WX_SHOW_HUM  0x02
+#define WX_SHOW_DESC 0x04
+#define WX_SHOW_ALL  (WX_SHOW_TEMP | WX_SHOW_HUM | WX_SHOW_DESC)
+uint8_t  wxPreset              = WX_SHOW_ALL;
+
 float    weatherTempC          = -999;
 int      weatherHumidity       = -1;
 char     weatherDesc[48]       = "";
@@ -914,9 +1332,36 @@ const uint8_t moonIcon[8] = {
   0b00111100
 };
 
+// THE CLOCK, READ SAFELY
+//
+// getLocalTime(info, 0) is not a reliable way to ask what time it is. The core
+// writes it as
+//
+//     uint32_t start = millis();
+//     while ((millis() - start) <= ms) { ... return true; }
+//     return false;
+//
+// so with ms == 0 the body runs only if the millisecond counter has not ticked
+// between those two millis() calls. That gap is a couple of microseconds out of
+// every thousand, which makes roughly one call in several hundred report failure
+// on a clock that is perfectly set - and callers that bail on failure then skip
+// a draw for no reason at all.
+//
+// Giving it a non-zero timeout would trade that for a different problem: on a
+// clock that has never been set it spends a delay(10) per attempt, and these run
+// inside loop(), where the display advances one column per iteration.
+//
+// This is the same test with neither behaviour: read the clock once, and decide
+// from the year whether it has been set.
+static bool readLocalTime(struct tm& out) {
+  time_t t = time(nullptr);
+  localtime_r(&t, &out);
+  return out.tm_year > (2016 - 1900);
+}
+
 static bool isNight() {
   struct tm ti;
-  if (!getLocalTime(&ti)) return false;
+  if (!readLocalTime(ti)) return false;
   int h = ti.tm_hour;
   return (h >= 21 || h < 6);
 }
@@ -951,6 +1396,113 @@ const uint8_t* getWeatherIcon() {
 uint8_t  tempUnit              = 0;
 
 uint8_t  hourFormat            = 0;
+bool     hourLeadingZero       = false;   // 2:30 -> 02:30
+
+// HOUR AND WEEKDAY TILE
+//
+// Its own copy of the hour options, so it can run 12h next to a 24h Hour tile,
+// plus the one-row bar that goes with the weekday.
+#define HW_BAR_STATIC    0   // a fixed underline
+#define HW_BAR_SECONDS   1   // fills up across the minute
+#define HW_BAR_BELOW     0
+#define HW_BAR_ABOVE     1
+uint8_t  hwFormat              = 0;       // 0 = 24h, 1 = 12h
+bool     hwLeadZero            = false;
+uint8_t  hwBarMode             = HW_BAR_SECONDS;
+uint8_t  hwBarPos              = HW_BAR_BELOW;
+bool     hwSwap                = false;   // day on the left, time on the right
+
+// DEFAULT START MODE
+//
+// Which radio the clock comes up on after a power cut. Choosing AP also keeps
+// the tile loop running there: the access point stops being a repair hatch and
+// becomes how the clock normally lives, for anyone with no router to put it on.
+// Purely an interface preference: with it off, the web interface leaves out the
+// rows it would otherwise show dimmed - a tile that needs the internet while the
+// access point is up, an event sound whose tile is switched off, the update
+// check in AP mode. Kept on the device so it travels with the user rather than
+// with the browser.
+bool     showGrayedContent     = true;
+
+// Marks the row the panel is showing right now, in the Tile Manager.
+bool     liveTileHighlight     = true;
+
+// Dark mode and the interface language. Neither changes anything the device
+// does - they sit next to accentColor purely so the interface looks the same
+// from whichever browser the user opens it in. The browser keeps its own
+// localStorage copy as well, to paint the right theme before /state arrives.
+bool     webUiDark             = true;
+char     webUiLang[3]          = "ro";
+// Forma ramelor de iconita din interfata: 0 cerc, 1 patrat rotunjit, 2 dala,
+// 3 squircle.
+uint8_t  webUiShape            = 0;
+// Custom interface colours as "bgDark,cardDark,bgLight,cardLight": each slot is
+// empty for the theme's own colour, or #rrggbb. Stored as sent - the browser
+// works the rest of the surfaces out from them.
+char     webUiColors[32]       = "";
+
+#define START_MODE_WIFI 0
+#define START_MODE_AP   1
+uint8_t  defaultStartMode      = START_MODE_WIFI;
+
+// True while the panel belongs to the AP badge rather than to the tiles. Every
+// early return in loop() goes through this, so the one exception - AP picked as
+// the start mode - is stated once instead of thirty-four times.
+static inline bool tileLoopSuspended() {
+  return provisionMode && defaultStartMode != START_MODE_AP;
+}
+
+// NETWORK TIME
+//
+// On by default: NTP keeps the clock right on its own. Switched off, nothing
+// writes the RTC but the user - and since there is no battery behind it, the
+// time is genuinely lost at every restart and has to be typed in again.
+bool     netTimeSync           = true;
+
+// With no valid clock verifySessionToken() refuses to judge a cookie's expiry,
+// so every session is rejected and the page that sets the time is the one page
+// nobody can reach. Boot manual mode on a plausible date instead of 1970.
+#define MANUAL_TIME_FALLBACK 1767225600UL   // 2026-01-01 00:00:00
+
+// SNTP would otherwise walk over a hand-set clock at its next poll.
+static void stopNtp() {
+  if (esp_sntp_enabled()) esp_sntp_stop();
+}
+
+static void seedManualClock() {
+  if (TIME_LOOKS_VALID(time(nullptr))) return;
+  struct timeval tv;
+  tv.tv_sec  = (time_t)MANUAL_TIME_FALLBACK;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+}
+
+// mktime() reads the fields as local time in whatever TZ is active and
+// localtime_r() turns them back into the same fields, so what the user types is
+// exactly what the tiles show - no offset arithmetic on either side.
+static bool applyManualTime(int y, int mo, int d, int h, int mi, int s) {
+  if (y < 2024 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+      h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) return false;
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year  = y - 1900;
+  t.tm_mon   = mo - 1;
+  t.tm_mday  = d;
+  t.tm_hour  = h;
+  t.tm_min   = mi;
+  t.tm_sec   = s;
+  t.tm_isdst = -1;
+  time_t e = mktime(&t);
+  if (e <= 0) return false;
+  // mktime normalises out-of-range days (32 Jan becomes 1 Feb); reject that
+  // rather than silently storing a date the user did not ask for.
+  if (t.tm_mday != d || t.tm_mon != mo - 1) return false;
+  struct timeval tv;
+  tv.tv_sec  = e;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  return true;
+}
 
 uint8_t  dateFormat            = 2;
 uint8_t  dateLang              = 0;  // 0 = English, 1 = Romanian (used only by dateFormat 4 "Mon 11")
@@ -979,7 +1531,10 @@ static int    wxWrapPass      = 0;
 
 NpState       notifState       = NP_SHOW_START;
 unsigned long notifPauseMs     = 0;
-static uint8_t  notifColBuf[512];
+// Room for the whole text in the widest font (6 columns a letter with the
+// gap) plus the icon. At 512 anything past ~85 characters was cut off.
+#define NOTIF_COL_MAX 1250
+static uint8_t  notifColBuf[NOTIF_COL_MAX];
 static int      notifColCount  = 0;
 static int      notifScrollPos = 0;
 static unsigned long notifLastScrollMs = 0;
@@ -1001,12 +1556,35 @@ static unsigned long ipLastScrollMs = 0;
 static int      ipWrapPass       = 0;
 
 bool          provisionMode    = false;
+
+// POWER
+//
+// sleepActive is the panel being dark while everything else carries on: the
+// web server answers, Octoglow Connect still gets through, and anything that
+// arrives counts as a reason to light back up. Power Off is a different thing
+// entirely and does not live in a flag - it is a deep sleep the device only
+// comes out of by being held.
+bool          sleepActive      = false;
+bool          autoSleepOn      = false;
+uint32_t      autoSleepSec     = 1800;
+unsigned long lastActivityMs   = 0;
+// Long enough that a hand passing the pad is not a power button, short enough
+// that nobody thinks the clock is broken.
+#define POWER_ON_HOLD_MS 1500
+
 bool          buzzerOn         = true;
 uint8_t       buzzerVolume     = 80;
+// A level per category. The main volume sets all four at once, the way the
+// global transition speed sets every tile; they can then be moved apart.
+uint8_t       buzzVolNotif     = 80;
+uint8_t       buzzVolAuto      = 80;
+uint8_t       buzzVolAlarm     = 80;
+uint8_t       buzzVolTouch     = 80;
 char          buzzerPreset[16] = "calm";
 char          eventSoundTile[16]  = "calm";
 char          eventSoundWifi[16]  = "urgent";
 char          eventSoundNotif[16] = "soft";
+char          eventSoundWeb[16]   = "soft";
 char          eventSoundEts2[16]  = "urgent";
 char          eventSoundTouch[16] = "soft";
 char          accentColor[8]      = "#d0bcff";
@@ -1024,47 +1602,288 @@ bool          touchScreenOff       = false;
 
 char displayBuf[32];
 
-// BUZZER NON BLOCKING (for touch)
+// BUZZER OUTPUT
+//
+// The notes are played by the RMT peripheral, from a task of their own.
+//
+// Timing: a note has to end on time, and the next one start on time, even when
+// loop() is busy. A tile transition, a slow request or a WiFi reconnect holds
+// loop() for hundreds of milliseconds; a note that only loop() could stop
+// droned on through all of it, and a tune that only loop() could advance fell
+// apart. buzzTask() walks the queue on its own clock, and each note is a
+// counted run of periods that the hardware stops by itself.
+//
+// Volume: a passive buzzer has no volume line, and narrowing the pulse to make
+// it quieter pushes the sound into its upper harmonics, so everything played
+// quietly came out at a different pitch. Instead the note keeps its
+// half-and-half square shape and its high half is chopped by a 40 kHz carrier.
+// The buzzer cannot follow the carrier, only its average, so the level scales
+// with the carrier duty and the pitch stays where it was.
+//
+// Shape: rewriting that duty while a note sounds lets it die away like a
+// struck bell or a plucked string instead of stopping dead, which is most of
+// the difference between a chime and a beep.
+#include "soc/rmt_struct.h"
+#include "soc/gpio_struct.h"
+#include "soc/gpio_sig_map.h"
 
-#define NB_QUEUE_MAX 32
-struct NbNote { uint16_t freq; uint16_t dur; };
+#define BUZZ_TICK_HZ       1000000UL  // symbol durations in microseconds
+#define BUZZ_CARRIER_HZ    40000UL
+#define BUZZ_CARRIER_TICKS 2000       // one carrier period at the 80 MHz RMT group clock
+// Never 0 ticks high or low: the register reads 0 as 65536, and the HAL asserts.
+#define BUZZ_TICKS_MIN     4
+#define BUZZ_TICKS_MAX     1960
+
+// How a note's level moves while it sounds.
+#define BZ_ENV_FLAT   0  // on, then off: the original beeps
+#define BZ_ENV_PLUCK  1  // struck and quickly gone
+#define BZ_ENV_BELL   2  // struck and left to ring
+#define BZ_ENV_SWELL  3  // rises, then fades
+
+static portMUX_TYPE nbMux = portMUX_INITIALIZER_UNLOCKED;
+static bool    buzzReady        = false;
+static int     buzzCarrierTicks = -2;  // -1 carrier off, -2 not known
+static int8_t  buzzRmtCh        = -1;  // the RMT channel on the pin, -1 unknown
+
+static uint8_t buzzCatVolume(uint8_t cat) {
+  uint8_t v;
+  switch (cat) {
+    case BZ_CAT_NOTIF: v = buzzVolNotif; break;
+    case BZ_CAT_AUTO:  v = buzzVolAuto;  break;
+    case BZ_CAT_ALARM: v = buzzVolAlarm; break;
+    case BZ_CAT_TOUCH: v = buzzVolTouch; break;
+    default:           v = buzzerVolume; break;
+  }
+  return v > 100 ? 100 : v;
+}
+
+static bool buzzBegin() {
+  if (buzzReady) return true;
+  if (!rmtInit(BUZZER_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, BUZZ_TICK_HZ)) return false;
+  buzzReady        = true;
+  buzzCarrierTicks = -2;
+  // The Arduino layer does not say which channel it took; the GPIO matrix does.
+  uint32_t sel = GPIO.func_out_sel_cfg[BUZZER_PIN].func_sel;
+  buzzRmtCh = (sel >= RMT_SIG_OUT0_IDX && sel <= RMT_SIG_OUT3_IDX) ? (int8_t)(sel - RMT_SIG_OUT0_IDX) : -1;
+  return true;
+}
+
+// Between notes, through the driver. It reaches the pin when the next note starts.
+static void buzzCarrierSet(int ticks) {
+  if (ticks == buzzCarrierTicks) return;
+  bool ok;
+  if (ticks < 0) {
+    ok = rmtSetCarrier(BUZZER_PIN, false, false, 0, 0.5f);
+  } else {
+    // The third argument is polarity_active_low: false puts the carrier on the
+    // high half of the note. The half tick keeps the driver's truncation from
+    // landing one below.
+    ok = rmtSetCarrier(BUZZER_PIN, true, false, BUZZ_CARRIER_HZ, (ticks + 0.5f) / BUZZ_CARRIER_TICKS);
+  }
+  buzzCarrierTicks = ok ? ticks : -2;
+}
+
+// While a note sounds. The driver has no call for this, so the duty goes
+// straight into the register, followed by the channel's synchronisation bit
+// that carries configuration across to the RMT clock domain - the same bit the
+// driver sets to start or stop a transmission. The critical section keeps the
+// RMT interrupt, which lives on this core, off CONF0 while it is written.
+static void buzzCarrierLive(int ticks) {
+  if (ticks == buzzCarrierTicks) return;
+  if (buzzRmtCh < 0 || buzzCarrierTicks < 0) { buzzCarrierSet(ticks); return; }
+  portENTER_CRITICAL(&nbMux);
+  RMT.chncarrier_duty[buzzRmtCh].val = ((uint32_t)ticks << 16) | (uint32_t)(BUZZ_CARRIER_TICKS - ticks);
+  RMT.chnconf0[buzzRmtCh].conf_update_chn = 1;
+  portEXIT_CRITICAL(&nbMux);
+  buzzCarrierTicks = ticks;
+}
+
+static int buzzTicksFor(float amp) {
+  int t = (int)(amp * BUZZ_CARRIER_TICKS + 0.5f);
+  if (t < BUZZ_TICKS_MIN) t = BUZZ_TICKS_MIN;
+  if (t > BUZZ_TICKS_MAX) t = BUZZ_TICKS_MAX;
+  return t;
+}
+
+// The level t ms into a note dur ms long, 1 being the note's full volume.
+static float buzzEnvelope(uint8_t env, uint32_t t, uint16_t dur) {
+  float x = dur ? (float)t / dur : 1.0f;
+  if (x > 1.0f) x = 1.0f;
+  switch (env) {
+    case BZ_ENV_PLUCK: return expf(-3.5f * x);  // ends near 3 %
+    case BZ_ENV_BELL:  return expf(-1.8f * x);  // still ringing at 16 %
+    case BZ_ENV_SWELL: return x < 0.35f ? 0.4f + 0.6f * x / 0.35f : 1.0f - 0.85f * (x - 0.35f) / 0.65f;
+    default:           return 1.0f;
+  }
+}
+
+// An empty looping write cuts off whatever is sounding; the pin drops to its
+// idle level, low.
+static void buzzSilence() {
+  if (buzzReady) rmtWriteLooping(BUZZER_PIN, NULL, 0);
+}
+
+// Starts a note. Returns its full-volume carrier amplitude, or a negative
+// number when nothing is sounding: a rest, or a category turned down to 0.
+static float buzzStartNote(uint16_t freq, uint16_t durMs, uint8_t env, uint8_t cat) {
+  uint8_t vol = buzzCatVolume(cat);
+  if (freq == 0 || durMs == 0 || vol == 0) { buzzSilence(); return -1.0f; }
+  if (!buzzBegin()) return -1.0f;
+  // Loudness falls away far more slowly than the number does, so the setting
+  // is squared: 50 drives the buzzer at a quarter, about -12 dB.
+  float peak = (vol / 100.0f) * (vol / 100.0f);
+  // A flat note at full volume needs no carrier: that is the plain square wave
+  // tone() used to play. A shaped note keeps it on so its level can move.
+  if (env == BZ_ENV_FLAT && vol >= 100) buzzCarrierSet(-1);
+  else                                  buzzCarrierSet(buzzTicksFor(peak * buzzEnvelope(env, 0, durMs)));
+  if (freq < 20)    freq = 20;     // half a period has to fit in 15 bits of µs
+  if (freq > 20000) freq = 20000;
+  uint32_t period = (BUZZ_TICK_HZ + freq / 2) / freq;
+  static rmt_data_t sym;
+  sym.level0 = 1; sym.duration0 = period / 2;
+  sym.level1 = 0; sym.duration1 = period - period / 2;
+  uint32_t cycles = ((uint32_t)durMs * 1000UL + period / 2) / period;
+  // One cycle would go out as a one-shot write, and the next note could not
+  // cut that short. Starting a repeated write cancels the one before it.
+  if (cycles < 2) cycles = 2;
+  rmtWriteRepeated(BUZZER_PIN, &sym, 1, cycles);
+  return peak;
+}
+
+// BUZZER QUEUE
+//
+// loop() and the web handlers queue notes, buzzTask() plays them, and nbMux
+// covers everything the two share. Each note carries the category whose volume
+// it plays at; nbEnqCat is the one being queued, and only loop() touches it.
+#define NB_QUEUE_MAX 64
+struct NbNote { uint16_t freq; uint16_t dur; uint8_t env; uint8_t cat; };
 static NbNote  nbQueue[NB_QUEUE_MAX];
-static uint8_t nbHead      = 0;
-static uint8_t nbTail      = 0;
-static bool    nbPlaying   = false;
-static unsigned long nbNoteStart = 0;
-static uint16_t nbNoteDur  = 0;
+static uint8_t nbHead     = 0;
+static uint8_t nbTail     = 0;
+static bool    nbStopReq  = false;
+static bool    nbNoteOn   = false;  // a note, or the gap after it, is under way
+static bool    nbShutReq  = false;
+static volatile bool nbShutDone = false;
+static uint8_t nbEnqCat   = BZ_CAT_NONE;
+static TaskHandle_t buzzTaskH = NULL;
+
+static void buzzWake() {
+  if (buzzTaskH) xTaskNotifyGive(buzzTaskH);
+}
+
+static void nbEnqueueEnv(uint16_t freq, uint16_t dur, uint8_t env) {
+  portENTER_CRITICAL(&nbMux);
+  uint8_t next = (nbTail + 1) % NB_QUEUE_MAX;
+  if (next != nbHead) {
+    nbQueue[nbTail] = { freq, dur, env, nbEnqCat };
+    nbTail = next;
+  }
+  portEXIT_CRITICAL(&nbMux);
+  buzzWake();
+}
 
 static void nbEnqueue(uint16_t freq, uint16_t dur) {
-  uint8_t next = (nbTail + 1) % NB_QUEUE_MAX;
-  if (next == nbHead) return;
-  nbQueue[nbTail] = {freq, dur};
-  nbTail = next;
+  nbEnqueueEnv(freq, dur, BZ_ENV_FLAT);
 }
 
-void tickBuzzer() {
-  if (nbHead == nbTail) {
-    if (nbPlaying) { noTone(BUZZER_PIN); nbPlaying = false; }
-    return;
-  }
-  unsigned long now = millis();
-  if (!nbPlaying) {
-    NbNote n = nbQueue[nbHead];
-    nbHead = (nbHead + 1) % NB_QUEUE_MAX;
-    if (n.freq == 0) { noTone(BUZZER_PIN); }
-    else             { tone(BUZZER_PIN, n.freq, n.dur); }
-    nbNoteStart = now;
-    nbNoteDur   = n.dur + 5;
-    nbPlaying   = true;
-  } else if (now - nbNoteStart >= (unsigned long)nbNoteDur) {
-    nbPlaying = false;
+// Empties the queue and cuts off whatever is sounding.
+static void nbStop() {
+  portENTER_CRITICAL(&nbMux);
+  nbHead = nbTail = 0;
+  nbStopReq = true;
+  portEXIT_CRITICAL(&nbMux);
+  buzzWake();
+}
+
+// Anything queued, sounding, or about to be cut off.
+static bool nbBusy() {
+  portENTER_CRITICAL(&nbMux);
+  bool busy = nbHead != nbTail || nbNoteOn || nbStopReq;
+  portEXIT_CRITICAL(&nbMux);
+  return busy;
+}
+
+// A note holds the queue for its length plus a 5 ms gap. A shaped note is
+// revisited every 3 ms to move its level; otherwise the task sleeps until the
+// note is over or something new is queued.
+static void buzzTask(void*) {
+  unsigned long start = 0;
+  uint16_t dur = 0, span = 0;
+  uint8_t  env = BZ_ENV_FLAT;
+  float    peak = -1.0f;
+  for (;;) {
+    unsigned long now = millis();
+    NbNote n = { 0, 0, 0, 0 };
+    bool shut, stop = false, have = false;
+    portENTER_CRITICAL(&nbMux);
+    shut = nbShutReq;
+    if (nbStopReq) { nbStopReq = false; nbNoteOn = false; stop = true; }
+    if (nbNoteOn && now - start >= span) nbNoteOn = false;
+    if (!shut && !nbNoteOn && nbHead != nbTail) {
+      n = nbQueue[nbHead];
+      nbHead = (nbHead + 1) % NB_QUEUE_MAX;
+      nbNoteOn = have = true;
+    }
+    bool idle = !nbNoteOn;
+    portEXIT_CRITICAL(&nbMux);
+
+    if (shut) {
+      buzzSilence();
+      if (buzzReady) { rmtDeinit(BUZZER_PIN); buzzReady = false; }
+      nbShutDone = true;
+      vTaskSuspend(NULL);
+    }
+    if (have) {
+      start = now; dur = n.dur; span = n.dur + 5; env = n.env;
+      peak = buzzStartNote(n.freq, n.dur, n.env, n.cat);
+    } else if (stop) {
+      peak = -1.0f;
+      buzzSilence();
+    }
+    bool shaping = peak >= 0 && env != BZ_ENV_FLAT && now - start < dur;
+    if (shaping) buzzCarrierLive(buzzTicksFor(peak * buzzEnvelope(env, now - start, dur)));
+
+    TickType_t wait = portMAX_DELAY;
+    if (shaping) {
+      wait = pdMS_TO_TICKS(3);
+    } else if (!idle) {
+      unsigned long el = millis() - start;
+      wait = el < span ? pdMS_TO_TICKS(span - el) : 1;
+      if (wait == 0) wait = 1;
+    }
+    ulTaskNotifyTake(pdTRUE, wait);
   }
 }
 
-static void nbPlayPreset(const char* id) {
+// Silent and released: for boot and for sleep, where the pin must sit low.
+static void buzzOff() {
+  if (buzzTaskH) {
+    portENTER_CRITICAL(&nbMux);
+    nbHead = nbTail = 0;
+    nbShutReq = true;
+    portEXIT_CRITICAL(&nbMux);
+    buzzWake();
+    for (int i = 0; i < 50 && !nbShutDone; i++) delay(2);
+  }
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// Above loop() in priority and on loop()'s core: a busy pass cannot hold a
+// note back, and the RMT interrupt the task installs lands on the core that
+// buzzCarrierLive() shuts it out of.
+static void buzzStartTask() {
+  if (buzzTaskH) return;
+  xTaskCreatePinnedToCore(buzzTask, "buzzer", 5120, NULL, 2, &buzzTaskH, xPortGetCoreID());
+}
+
+// cat is whose volume the preset plays at: BZ_CAT_NOTIF, BZ_CAT_AUTO or
+// BZ_CAT_TOUCH.
+static void nbPlayPreset(const char* id, uint8_t cat) {
   if (!buzzerOn) return;
   if (strcmp(id, "none") == 0) return;
-  nbHead = nbTail = 0; nbPlaying = false; noTone(BUZZER_PIN);
+  nbStop();
+  nbEnqCat = cat;
   if (strcmp(id, "calm") == 0) {
     nbEnqueue(1000, 80);
   } else if (strcmp(id, "loud") == 0) {
@@ -1143,6 +1962,34 @@ static void nbPlayPreset(const char* id) {
     for (int i = 0; i < 5; i++) { nbEnqueue(notes[i], 30); nbEnqueue(0, 10); }
   } else if (strcmp(id, "whistle") == 0) {
     for (int f = 800; f <= 2000; f += 40) nbEnqueue(f, 12);
+  // The shaped ones. Each note is struck and left to fade (PLUCK, BELL) or
+  // swells and falls away (SWELL), and they keep to the pentatonic and major
+  // intervals, in the octave the buzzer sings best in.
+  } else if (strcmp(id, "glass") == 0) {
+    nbEnqueueEnv(2637, 120, BZ_ENV_BELL); nbEnqueueEnv(1976, 650, BZ_ENV_BELL);
+  } else if (strcmp(id, "musicbox") == 0) {
+    nbEnqueueEnv(1047, 110, BZ_ENV_PLUCK); nbEnqueueEnv(1319, 110, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1568, 110, BZ_ENV_PLUCK); nbEnqueueEnv(2093, 480, BZ_ENV_BELL);
+  } else if (strcmp(id, "kalimba") == 0) {
+    nbEnqueueEnv(1568, 150, BZ_ENV_PLUCK); nbEnqueueEnv(1319, 150, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1047, 380, BZ_ENV_PLUCK);
+  } else if (strcmp(id, "dingdong") == 0) {
+    nbEnqueueEnv(1319, 420, BZ_ENV_BELL); nbEnqueueEnv(1047, 750, BZ_ENV_BELL);
+  } else if (strcmp(id, "droplet") == 0) {
+    nbEnqueueEnv(1568, 50, BZ_ENV_PLUCK); nbEnqueueEnv(2349, 300, BZ_ENV_PLUCK);
+  } else if (strcmp(id, "success") == 0) {
+    nbEnqueueEnv(784, 90, BZ_ENV_PLUCK);   nbEnqueueEnv(1047, 90, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1319, 90, BZ_ENV_PLUCK);  nbEnqueueEnv(1568, 450, BZ_ENV_BELL);
+  } else if (strcmp(id, "softping") == 0) {
+    nbEnqueueEnv(1760, 800, BZ_ENV_BELL);
+  } else if (strcmp(id, "aurora") == 0) {
+    nbEnqueueEnv(1047, 280, BZ_ENV_SWELL); nbEnqueueEnv(1568, 560, BZ_ENV_BELL);
+  } else if (strcmp(id, "harmony") == 0) {
+    nbEnqueueEnv(880, 80, BZ_ENV_PLUCK);   nbEnqueueEnv(1109, 80, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1319, 80, BZ_ENV_PLUCK);  nbEnqueueEnv(1760, 550, BZ_ENV_BELL);
+  } else if (strcmp(id, "twinkle") == 0) {
+    nbEnqueueEnv(2637, 70, BZ_ENV_PLUCK);  nbEnqueueEnv(2093, 70, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1568, 70, BZ_ENV_PLUCK);  nbEnqueueEnv(2637, 380, BZ_ENV_BELL);
   } else if (strcmp(id, "boldalert") == 0) {
     for (int i = 0; i < 4; i++) { nbEnqueue(300, 70); nbEnqueue(0, 10); nbEnqueue(1200, 70); nbEnqueue(0, 10); }
   } else {
@@ -1150,121 +1997,202 @@ static void nbPlayPreset(const char* id) {
   }
 }
 
+// ALARM TONES
+//
+// The presets above are single notifications - a note or two and done. An alarm
+// has to carry on until somebody stops it, so each tone here is a phrase that
+// alarmToneTick() re-queues for as long as the alarm rings. They go through the
+// same nbEnqueue()/buzzTask() pair as the presets; only the repeat is new.
+// NB_QUEUE_MAX leaves room for 63 entries, rests included, and no phrase below
+// goes past 30.
+static void alarmEnqueueTone(const char* id) {
+  nbEnqCat = BZ_CAT_ALARM;
+  if (strcmp(id, "chimes") == 0) {
+    // A four-note chime figure, twice over.
+    static const uint16_t n[4] = { 659, 784, 587, 392 };
+    for (int r = 0; r < 2; r++)
+      for (int i = 0; i < 4; i++) { nbEnqueue(n[i], 260); nbEnqueue(0, 40); }
+  } else if (strcmp(id, "morning") == 0) {
+    static const uint16_t n[6] = { 523, 659, 784, 659, 784, 1046 };
+    for (int r = 0; r < 2; r++)
+      for (int i = 0; i < 6; i++) { nbEnqueue(n[i], 190); nbEnqueue(0, 30); }
+  } else if (strcmp(id, "radar") == 0) {
+    for (int r = 0; r < 4; r++) {
+      nbEnqueue(880, 90);   nbEnqueue(0, 30);
+      nbEnqueue(1046, 90);  nbEnqueue(0, 30);
+      nbEnqueue(1318, 150); nbEnqueue(0, 200);
+    }
+  } else if (strcmp(id, "insistent") == 0) {
+    for (int r = 0; r < 6; r++) { nbEnqueue(2000, 90); nbEnqueue(0, 60); nbEnqueue(1600, 90); nbEnqueue(0, 160); }
+  } else if (strcmp(id, "siren") == 0) {
+    for (int f = 500; f <= 1500; f += 125) nbEnqueue(f, 60);
+    for (int f = 1500; f >= 500; f -= 125) nbEnqueue(f, 60);
+  } else if (strcmp(id, "melody") == 0) {
+    static const uint16_t n[8] = { 523, 587, 659, 523, 523, 587, 659, 523 };
+    for (int i = 0; i < 8; i++) { nbEnqueue(n[i], 220); nbEnqueue(0, 30); }
+  } else if (strcmp(id, "sunrise") == 0) {
+    // A slow climb up the pentatonic scale, every step left to ring.
+    static const uint16_t n[6] = { 1047, 1175, 1319, 1568, 1760, 2093 };
+    for (int i = 0; i < 6; i++) nbEnqueueEnv(n[i], i == 5 ? 1100 : 420, BZ_ENV_BELL);
+  } else if (strcmp(id, "musicbox") == 0) {
+    static const uint16_t n[16] = { 1319, 1568, 2093, 1568, 1760, 1568, 1319, 1047,
+                                    1175, 1319, 1568, 1319, 1175, 1047, 1175, 1047 };
+    for (int i = 0; i < 15; i++) nbEnqueueEnv(n[i], 230, BZ_ENV_PLUCK);
+    nbEnqueueEnv(n[15], 800, BZ_ENV_BELL);
+  } else if (strcmp(id, "arpeggio") == 0) {
+    static const uint16_t n[8] = { 1047, 1319, 1568, 2093, 2637, 2093, 1568, 1319 };
+    for (int r = 0; r < 2; r++)
+      for (int i = 0; i < 8; i++) nbEnqueueEnv(n[i], 140, BZ_ENV_PLUCK);
+    nbEnqueueEnv(1047, 700, BZ_ENV_BELL);
+  } else if (strcmp(id, "birds") == 0) {
+    // Short plucked chirps with room between them - a trill, a call, a flutter.
+    static const uint16_t a[3] = { 2093, 2349, 2637 };
+    static const uint16_t b[4] = { 1976, 2349, 2794, 2349 };
+    for (int r = 0; r < 2; r++) {
+      for (int i = 0; i < 3; i++) nbEnqueueEnv(a[i], 20, BZ_ENV_PLUCK);
+      nbEnqueue(0, 140);
+      nbEnqueueEnv(2637, 24, BZ_ENV_PLUCK); nbEnqueueEnv(2349, 40, BZ_ENV_PLUCK);
+      nbEnqueue(0, 320);
+      for (int i = 0; i < 4; i++) nbEnqueueEnv(b[i], 18, BZ_ENV_PLUCK);
+      nbEnqueue(0, 480);
+    }
+  } else if (strcmp(id, "zen") == 0) {
+    nbEnqueueEnv(880, 1000, BZ_ENV_SWELL);  nbEnqueue(0, 120);
+    nbEnqueueEnv(1319, 1000, BZ_ENV_SWELL); nbEnqueue(0, 120);
+    nbEnqueueEnv(1175, 1000, BZ_ENV_SWELL); nbEnqueue(0, 120);
+    nbEnqueueEnv(880, 1400, BZ_ENV_SWELL);
+  } else if (strcmp(id, "windchime") == 0) {
+    nbEnqueueEnv(2637, 420, BZ_ENV_BELL); nbEnqueueEnv(2093, 320, BZ_ENV_BELL); nbEnqueue(0, 120);
+    nbEnqueueEnv(2349, 520, BZ_ENV_BELL); nbEnqueueEnv(1760, 360, BZ_ENV_BELL); nbEnqueue(0, 200);
+    nbEnqueueEnv(1568, 620, BZ_ENV_BELL); nbEnqueueEnv(2637, 260, BZ_ENV_BELL);
+    nbEnqueueEnv(2093, 800, BZ_ENV_BELL);
+  } else if (strcmp(id, "gentle") == 0) {
+    // Three soft four-note figures, each a step higher, then one bell.
+    static const uint16_t n[3][4] = { { 1047, 1319, 1568, 1319 },
+                                      { 1175, 1397, 1760, 1397 },
+                                      { 1319, 1568, 2093, 1568 } };
+    for (int p = 0; p < 3; p++) {
+      for (int i = 0; i < 4; i++) nbEnqueueEnv(n[p][i], 260, BZ_ENV_PLUCK);
+      nbEnqueue(0, 200);
+    }
+    nbEnqueueEnv(2093, 900, BZ_ENV_BELL);
+  } else {
+    // "classic" and anything unrecognised: the two-tone alarm everybody knows.
+    for (int r = 0; r < 7; r++) { nbEnqueue(1200, 130); nbEnqueue(0, 60); nbEnqueue(900, 130); nbEnqueue(0, 60); }
+  }
+}
+
+// Minutes from now until the next alarm that is switched on, or -1 if there is
+// none. It walks forward one day at a time instead of reasoning about the
+// calendar, so midnight, the end of the week and "already gone for today" are
+// all the same case. Eight steps rather than seven: an alarm set for one day a
+// week is exactly a week away when today is that day and the time has passed.
+static int alarmMinutesUntilNext(int* outIdx) {
+  if (outIdx) *outIdx = -1;
+  struct tm ti;
+  if (!readLocalTime(ti)) return -1;
+  int nowMin = ti.tm_hour * 60 + ti.tm_min;
+  int best = -1, bestIdx = -1;
+  for (int i = 0; i < ALARM_COUNT; i++) {
+    if (!alarms[i].present || !alarms[i].enabled || alarms[i].days == 0) continue;
+    int at = alarms[i].hour * 60 + alarms[i].minute;
+    for (int d = 0; d <= 7; d++) {
+      if (!(alarms[i].days & ALARM_WDAY_BIT((ti.tm_wday + d) % 7))) continue;
+      int delta = d * 1440 + at - nowMin;
+      if (delta < 0) continue;
+      // The minute it is ringing in, or has already rung in, is behind us.
+      if (delta == 0 && alarmFired[i]) continue;
+      if (best < 0 || delta < best) { best = delta; bestIdx = i; }
+      break;
+    }
+  }
+  if (outIdx) *outIdx = bestIdx;
+  return best;
+}
+
+static void alarmStartRinging(int idx) {
+  // An alarm nobody can see is half an alarm.
+  sleepWake();
+  alarmRinging     = true;
+  alarmRingingIdx  = (int8_t)idx;
+  alarmRingStartMs = millis();
+  alarmToneNextMs  = 0;
+  if (buzzerOn) {
+    nbStop();
+    alarmEnqueueTone(alarms[idx].tone);
+  }
+}
+
+void alarmStopRinging() {
+  if (!alarmRinging) return;
+  alarmRinging    = false;
+  alarmRingingIdx = -1;
+  alarmToneNextMs = 0;
+  nbStop();
+}
+
+// Feeds the buzzer another pass of the tone once the last one has drained. The
+// gap is measured from the moment the queue empties, not from when it started,
+// so a long tone and a short one both get the same pause between repeats.
+static void alarmToneTick() {
+  if (!alarmRinging || !buzzerOn) return;
+  if (nbBusy()) { alarmToneNextMs = 0; return; }
+  unsigned long now = millis();
+  if (alarmToneNextMs == 0) { alarmToneNextMs = now + ALARM_TONE_GAP_MS; return; }
+  if ((long)(now - alarmToneNextMs) < 0) return;
+  alarmToneNextMs = 0;
+  if (alarmRingingIdx >= 0) alarmEnqueueTone(alarms[alarmRingingIdx].tone);
+}
+
+// Called every pass through loop(). Everything it decides is a function of the
+// wall clock, so a reboot changes nothing: the alarms come back from NVS and the
+// first tick after the clock is set picks up where it left off.
+static void alarmTick() {
+  // Taken out of the Tile Manager means switched off, the same as it does for
+  // every other priority tile - and a tile that is gone cannot be silenced.
+  if (prioHiddenMask & (1u << PRIORITY_ID_ALARM)) {
+    if (alarmRinging) alarmStopRinging();
+    return;
+  }
+  if (alarmRinging && (millis() - alarmRingStartMs >= ALARM_MAX_RING_MS)) alarmStopRinging();
+
+  // Four times a second is ample for something that acts on whole minutes, and
+  // it keeps even the cheap clock read off the critical path.
+  static unsigned long lastCheckMs = 0;
+  unsigned long nowMs = millis();
+  if (nowMs - lastCheckMs < 250) return;
+  lastCheckMs = nowMs;
+
+  struct tm ti;
+  if (!readLocalTime(ti)) return;
+
+  uint8_t todayBit = ALARM_WDAY_BIT(ti.tm_wday);
+  for (int i = 0; i < ALARM_COUNT; i++) {
+    bool match = alarms[i].present &&
+                 alarms[i].enabled &&
+                 (alarms[i].days & todayBit) &&
+                 ti.tm_hour == alarms[i].hour &&
+                 ti.tm_min  == alarms[i].minute;
+    if (!match)        { alarmFired[i] = false; continue; }
+    if (alarmFired[i]) continue;
+    // Two alarms set to the same minute both latch here, but only the first in
+    // index order starts ringing: the second would otherwise queue up behind it
+    // and ask to be stopped a second time for the same minute.
+    alarmFired[i] = true;
+    if (!alarmRinging) alarmStartRinging(i);
+  }
+}
+
 // BUZZER BLOCKING (for non-touch events)
 
-void playPresetTone(const char* id) {
-  if (!buzzerOn) return;
-  if (strcmp(id, "none") == 0) return;
-  if (strcmp(id, "calm") == 0) {
-    tone(BUZZER_PIN, 1000, 80); delay(80);
-  } else if (strcmp(id, "loud") == 0) {
-    tone(BUZZER_PIN, 1500, 130); delay(130);
-  } else if (strcmp(id, "urgent") == 0) {
-    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1800, 60); delay(75); }
-  } else if (strcmp(id, "soft") == 0) {
-    tone(BUZZER_PIN, 650, 60); delay(60);
-  } else if (strcmp(id, "double") == 0) {
-    tone(BUZZER_PIN, 1200, 70); delay(90);
-    tone(BUZZER_PIN, 1200, 70); delay(70);
-  } else if (strcmp(id, "triple") == 0) {
-    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1200, 60); delay(80); }
-  } else if (strcmp(id, "chime") == 0) {
-    tone(BUZZER_PIN, 523, 90);  delay(95);
-    tone(BUZZER_PIN, 659, 90);  delay(95);
-    tone(BUZZER_PIN, 784, 130); delay(130);
-  } else if (strcmp(id, "bell") == 0) {
-    tone(BUZZER_PIN, 1568, 60);  delay(60);
-    tone(BUZZER_PIN, 1318, 70);  delay(70);
-    tone(BUZZER_PIN, 1046, 160); delay(160);
-  } else if (strcmp(id, "doorbell") == 0) {
-    tone(BUZZER_PIN, 784, 160); delay(170);
-    tone(BUZZER_PIN, 659, 220); delay(220);
-  } else if (strcmp(id, "xylophone") == 0) {
-    int notes[5] = {659, 784, 880, 988, 1175};
-    for (int i = 0; i < 5; i++) { tone(BUZZER_PIN, notes[i], 55); delay(60); }
-  } else if (strcmp(id, "harp") == 0) {
-    for (int f = 1400; f >= 500; f -= 45) { tone(BUZZER_PIN, f, 18); delay(14); }
-  } else if (strcmp(id, "marimba") == 0) {
-    tone(BUZZER_PIN, 440, 110); delay(115);
-    tone(BUZZER_PIN, 220, 160); delay(160);
-  } else if (strcmp(id, "crystal") == 0) {
-    tone(BUZZER_PIN, 1568, 45); delay(48);
-    tone(BUZZER_PIN, 1976, 45); delay(48);
-    tone(BUZZER_PIN, 2349, 90); delay(90);
-  } else if (strcmp(id, "wave") == 0) {
-    for (int f = 400; f <= 1000; f += 30) { tone(BUZZER_PIN, f, 12); delay(10); }
-    for (int f = 1000; f >= 400; f -= 30) { tone(BUZZER_PIN, f, 12); delay(10); }
-  } else if (strcmp(id, "lullaby") == 0) {
-    int notes[4] = {784, 659, 587, 523};
-    for (int i = 0; i < 4; i++) { tone(BUZZER_PIN, notes[i], 140); delay(150); }
-  } else if (strcmp(id, "pingpong") == 0) {
-    for (int i = 0; i < 4; i++) {
-      tone(BUZZER_PIN, i % 2 == 0 ? 1200 : 800, 55);
-      delay(65);
-    }
-  } else if (strcmp(id, "sos") == 0) {
-    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 60); delay(75); }
-    delay(80);
-    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 180); delay(200); }
-    delay(80);
-    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 1500, 60); delay(75); }
-  } else if (strcmp(id, "siren") == 0) {
-    for (int f = 400; f <= 1800; f += 70) { tone(BUZZER_PIN, f, 18); delay(15); }
-    for (int f = 1800; f >= 400; f -= 70) { tone(BUZZER_PIN, f, 18); delay(15); }
-  } else if (strcmp(id, "klaxon") == 0) {
-    for (int i = 0; i < 6; i++) { tone(BUZZER_PIN, i % 2 == 0 ? 1000 : 1400, 45); delay(55); }
-  } else if (strcmp(id, "laser") == 0) {
-    for (int f = 2500; f >= 300; f -= 100) { tone(BUZZER_PIN, f, 10); delay(8); }
-  } else if (strcmp(id, "robot") == 0) {
-    int notes[5] = {900, 1300, 700, 1600, 1000};
-    for (int i = 0; i < 5; i++) { tone(BUZZER_PIN, notes[i], 40); delay(55); }
-  } else if (strcmp(id, "fanfare") == 0) {
-    tone(BUZZER_PIN, 523, 90);   delay(100);
-    tone(BUZZER_PIN, 659, 90);   delay(100);
-    tone(BUZZER_PIN, 784, 90);   delay(100);
-    tone(BUZZER_PIN, 1046, 220); delay(220);
-  } else if (strcmp(id, "powerdown") == 0) {
-    for (int f = 1200; f >= 200; f -= 50) { tone(BUZZER_PIN, f, 14); delay(11); }
-  } else if (strcmp(id, "powerup") == 0) {
-    for (int f = 200; f <= 1200; f += 50) { tone(BUZZER_PIN, f, 14); delay(11); }
-  } else if (strcmp(id, "heartbeat") == 0) {
-    tone(BUZZER_PIN, 150, 80); delay(120);
-    tone(BUZZER_PIN, 150, 60); delay(280);
-    tone(BUZZER_PIN, 150, 80); delay(120);
-    tone(BUZZER_PIN, 150, 60); delay(60);
-  } else if (strcmp(id, "scifi") == 0) {
-    for (int i = 0; i < 2; i++) {
-      for (int f = 600; f <= 1600; f += 80) { tone(BUZZER_PIN, f, 12); delay(10); }
-      for (int f = 1600; f >= 600; f -= 80) { tone(BUZZER_PIN, f, 12); delay(10); }
-    }
-  } else if (strcmp(id, "arcade") == 0) {
-    int notes[4] = {800, 1000, 1200, 1600};
-    for (int i = 0; i < 4; i++) { tone(BUZZER_PIN, notes[i], 45); delay(53); }
-  } else if (strcmp(id, "zen") == 0) {
-    tone(BUZZER_PIN, 220, 400); delay(400);
-  } else if (strcmp(id, "bubble") == 0) {
-    int notes[5] = {600, 900, 1200, 1500, 1800};
-    for (int i = 0; i < 5; i++) { tone(BUZZER_PIN, notes[i], 30); delay(40); }
-  } else if (strcmp(id, "whistle") == 0) {
-    for (int f = 800; f <= 2000; f += 40) { tone(BUZZER_PIN, f, 12); delay(9); }
-  } else if (strcmp(id, "boldalert") == 0) {
-    for (int i = 0; i < 4; i++) {
-      tone(BUZZER_PIN, 300, 70);  delay(80);
-      tone(BUZZER_PIN, 1200, 70); delay(80);
-    }
-  } else {
-    tone(BUZZER_PIN, 1000, 80); delay(80);
-  }
-  noTone(BUZZER_PIN);
-}
 void beepSwitch() {
   if (!buzzerOn) return;
-  nbPlayPreset(eventSoundTile);
+  nbPlayPreset(eventSoundTile, BZ_CAT_AUTO);
 }
 
 void beepTouch() {
   if (!buzzerOn) return;
-  nbPlayPreset(eventSoundTouch);
+  nbPlayPreset(eventSoundTouch, BZ_CAT_TOUCH);
 }
 
 // CUSTOM FONT
@@ -1289,12 +2217,26 @@ const uint8_t CHAR_DOT[1]   = {0x40};
 // Font mode constants (moved up from below so they're visible to appendGlyphAuto)
 #define FONT_MODE_DEFAULT 0
 #define FONT_MODE_TIKO    1
+#define FONT_MODE_MAKO    2
+#define FONT_MODE_COUNT   3
 #define TIKO_MAX_COLS 5
 
+// Tiko and Mako are both drawn from a glyph table of our own rather than the
+// library font, so every place that asked "is it Tiko?" really means "is it
+// one of ours?" - and then has to ask the right table.
+uint8_t tikoGetChar(char ch, uint8_t size, uint8_t* buf);
+uint8_t makoGetChar(char ch, uint8_t size, uint8_t* buf);
+static inline bool isPixelFont(uint8_t m) {
+  return m == FONT_MODE_TIKO || m == FONT_MODE_MAKO;
+}
+static inline uint8_t pixGetChar(uint8_t m, char ch, uint8_t size, uint8_t* buf) {
+  return (m == FONT_MODE_MAKO) ? makoGetChar(ch, size, buf) : tikoGetChar(ch, size, buf);
+}
+
 static void appendGlyphAuto(uint8_t* buf, int& count, int maxCount, char ch, uint8_t fontMode = FONT_MODE_DEFAULT) {
-  if (fontMode == FONT_MODE_TIKO) {
+  if (isPixelFont(fontMode)) {
     uint8_t tmp[TIKO_MAX_COLS];
-    uint8_t n = tikoGetChar(ch, sizeof(tmp), tmp);
+    uint8_t n = pixGetChar(fontMode, ch, sizeof(tmp), tmp);
     if (n == 0) return;
     for (int i = 0; i < n && count < maxCount; i++) buf[count++] = tmp[i];
     if (count < maxCount) buf[count++] = 0x00;
@@ -1435,8 +2377,176 @@ uint8_t tikoGetChar(char ch, uint8_t size, uint8_t* buf) {
   return n;
 }
 
+// ============================================================
+// MICRO FONT (3x5) - only for the Hour and Weekday tile, where the
+// weekday has to sit next to a full Tiko time. Same column layout
+// as TIKO_FONT (bit 0 = top row); W is the only 5-column letter.
+// Holds just the capitals the RO/EN weekday names use.
+// ============================================================
+const TikoGlyph MICRO_FONT[] = {
+  { 'A', 3, { 0x1E, 0x05, 0x1E } },
+  { 'D', 3, { 0x1F, 0x11, 0x0E } },
+  { 'E', 3, { 0x1F, 0x15, 0x11 } },
+  { 'F', 3, { 0x1F, 0x05, 0x01 } },
+  { 'H', 3, { 0x1F, 0x04, 0x1F } },
+  { 'I', 3, { 0x11, 0x1F, 0x11 } },
+  { 'J', 3, { 0x08, 0x10, 0x0F } },
+  { 'L', 3, { 0x1F, 0x10, 0x10 } },
+  { 'M', 3, { 0x1F, 0x02, 0x1F } },
+  { 'N', 3, { 0x1F, 0x01, 0x1E } },
+  { 'O', 3, { 0x0E, 0x11, 0x0E } },
+  { 'R', 3, { 0x1F, 0x05, 0x1A } },
+  { 'S', 3, { 0x12, 0x15, 0x09 } },
+  { 'T', 3, { 0x01, 0x1F, 0x01 } },
+  { 'U', 3, { 0x1F, 0x10, 0x1F } },
+  { 'V', 3, { 0x0F, 0x10, 0x0F } },
+  { 'W', 5, { 0x1F, 0x08, 0x04, 0x08, 0x1F } },
+};
+const uint8_t MICRO_FONT_COUNT = sizeof(MICRO_FONT) / sizeof(MICRO_FONT[0]);
+
+// Case-insensitive like tikoGetChar(); returns 0 for a letter it lacks.
+// buf must hold TIKO_MAX_COLS bytes.
+static uint8_t microGetChar(char ch, uint8_t* buf) {
+  char up = (ch >= 'a' && ch <= 'z') ? (ch - 32) : ch;
+  for (uint8_t gi = 0; gi < MICRO_FONT_COUNT; gi++) {
+    if (MICRO_FONT[gi].ch == up) {
+      memcpy(buf, MICRO_FONT[gi].data, MICRO_FONT[gi].cols);
+      return MICRO_FONT[gi].cols;
+    }
+  }
+  return 0;
+}
+
+// ============================================================
+// MAKO FONT (4x7 custom pixel font) - the third option, between
+// Tiko's 3-wide capitals and Marymba's 5-wide library look.
+// Rounded bowls and cut corners; real lowercase with a 5-row
+// x-height and descenders on row 7. Digits are all exactly 4
+// columns so the clock centres the same whatever the time.
+// Same column encoding as Tiko: bit r is row r, r=0 is the top.
+// Generated from the ASCII drawings in mako_font.py.
+// ============================================================
+const TikoGlyph MAKO_FONT[] = {
+  { '0', 4, { 0x3E, 0x41, 0x41, 0x3E } },
+  { '1', 4, { 0x00, 0x42, 0x7F, 0x40 } },
+  { '2', 4, { 0x62, 0x51, 0x49, 0x46 } },
+  { '3', 4, { 0x41, 0x49, 0x49, 0x36 } },
+  { '4', 4, { 0x0C, 0x0A, 0x09, 0x7F } },
+  { '5', 4, { 0x27, 0x45, 0x45, 0x39 } },
+  { '6', 4, { 0x3E, 0x49, 0x49, 0x30 } },
+  { '7', 4, { 0x01, 0x71, 0x09, 0x07 } },
+  { '8', 4, { 0x36, 0x49, 0x49, 0x36 } },
+  { '9', 4, { 0x06, 0x49, 0x49, 0x3E } },
+  { 'A', 4, { 0x7E, 0x09, 0x09, 0x7E } },
+  { 'B', 4, { 0x7F, 0x49, 0x49, 0x36 } },
+  { 'C', 4, { 0x3E, 0x41, 0x41, 0x22 } },
+  { 'D', 4, { 0x7F, 0x41, 0x41, 0x3E } },
+  { 'E', 4, { 0x7F, 0x49, 0x49, 0x41 } },
+  { 'F', 4, { 0x7F, 0x09, 0x09, 0x01 } },
+  { 'G', 4, { 0x3E, 0x41, 0x49, 0x7A } },
+  { 'H', 4, { 0x7F, 0x08, 0x08, 0x7F } },
+  { 'I', 3, { 0x41, 0x7F, 0x41 } },
+  { 'J', 4, { 0x30, 0x40, 0x41, 0x3F } },
+  { 'K', 4, { 0x7F, 0x08, 0x14, 0x63 } },
+  { 'L', 4, { 0x7F, 0x40, 0x40, 0x40 } },
+  { 'M', 5, { 0x7F, 0x02, 0x0C, 0x02, 0x7F } },
+  { 'N', 4, { 0x7F, 0x06, 0x18, 0x7F } },
+  { 'O', 4, { 0x3E, 0x41, 0x41, 0x3E } },
+  { 'P', 4, { 0x7F, 0x09, 0x09, 0x06 } },
+  { 'Q', 4, { 0x3E, 0x41, 0x21, 0x5E } },
+  { 'R', 4, { 0x7F, 0x09, 0x19, 0x66 } },
+  { 'S', 4, { 0x46, 0x49, 0x49, 0x31 } },
+  { 'T', 5, { 0x01, 0x01, 0x7F, 0x01, 0x01 } },
+  { 'U', 4, { 0x3F, 0x40, 0x40, 0x3F } },
+  { 'V', 4, { 0x1F, 0x60, 0x60, 0x1F } },
+  { 'W', 5, { 0x7F, 0x20, 0x18, 0x20, 0x7F } },
+  { 'X', 4, { 0x63, 0x1C, 0x1C, 0x63 } },
+  { 'Y', 4, { 0x07, 0x78, 0x78, 0x07 } },
+  { 'Z', 4, { 0x61, 0x51, 0x4D, 0x43 } },
+  { 'a', 4, { 0x20, 0x54, 0x54, 0x78 } },
+  { 'b', 4, { 0x7F, 0x44, 0x44, 0x38 } },
+  { 'c', 4, { 0x38, 0x44, 0x44, 0x44 } },
+  { 'd', 4, { 0x38, 0x44, 0x44, 0x7F } },
+  { 'e', 4, { 0x38, 0x54, 0x54, 0x58 } },
+  { 'f', 3, { 0x7E, 0x05, 0x05 } },
+  { 'g', 4, { 0x98, 0xA4, 0xA4, 0x7C } },
+  { 'h', 4, { 0x7F, 0x04, 0x04, 0x78 } },
+  { 'i', 1, { 0x7D } },
+  { 'j', 2, { 0x80, 0x7D } },
+  { 'k', 4, { 0x7F, 0x10, 0x28, 0x44 } },
+  { 'l', 2, { 0x3F, 0x40 } },
+  { 'm', 5, { 0x7C, 0x04, 0x78, 0x04, 0x78 } },
+  { 'n', 4, { 0x7C, 0x04, 0x04, 0x78 } },
+  { 'o', 4, { 0x38, 0x44, 0x44, 0x38 } },
+  { 'p', 4, { 0xFC, 0x24, 0x24, 0x18 } },
+  { 'q', 4, { 0x18, 0x24, 0x24, 0xFC } },
+  { 'r', 3, { 0x7C, 0x08, 0x04 } },
+  { 's', 4, { 0x48, 0x54, 0x54, 0x24 } },
+  { 't', 3, { 0x04, 0x3F, 0x44 } },
+  { 'u', 4, { 0x3C, 0x40, 0x40, 0x7C } },
+  { 'v', 4, { 0x1C, 0x60, 0x60, 0x1C } },
+  { 'w', 5, { 0x3C, 0x40, 0x30, 0x40, 0x3C } },
+  { 'x', 4, { 0x6C, 0x10, 0x10, 0x6C } },
+  { 'y', 4, { 0x1C, 0xA0, 0xA0, 0x7C } },
+  { 'z', 4, { 0x64, 0x54, 0x4C, 0x44 } },
+  { '.', 1, { 0x40 } },
+  { ',', 2, { 0x80, 0x60 } },
+  { ':', 1, { 0x36 } },
+  { ';', 2, { 0x40, 0x36 } },
+  { '!', 1, { 0x5F } },
+  { '?', 4, { 0x02, 0x51, 0x09, 0x06 } },
+  { '-', 3, { 0x08, 0x08, 0x08 } },
+  { '+', 3, { 0x08, 0x1C, 0x08 } },
+  { '=', 3, { 0x14, 0x14, 0x14 } },
+  { '/', 3, { 0x60, 0x1C, 0x03 } },
+  { '\\', 3, { 0x03, 0x1C, 0x60 } },
+  { '(', 2, { 0x3E, 0x41 } },
+  { ')', 2, { 0x41, 0x3E } },
+  { '[', 2, { 0x7F, 0x41 } },
+  { ']', 2, { 0x41, 0x7F } },
+  { '\'', 1, { 0x03 } },
+  { '"', 3, { 0x03, 0x00, 0x03 } },
+  { '%', 4, { 0x13, 0x0B, 0x34, 0x32 } },
+  { '*', 3, { 0x0A, 0x04, 0x0A } },
+  { '#', 5, { 0x12, 0x3F, 0x12, 0x3F, 0x12 } },
+  { '_', 4, { 0x80, 0x80, 0x80, 0x80 } },
+  { '<', 3, { 0x08, 0x14, 0x22 } },
+  { '>', 3, { 0x22, 0x14, 0x08 } },
+  { '^', 3, { 0x02, 0x01, 0x02 } },
+  { '~', 4, { 0x10, 0x08, 0x10, 0x08 } },
+  { '`', 2, { 0x01, 0x02 } },
+  { '|', 1, { 0x7F } },
+};
+const uint8_t MAKO_FONT_COUNT = sizeof(MAKO_FONT) / sizeof(MAKO_FONT[0]);
+const uint8_t MAKO_DEG[3] = { 0x02, 0x05, 0x02 };  // 3-wide ring, the same shape Tiko draws
+
+// Like tikoGetChar, but case-sensitive - Mako has its own lowercase - and
+// anything it does not draw (@, &, $...) falls back to the Marymba glyph
+// instead of a gap, so a notification never silently loses a character.
+uint8_t makoGetChar(char ch, uint8_t size, uint8_t* buf) {
+  if (ch == ' ') {
+    uint8_t n = (2 <= size) ? 2 : size;
+    for (uint8_t i = 0; i < n; i++) buf[i] = 0x00;
+    return n;
+  }
+  for (uint8_t gi = 0; gi < MAKO_FONT_COUNT; gi++) {
+    if (MAKO_FONT[gi].ch == ch) {
+      uint8_t n = (MAKO_FONT[gi].cols <= size) ? MAKO_FONT[gi].cols : size;
+      for (uint8_t i = 0; i < n; i++) buf[i] = MAKO_FONT[gi].data[i];
+      return n;
+    }
+  }
+  return mx.getChar(ch, size, buf);
+}
+
+// The degree sign both of our fonts draw next to a temperature (3 columns).
+static inline const uint8_t* pixDeg(uint8_t m) {
+  return (m == FONT_MODE_MAKO) ? MAKO_DEG : TIKO_DEG;
+}
+
 // FONT_MODE_DEFAULT = 0 ("Marymba", the existing library/FONT[] look)
-// FONT_MODE_TIKO    = 1 (new 3x7 custom font)
+// FONT_MODE_TIKO    = 1 (3x7 custom font)
+// FONT_MODE_MAKO    = 2 (4x7 custom font with lowercase)
 // (defined earlier, near appendGlyphAuto, so they're visible where first used)
 
 const uint8_t wifiLogo[8] = {
@@ -1469,14 +2579,141 @@ void drawApScreen() {
 
   mx.setColumn(31 - 8, 0x00);
 
-  uint8_t tmpA[8]; uint8_t nA = mx.getChar('A', sizeof(tmpA), tmpA);
-  for (int i = 0; i < nA; i++) mx.setColumn(31 - (9 + i), tmpA[i]);
-  mx.setColumn(31 - (9 + nA), 0x00);
-
-  uint8_t tmpP[8]; uint8_t nP = mx.getChar('P', sizeof(tmpP), tmpP);
-  for (int i = 0; i < nP; i++) mx.setColumn(31 - (9 + nA + 1 + i), tmpP[i]);
+  // In the font picked under Tile Manager -> Font Type, like the tiles.
+  uint8_t lbl[23]; int lblN = 0;
+  appendGlyphAuto(lbl, lblN, sizeof(lbl), 'A', fontType);
+  appendGlyphAuto(lbl, lblN, sizeof(lbl), 'P', fontType);
+  for (int i = 0; i < lblN; i++) mx.setColumn(31 - (9 + i), lbl[i]);
 
   mxCommit();
+}
+
+// LOADING ANIMATION
+//
+// A gap of LOAD_GAP pixels running clockwise around the 24-pixel perimeter of an
+// 8x8 rounded box. 24 perimeter positions means 24 frames and exactly one full
+// turn, with every position visited once - so the loop is seamless and needs no
+// stored frame table: 24 frames x 8 rows would be 192 bytes of flash holding
+// data that is fully derivable from the frame index.
+#define LOAD_FRAMES   24
+#define LOAD_GAP       3
+#define LOAD_FRAME_MS 55
+
+// Wi-Fi connect window, and how much of it the Wi-Fi logo keeps to itself
+// before the spinner takes over - cutting to the spinner immediately made the
+// logo look like it had been yanked off the panel.
+#define WIFI_CONNECT_ATTEMPTS 20   // x500ms -> 10s ceiling on the wait
+#define LOAD_LOGO_HOLD_PCT    20   // logo holds for the first fifth of it
+
+// The AP badge gets the same treatment on the way in: long enough to read that
+// the mode changed, then the spinner while the access point comes up.
+#define AP_SCREEN_HOLD_MS 2000
+
+// Maps a perimeter position (0..23, clockwise starting at the top-left) to the
+// pixel it lights.
+static inline void loadPerimeterPixel(uint8_t idx, uint8_t& row, uint8_t& col) {
+  idx %= LOAD_FRAMES;
+  if (idx < 6)       { row = 0;        col = idx + 1;  }   // top,    left  -> right
+  else if (idx < 12) { row = idx - 5;  col = 7;        }   // right,  top   -> bottom
+  else if (idx < 18) { row = 7;        col = 18 - idx; }   // bottom, right -> left
+  else               { row = 24 - idx; col = 0;        }   // left,   bottom-> top
+}
+
+// Builds one frame as 8 row bytes (MSB = leftmost column), the same layout the
+// static icons above use.
+static void buildLoadFrame(uint8_t frame, uint8_t rows[8]) {
+  for (uint8_t i = 0; i < 8; i++) rows[i] = 0;
+  uint8_t gapStart = (uint8_t)((frame + 3) % LOAD_FRAMES);
+  for (uint8_t k = 0; k < LOAD_FRAMES; k++) {
+    if ((uint8_t)((k + LOAD_FRAMES - gapStart) % LOAD_FRAMES) < LOAD_GAP) continue;
+    uint8_t r, c;
+    loadPerimeterPixel(k, r, c);
+    rows[r] |= (uint8_t)(0x80 >> c);
+  }
+}
+
+// Spinner on the left, "Load" next to it.
+void drawLoadingScreen(uint8_t frame) {
+  uint8_t rows[8];
+  buildLoadFrame(frame, rows);
+
+  mx.update(MD_MAX72XX::OFF);
+  for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
+
+  for (int col = 0; col < 8; col++) {
+    uint8_t colVal = 0;
+    for (int row = 0; row < 8; row++) {
+      if (rows[row] & (0x80 >> col)) colVal |= (1 << row);
+    }
+    mx.setColumn(31 - col, colVal);
+  }
+
+  // Build the text into a column buffer first so its width is known and it can
+  // be centred in the space left of the icon instead of risking a clipped tail.
+  uint8_t txtCols[24];
+  int nTxt = 0;
+  const char* txt = "Load";
+  for (const char* p = txt; *p; p++) {
+    uint8_t tmp[8];
+    uint8_t n = mx.getChar(*p, sizeof(tmp), tmp);
+    for (uint8_t i = 0; i < n && nTxt < (int)sizeof(txtCols); i++) txtCols[nTxt++] = tmp[i];
+    if (p[1] && nTxt < (int)sizeof(txtCols)) txtCols[nTxt++] = 0x00;  // letter spacing
+  }
+
+  const int textStart = 9;                     // one blank column after the icon
+  int avail = 32 - textStart;
+  int at = textStart + (nTxt < avail ? (avail - nTxt) / 2 : 0);
+  for (int i = 0; i < nTxt && at < 32; i++) mx.setColumn(31 - at++, txtCols[i]);
+
+  mxCommit();
+}
+
+// Keeps the spinner turning for `ms` milliseconds instead of blocking on a bare
+// delay(). The frame counter is static so a wait split across several calls
+// carries on from where the previous one stopped - the animation never restarts
+// mid-spin, however many times it is called.
+static uint8_t loadAnimFrame = 0;
+
+static void loadAnimWait(uint16_t ms) {
+  uint32_t start = millis();
+  do {
+    drawLoadingScreen(loadAnimFrame);
+    loadAnimFrame = (uint8_t)((loadAnimFrame + 1) % LOAD_FRAMES);
+    delay(LOAD_FRAME_MS);
+  } while ((uint32_t)(millis() - start) < ms);
+}
+
+// autoDetectTimezone() blocks on an HTTP request for up to 5s, which would
+// otherwise freeze the spinner mid-turn. Give it the same treatment the
+// weather and currency fetches already get - run it on core 0 and keep
+// animating on this one until it reports back. The guard is well past the 5s
+// HTTP timeout, so a wedged request can never hold up boot indefinitely.
+static volatile bool tzDetectBusy = false;
+
+static void tzDetectTask(void* pv) {
+  autoDetectTimezone();
+  tzDetectBusy = false;
+  vTaskDelete(nullptr);
+}
+
+// Same task, but nobody waits for it - safe to call from an HTTP handler,
+// where blocking for the 5s lookup would stall the whole loop.
+static void tzDetectAsync() {
+  if (tzDetectBusy) return;
+  tzDetectBusy = true;
+  if (xTaskCreatePinnedToCore(tzDetectTask, "tzDetect", 8192, nullptr, 1, nullptr, 0) != pdPASS)
+    tzDetectBusy = false;
+}
+
+static void autoDetectTimezoneAnimated() {
+  tzDetectBusy = true;
+  if (xTaskCreatePinnedToCore(tzDetectTask, "tzDetect", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
+    tzDetectBusy = false;
+    autoDetectTimezone();          // could not spawn the task - run it inline
+    return;
+  }
+  uint32_t start = millis();
+  while (tzDetectBusy && (uint32_t)(millis() - start) < 12000) loadAnimWait(LOAD_FRAME_MS);
 }
 
 const uint8_t musicIcon[8] = {
@@ -1516,7 +2753,10 @@ const uint8_t mementoIcon[8] = {
 char     mementoBuf[128]        = "";
 NpState  mementoState           = NP_SHOW_START;
 unsigned long mementoPauseMs    = 0;
-static uint8_t  mementoColBuf[512];
+// Room for the whole text in the widest font (6 columns a letter with the
+// gap) plus the icon. At 512 anything past ~85 characters was cut off.
+#define MEMENTO_COL_MAX 800
+static uint8_t  mementoColBuf[MEMENTO_COL_MAX];
 static int      mementoColCount = 0;
 static int      mementoScrollPos = 0;
 static unsigned long mementoLastScrollMs = 0;
@@ -1747,12 +2987,12 @@ static void tempAddGlyph(const uint8_t* glyph, int width = 5) {
 }
 
 // Shared helper: returns a pointer-friendly digit glyph (0-9) for
-// either the classic 5-wide FONT[] table or the new 3-wide Tiko
-// font, and reports its column width via 'width'. 'tmp' must be
+// the classic 5-wide FONT[] table, 3-wide Tiko or 4-wide Mako,
+// and reports its column width via 'width'. 'tmp' must be
 // at least TIKO_MAX_COLS bytes and stays valid until reused.
 static const uint8_t* digitGlyph(uint8_t fontMode, int d, uint8_t* tmp, int& width) {
-  if (fontMode == FONT_MODE_TIKO) {
-    width = tikoGetChar((char)('0' + d), TIKO_MAX_COLS, tmp);
+  if (isPixelFont(fontMode)) {
+    width = pixGetChar(fontMode, (char)('0' + d), TIKO_MAX_COLS, tmp);
     return tmp;
   }
   width = 5;
@@ -1760,9 +3000,9 @@ static const uint8_t* digitGlyph(uint8_t fontMode, int d, uint8_t* tmp, int& wid
 }
 
 static void dateAddDot() {
-  if (fontTypeDate == FONT_MODE_TIKO) {
+  if (isPixelFont(fontTypeDate)) {
     uint8_t tmp[TIKO_MAX_COLS];
-    uint8_t n = tikoGetChar('.', TIKO_MAX_COLS, tmp);
+    uint8_t n = pixGetChar(fontTypeDate, '.', TIKO_MAX_COLS, tmp);
     for (int i = 0; i < n && dateColCount < 126; i++) dateColBuf[dateColCount++] = tmp[i];
     if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
     return;
@@ -1785,40 +3025,55 @@ static void scrollBufPrependIcon(uint8_t* buf, int& count, int maxCount, const u
 }
 
 void tempBuildBuffer(int tempC) {
-  int temp = (tempUnit == 1) ? (tempC * 9 / 5 + 32) : tempC;
+  int temp = (tempC == TEMP_NO_READING) ? 0
+           : (tempUnit == 1) ? (tempC * 9 / 5 + 32) : tempC;
   tempColCount = 0;
   if (scrollIconInBuffer(scrollTypeTemp) && !hideIconTemp) {
     scrollBufPrependIcon(tempColBuf, tempColCount, 127, resolveTileIcon(iconSelTemp, tempIcon), TEMP_ICON_COLS);
   }
 
-  bool negative = (temp < 0);
-  int  absTemp  = abs(temp);
-  bool tiko = (fontTypeTemp == FONT_MODE_TIKO);
+  bool tiko = isPixelFont(fontTypeTemp);   // Tiko or Mako
 
-  if (negative) {
-    const uint8_t* minusGlyph = tiko ? TIKO_MINUS : nullptr;
-    int minusW = tiko ? 3 : 3;
-    for (int i = 0; i < minusW && tempColCount < 126; i++)
-      tempColBuf[tempColCount++] = tiko ? minusGlyph[i] : 0x08;
-    if (tempColCount < 127) tempColBuf[tempColCount++] = 0x00;
-  }
-
-  uint8_t dtmp[TIKO_MAX_COLS]; int dw;
-  if (absTemp >= 100) {
-    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 100, dtmp, dw), dw);
-    tempAddGlyph(digitGlyph(fontTypeTemp, (absTemp / 10) % 10, dtmp, dw), dw);
-    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
-  } else if (absTemp >= 10) {
-    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 10, dtmp, dw), dw);
-    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
+  if (tempC == TEMP_NO_READING) {
+    // No usable reading yet. Draw "--" followed by the unit rather than
+    // leaving the buffer empty: an empty buffer meant tempDrawAtPos() wrote 32
+    // blank columns and the matrix stayed black for the tile's whole slot,
+    // which reads as a broken clock instead of a quiet sensor. This also
+    // matches the "--" the web dashboard already shows for the same state.
+    for (int rep = 0; rep < 2; rep++) {
+      for (int i = 0; i < 3 && tempColCount < 126; i++)
+        tempColBuf[tempColCount++] = tiko ? TIKO_MINUS[i] : 0x08;
+      if (tempColCount < 127) tempColBuf[tempColCount++] = 0x00;
+    }
   } else {
-    tempAddGlyph(digitGlyph(fontTypeTemp, absTemp, dtmp, dw), dw);
+    bool negative = (temp < 0);
+    int  absTemp  = abs(temp);
+
+    if (negative) {
+      const uint8_t* minusGlyph = tiko ? TIKO_MINUS : nullptr;
+      int minusW = tiko ? 3 : 3;
+      for (int i = 0; i < minusW && tempColCount < 126; i++)
+        tempColBuf[tempColCount++] = tiko ? minusGlyph[i] : 0x08;
+      if (tempColCount < 127) tempColBuf[tempColCount++] = 0x00;
+    }
+
+    uint8_t dtmp[TIKO_MAX_COLS]; int dw;
+    if (absTemp >= 100) {
+      tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 100, dtmp, dw), dw);
+      tempAddGlyph(digitGlyph(fontTypeTemp, (absTemp / 10) % 10, dtmp, dw), dw);
+      tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
+    } else if (absTemp >= 10) {
+      tempAddGlyph(digitGlyph(fontTypeTemp, absTemp / 10, dtmp, dw), dw);
+      tempAddGlyph(digitGlyph(fontTypeTemp, absTemp % 10, dtmp, dw), dw);
+    } else {
+      tempAddGlyph(digitGlyph(fontTypeTemp, absTemp, dtmp, dw), dw);
+    }
   }
 
   if (tiko) {
-    tempAddGlyph(TIKO_DEG, 3);
+    tempAddGlyph(pixDeg(fontTypeTemp), 3);
     uint8_t utmp[TIKO_MAX_COLS];
-    uint8_t uw = tikoGetChar((tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
+    uint8_t uw = pixGetChar(fontTypeTemp, (tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
     tempAddGlyph(utmp, uw);
   } else {
     tempAddGlyph(CHAR_DEG);
@@ -1833,10 +3088,12 @@ void tempDrawAtPos(int pos) {
 
   if (!hideIconTemp && !scrollIconInBuffer(scrollTypeTemp)) {
 
+    // Resolved once rather than 64 times inside the loop below.
+    const uint8_t* tempIconBmp = resolveTileIcon(iconSelTemp, tempIcon);
     for (int col = 0; col < TEMP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (resolveTileIcon(iconSelTemp, tempIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (tempIconBmp[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -1877,10 +3134,6 @@ void tempInit(int tempC) {
   }
 }
 
-void drawTemp(int tempC) {
-  tempInit(tempC);
-}
-
 // ATMOSPHERIC PRESSURE 
 
 #define PRESSURE_HISTORY_LEN      6
@@ -1899,19 +3152,108 @@ static inline const uint8_t* pressureIconForTrend() {
   return resolveTileIcon(iconSelPressure, base);
 }
 
+// Brings up the BMP280 at either of its two possible addresses. Also used as
+// the recovery path, so it must be safe to call repeatedly.
+static bool bmpInitSensor() {
+  if (!(bmp.begin(0x76) || bmp.begin(0x77))) {
+    bmpOk = false;
+    return false;
+  }
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X16,
+                  Adafruit_BMP280::STANDBY_MS_500);
+  bmpOk = true;
+  return true;
+}
+
+// A slave interrupted mid-byte (brown-out, ESD, a knocked jumper) keeps SDA
+// pulled low and the bus is then dead for everyone - Wire just times out on
+// every transaction. Nine manual clock pulses walk it out of that byte, then a
+// manual STOP releases the bus.
+static void i2cBusRecover() {
+  Wire.end();
+  pinMode(BMP_SCL, OUTPUT_OPEN_DRAIN);
+  pinMode(BMP_SDA, INPUT_PULLUP);
+  digitalWrite(BMP_SCL, HIGH);
+  for (int i = 0; i < 9 && digitalRead(BMP_SDA) == LOW; i++) {
+    digitalWrite(BMP_SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(BMP_SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(BMP_SDA, OUTPUT_OPEN_DRAIN);
+  digitalWrite(BMP_SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(BMP_SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(BMP_SDA, HIGH); delayMicroseconds(5);
+  Wire.begin(BMP_SDA, BMP_SCL);
+}
+
+// Single guarded read. The range test is written positively so a NaN - what a
+// missing sensor produces - is rejected too.
+static bool bmpReadTempC(float& out) {
+  float t = bmp.readTemperature();
+  if (!(t >= -40.0f && t <= 85.0f)) {
+    if (bmpFailStreak < 255) bmpFailStreak++;
+    return false;
+  }
+  bmpFailStreak = 0;
+  bmpOk         = true;
+  out           = t;
+  return true;
+}
+
+// Called from loop(). Cheap while the sensor is healthy; when it is not, it
+// retries with backoff so a permanently absent sensor costs one begin() attempt
+// per minute instead of one per iteration.
+static void bmpHealthTick() {
+  if (bmpOk && bmpFailStreak < BMP_FAIL_LIMIT) return;
+
+  unsigned long now = millis();
+  if (bmpNextRetryMs != 0 && (long)(now - bmpNextRetryMs) < 0) return;
+
+  bmpOk = false;
+  i2cBusRecover();
+  if (bmpInitSensor()) {
+    Serial.println("[bmp] senzor reinitializat");
+    bmpFailStreak      = 0;
+    bmpRetryBackoffMs  = BMP_RETRY_MIN_MS;
+    lastTempSampleMs   = 0;   // resample on the very next tick
+    lastPressureReadMs = 0;
+  } else {
+    bmpRetryBackoffMs *= 2;
+    if (bmpRetryBackoffMs > BMP_RETRY_MAX_MS) bmpRetryBackoffMs = BMP_RETRY_MAX_MS;
+  }
+  bmpNextRetryMs = millis() + bmpRetryBackoffMs;
+}
+
 void tempSampleTick() {
   unsigned long now = millis();
   if (lastTempSampleMs != 0 && (now - lastTempSampleMs) < TEMP_SAMPLE_INTERVAL_MS) return;
   lastTempSampleMs = now;
-  float tf = bmp.readTemperature();
-  if (tf >= -40 && tf <= 85) {
-    lastTemp = (int)round(tf);
-  }
+  float tf;
+  if (bmpReadTempC(tf)) lastTemp = (int)round(tf);
 }
 
 void pressureSampleTick() {
+  // This used to hit the sensor on every single loop() iteration - thousands of
+  // I2C transactions a second (readPressure() reads the temperature registers
+  // too), which is both wasted time and the most likely way to wedge the bus in
+  // the first place. Atmospheric pressure does not move that fast.
+  unsigned long readNow = millis();
+  if (lastPressureReadMs != 0 && (readNow - lastPressureReadMs) < BMP_READ_INTERVAL_MS) return;
+  lastPressureReadMs = readNow;
+
   float hpa = bmp.readPressure() / 100.0F;
-  if (hpa < 850 || hpa > 1100) return;
+  // Written as a positive range test so a NaN reading (failed/absent sensor) is
+  // rejected too. `hpa < 850 || hpa > 1100` is false for NaN, which let NaN
+  // through to lastPressureHpa - and /state then serialised (int)round(NaN),
+  // which is undefined behaviour and can emit a garbage pressureHpa value.
+  if (!(hpa >= 850 && hpa <= 1100)) {
+    // Counts towards the same failure streak as a bad temperature read, so
+    // bmpHealthTick() can recover a sensor that only fails on this register.
+    if (bmpFailStreak < 255) bmpFailStreak++;
+    return;
+  }
   lastPressureHpa = hpa;
 
   unsigned long now = millis();
@@ -2171,7 +3513,7 @@ static void currencyFetchTask(void* pv) {
                         : (strcasecmp(currencyBase, "EUR") == 0 ? "USD" : "EUR");
 
   struct tm ti;
-  if (getLocalTime(&ti)) {
+  if (readLocalTime(ti)) {
     time_t nowEpoch = mktime(&ti);
     time_t monthAgoEpoch = nowEpoch - (30L * 24L * 60L * 60L);
     struct tm* tiMonthAgo = gmtime(&monthAgoEpoch);
@@ -2223,6 +3565,264 @@ static void currencyFetchPoll() {
       currencyRateMonthAgo = currFetchRateMonthAgo;
       currencyTrend        = currFetchTrend;
     }
+  }
+}
+
+// SUBSCRIBER COUNTER TILE (YouTube)
+//
+// Shows the subscriber count as "icon + number", scrolling when the number does
+// not fit - same behaviour as the currency tile.
+//
+// Only YouTube is implemented: it is the one platform of the obvious three that
+// publishes a usable public endpoint (Data API v3, with a free API key). TikTok
+// and Instagram expose no follower count without either an approved OAuth app or
+// a third-party scraper, so tiles for them would have had no dependable source.
+// The structure below is kept indexable so another platform can be slotted in if
+// a workable source ever appears.
+
+#define SOCIAL_COUNT 1
+#define SOC_YT 0
+#define SOCIAL_FETCH_INTERVAL_MS (10UL * 60UL * 1000UL)
+
+struct SocialCfg {
+  char     handle[80];    // channel link, @handle or channel id
+  char     apiKey[80];    // YouTube Data API key
+  uint32_t count;
+  bool     valid;
+  bool     showName;      // false: "12400"   true: "NUME: 12400"
+};
+SocialCfg     social[SOCIAL_COUNT];
+unsigned long lastSocialFetch[SOCIAL_COUNT] = { 0 };
+
+uint8_t iconSelYoutube = 0;
+
+static inline int socialIndexForItem(uint8_t id) {
+  return (id == ITEM_YOUTUBE) ? SOC_YT : -1;
+}
+
+static const uint8_t* socialIcon(int i) {
+  (void)i;
+  // Reuses the existing video glyph unless the user picked one in Icon Settings.
+  return resolveTileIcon(iconSelYoutube, videoIcon);
+}
+
+// --- render -----------------------------------------------------------------
+static uint8_t  socColBuf[128];
+static int      socColCount = 0;
+static int      socScrollPos = 0;
+static unsigned long socLastScrollMs = 0;
+static NpState  socState = NP_SHOW_START;
+static unsigned long socPauseMs = 0;
+static bool     socNeedsScroll = false;
+static int      socWrapPass = 0;
+static int      socActiveIdx = -1;
+
+static void socBufAppend(char ch) {
+  appendGlyphAuto(socColBuf, socColCount, 127, ch, fontTypeYoutube);
+}
+
+// Turns whatever the user typed - a full link, an @handle or a bare name - into
+// something short enough to sit in front of the count. The '@' is dropped on
+// purpose: the Tiko font has no glyph for it and would render a blank gap.
+static void socialDisplayName(int i, char* out, size_t n) {
+  const char* h = social[i].handle;
+  const char* p = strrchr(h, '/');
+  p = p ? p + 1 : h;
+  if (*p == '@') p++;
+  size_t len = 0;
+  while (p[len] != '\0' && p[len] != '?' && len < n - 1) len++;
+  memcpy(out, p, len);
+  out[len] = '\0';
+}
+
+void socialBuildBuffer(int i) {
+  socColCount = 0;
+  if (scrollIconInBuffer(scrollTypeYoutube) && !hideIconYoutube) {
+    scrollBufPrependIcon(socColBuf, socColCount, 127, socialIcon(i), PRESSURE_ICON_COLS);
+  }
+  char txt[96];
+  char num[16];
+  if (social[i].valid) snprintf(num, sizeof(num), "%lu", (unsigned long)social[i].count);
+  else                 strcpy(num, "...");
+
+  if (social[i].showName) {
+    char name[32];
+    socialDisplayName(i, name, sizeof(name));
+    if (name[0] != '\0') snprintf(txt, sizeof(txt), "%s: %s", name, num);
+    else                 snprintf(txt, sizeof(txt), "%s", num);
+  } else {
+    snprintf(txt, sizeof(txt), "%s", num);
+  }
+
+  for (int ci = 0; txt[ci] != '\0'; ci++) socBufAppend(txt[ci]);
+  if (socColCount > 0) socColCount--;
+}
+
+void socialDrawAtPos(int pos) {
+  int i = socActiveIdx;
+  if (i < 0) return;
+  mx.update(MD_MAX72XX::OFF);
+
+  // Blank first so no pixel from the previous frame can survive in a column
+  // this one does not write.
+  for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
+
+  if (!hideIconYoutube && !scrollIconInBuffer(scrollTypeYoutube)) {
+    const uint8_t* icon = socialIcon(i);
+    for (int col = 0; col < PRESSURE_ICON_COLS; col++) {
+      uint8_t colVal = 0;
+      for (int row = 0; row < 8; row++) {
+        if (icon[row] & (0x80 >> col)) colVal |= (1 << row);
+      }
+      int physCol = 31 - col;
+      if (physCol >= 0 && physCol < 32) mx.setColumn(physCol, colVal);
+    }
+  }
+
+  bool fullWidth = hideIconYoutube || scrollIconInBuffer(scrollTypeYoutube);
+  int textOffset = fullWidth ? 0 : (PRESSURE_ICON_COLS + PRESSURE_SEP_COLS);
+  int textCols   = fullWidth ? 32 : PRESSURE_TEXT_COLS;
+  for (int c = 0; c < textCols; c++) {
+    int srcCol = pos + c;
+    uint8_t colVal = (srcCol >= 0 && srcCol < socColCount) ? socColBuf[srcCol] : 0x00;
+    int physCol = 31 - (textOffset + c);
+    if (physCol >= 0 && physCol < 32) mx.setColumn(physCol, colVal);
+  }
+  mxCommit();
+}
+
+void socialInit(uint8_t itemId) {
+  int i = socialIndexForItem(itemId);
+  if (i < 0) return;
+  socActiveIdx = i;
+
+  mx.update(MD_MAX72XX::OFF);
+  for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
+  mxCommit();
+
+  socialBuildBuffer(i);
+  int effTextCols = (hideIconYoutube || scrollIconInBuffer(scrollTypeYoutube)) ? 32 : PRESSURE_TEXT_COLS;
+  socNeedsScroll = (socColCount > effTextCols);
+  socWrapPass    = 0;
+
+  socScrollPos = 0;
+  if (socNeedsScroll) {
+    socState   = NP_PAUSE_BEFORE_RIGHT;
+    socPauseMs = millis();
+  } else {
+    // Fits on the matrix: leave the scroll state machine idle. Nothing is
+    // offset - the icon sits at the left edge and the number follows it.
+    socState = NP_SHOW_START;
+  }
+  socialDrawAtPos(0);
+}
+
+// --- fetch ------------------------------------------------------------------
+// The API returns subscriberCount as a *string*, so it is read as one and
+// converted rather than relying on an implicit numeric cast.
+static bool socialFetchYouTube(int i, uint32_t& out) {
+  if (social[i].apiKey[0] == '\0' || social[i].handle[0] == '\0') return false;
+
+  String h = String(social[i].handle);
+  h.trim();
+  String param;
+  int at = h.lastIndexOf('@');
+  if (at >= 0) {
+    String tail = h.substring(at + 1);
+    int slash = tail.indexOf('/');
+    if (slash >= 0) tail = tail.substring(0, slash);
+    param = "forHandle=@" + urlEncode(tail);
+  } else {
+    int slash = h.lastIndexOf('/');
+    String tail = (slash >= 0) ? h.substring(slash + 1) : h;
+    int q = tail.indexOf('?');
+    if (q >= 0) tail = tail.substring(0, q);
+    param = tail.startsWith("UC") ? ("id=" + urlEncode(tail))
+                                  : ("forUsername=" + urlEncode(tail));
+  }
+
+  String url = "https://www.googleapis.com/youtube/v3/channels?part=statistics&" +
+               param + "&key=" + urlEncode(String(social[i].apiKey));
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(8000);
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    String body = http.getString();
+    DynamicJsonDocument doc(2048);
+    if (!deserializeJson(doc, body)) {
+      const char* s = doc["items"][0]["statistics"]["subscriberCount"] | (const char*)nullptr;
+      if (s && *s) { out = (uint32_t)strtoul(s, nullptr, 10); ok = true; }
+    }
+  } else {
+    Serial.printf("[social] YouTube HTTP %d\n", code);
+  }
+  http.end();
+  return ok;
+}
+
+// Runs on core 0 like the weather and currency fetches, so the matrix and the
+// web server are never blocked by the request.
+static volatile bool socialFetchBusy  = false;
+static volatile bool socialFetchReady = false;
+static volatile int  socialFetchIdx   = -1;
+static volatile bool socialFetchOk    = false;
+static uint32_t      socialFetchValue = 0;
+
+static void socialFetchTask(void* pv) {
+  int i = socialFetchIdx;
+  uint32_t n = 0;
+  bool ok = false;
+  if (i >= 0 && WiFi.status() == WL_CONNECTED) {
+    ok = socialFetchYouTube(i, n);
+  }
+  socialFetchValue = n;
+  socialFetchOk    = ok;
+  socialFetchReady = true;
+  socialFetchBusy  = false;
+  vTaskDelete(nullptr);
+}
+
+void socialFetch(int i) {
+  if (i < 0 || i >= SOCIAL_COUNT) return;
+  if (socialFetchBusy) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  lastSocialFetch[i] = millis();
+  socialFetchIdx   = i;
+  socialFetchBusy  = true;
+  socialFetchReady = false;
+  xTaskCreatePinnedToCore(socialFetchTask, "socFetch", 8192, nullptr, 1, nullptr, 0);
+}
+
+// Cheap check from loop(); only does work once a fetch has landed.
+static void socialFetchPoll() {
+  if (!socialFetchReady) return;
+  socialFetchReady = false;
+  int i = socialFetchIdx;
+  if (i < 0 || i >= SOCIAL_COUNT) return;
+  if (socialFetchOk) {
+    social[i].count = socialFetchValue;
+    social[i].valid = true;
+    if (items[currentSlot].id == ITEM_YOUTUBE + i) socialInit(items[currentSlot].id);
+  }
+}
+
+// Refreshes whichever tiles are enabled, one at a time.
+static void socialTickFetch() {
+  if (socialFetchBusy) return;
+  for (int i = 0; i < SOCIAL_COUNT; i++) {
+    uint8_t id = ITEM_YOUTUBE + i;
+    // Cheapest question first. The items[] scan used to run on every pass
+    // through loop(); now it only runs once a refresh is actually due.
+    if (lastSocialFetch[i] != 0 && millis() - lastSocialFetch[i] < SOCIAL_FETCH_INTERVAL_MS) continue;
+    if (!tileInManager(id)) continue;
+    bool enabled = false;
+    for (int k = 0; k < NUM_ITEMS; k++)
+      if (items[k].id == id && items[k].enabled) { enabled = true; break; }
+    if (!enabled) continue;
+    socialFetch(i);
+    return;
   }
 }
 
@@ -2292,6 +3892,7 @@ bool ets2Tick() {
     else if (cur.id == ITEM_MEMENTO) mementoInit();
     else if (cur.id == ITEM_CANVAS) drawCanvas();
     else if (cur.id == ITEM_CURRENCY) currencyInit();
+    else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
     else { gLastStaticDrawMs = 0; gStaticDrawDone = false; }
     finishP2CTransition();
     return false;
@@ -2338,9 +3939,9 @@ const char* const WEEKDAY_NAMES_EN[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fr
 const char* const WEEKDAY_NAMES_RO[7] = { "Dum", "Lun", "Mar", "Mie", "Joi", "Vin", "Sam" };
 
 static void dateAddChar(char ch) {
-  if (fontTypeDate == FONT_MODE_TIKO) {
+  if (isPixelFont(fontTypeDate)) {
     uint8_t tmp[TIKO_MAX_COLS];
-    uint8_t n = tikoGetChar(ch, sizeof(tmp), tmp);
+    uint8_t n = pixGetChar(fontTypeDate, ch, sizeof(tmp), tmp);
     if (n == 0) return;
     for (int i = 0; i < n && dateColCount < 126; i++) dateColBuf[dateColCount++] = tmp[i];
     if (dateColCount < 127) dateColBuf[dateColCount++] = 0x00;
@@ -2509,10 +4110,12 @@ void dateDrawAtPos(int pos) {
 
   if (!hideIconDate && !scrollIconInBuffer(scrollTypeDate)) {
 
+    // Resolved once rather than 64 times inside the loop below.
+    const uint8_t* dateIconBmp = resolveTileIcon(iconSelDate, dateIcon);
     for (int col = 0; col < DATE_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (resolveTileIcon(iconSelDate, dateIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (dateIconBmp[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -2531,9 +4134,12 @@ void dateDrawAtPos(int pos) {
   mxCommit();
 }
 
-void dateInit() {
+// Returns whether it actually put something on the panel. The caller has
+// already cleared the display by the time this runs, so "did not draw" and
+// "left the panel blank" are the same thing, and the caller has to know.
+bool dateInit() {
   struct tm ti;
-  if (!getLocalTime(&ti)) return;
+  if (!readLocalTime(ti)) return false;
   int day   = ti.tm_mday;
   int month = ti.tm_mon + 1;
   int year  = ti.tm_year + 1900;
@@ -2558,6 +4164,7 @@ void dateInit() {
     if (offset < 0) offset = 0;
     dateDrawAtPos(-offset);
   }
+  return true;
 }
 
 void drawDate() {
@@ -2566,7 +4173,7 @@ void drawDate() {
 
 void drawHour() {
   struct tm ti;
-  if (!getLocalTime(&ti)) return;
+  if (!readLocalTime(ti)) return;
   int h     = ti.tm_hour;
   int m     = ti.tm_min;
   int s     = ti.tm_sec;
@@ -2583,14 +4190,19 @@ void drawHour() {
   mx.update(MD_MAX72XX::OFF);
   for (int i = 0; i < 32; i++) mx.setColumn(i, 0x00);
 
-  bool twoDigitH = (h >= 10);
-  bool tiko = (fontType == FONT_MODE_TIKO);
-  int digitW = tiko ? 3 : 5;
+  // A leading zero only ever adds the tens digit; the centring below already
+  // works off twoDigitH, so nothing else has to change.
+  bool twoDigitH = (h >= 10) || hourLeadingZero;
+  bool tiko = isPixelFont(fontType);   // Tiko or Mako
+  // Every font keeps its digits one width, so the width of '0' is the width
+  // of all of them: Marymba 5, Mako 4, Tiko 3. The centring below needs it.
+  uint8_t w0tmp[TIKO_MAX_COLS]; int digitW;
+  digitGlyph(fontType, 0, w0tmp, digitW);
 
   uint8_t colonTmp[TIKO_MAX_COLS];
   const uint8_t* colonGlyph = CHAR_COLON;
   int colonW = 2;
-  if (tiko) { colonW = tikoGetChar(':', TIKO_MAX_COLS, colonTmp); colonGlyph = colonTmp; }
+  if (tiko) { colonW = pixGetChar(fontType, ':', TIKO_MAX_COLS, colonTmp); colonGlyph = colonTmp; }
 
   int totalWidth = (twoDigitH ? 2 : 1) * (digitW + 1) + (colonW + 1) + 2 * digitW + 1;
   int col = (32 - totalWidth) / 2;
@@ -2611,11 +4223,78 @@ void drawHour() {
   mxCommit();
 }
 
+// Hour and Weekday tile: Tiko time on one side, the weekday in the Micro font
+// centred in 13 columns on the other, and a one-row bar across those 13 either
+// under the day (day on rows 0-4, bar on 6) or over it (bar on 0, day on 2-6),
+// so both line up with the 7-row time. The time takes columns 0..16 and the day
+// 19..31, or with hwSwap the day 0..12 and the time 15..31. Redrawn every
+// 200 ms, like drawHour().
+static int hwPutCols(uint8_t* fb, int col, const uint8_t* g, int n, int shift) {
+  for (int i = 0; i < n; i++, col++)
+    if (col >= 0 && col < 32) fb[col] |= (uint8_t)(g[i] << shift);
+  return col;
+}
+
+void drawHourWeekday() {
+  struct tm ti;
+  if (!readLocalTime(ti)) return;
+  int h = ti.tm_hour;
+  if (hwFormat == 1) {
+    h = h % 12;
+    if (h == 0) h = 12;
+  }
+  bool twoDigitH = (h >= 10) || hwLeadZero;
+
+  uint8_t fb[32] = { 0 };
+  uint8_t g[TIKO_MAX_COLS];
+
+  // 3-column digits with a gap after each, and a one-column colon instead of
+  // Tiko's three-wide one, or "12:45 WED" would not fit. It hugs the day: on
+  // the left it ends at column 16, on the right it starts at 15, so the gap
+  // between the two is the same both ways.
+  int col = hwSwap ? 15 : 17 - ((twoDigitH ? 7 : 3) + 3 + 7);
+  if (twoDigitH) {
+    tikoGetChar((char)('0' + h / 10), sizeof(g), g);
+    col = hwPutCols(fb, col, g, 3, 0) + 1;
+  }
+  tikoGetChar((char)('0' + h % 10), sizeof(g), g);
+  col = hwPutCols(fb, col, g, 3, 0) + 1;
+  if (ti.tm_sec % 2 == 0) fb[col] |= 0x36;
+  col += 2;
+  tikoGetChar((char)('0' + ti.tm_min / 10), sizeof(g), g);
+  col = hwPutCols(fb, col, g, 3, 0) + 1;
+  tikoGetChar((char)('0' + ti.tm_min % 10), sizeof(g), g);
+  hwPutCols(fb, col, g, 3, 0);
+
+  bool above = (hwBarPos == HW_BAR_ABOVE);
+  int dayX = hwSwap ? 0 : 19;   // first of the 13 columns the day and bar share
+  const char* day = (dateLang == 1) ? WEEKDAY_NAMES_RO[ti.tm_wday] : WEEKDAY_NAMES_EN[ti.tm_wday];
+  int dayW = -1;
+  for (const char* p = day; *p; p++) dayW += microGetChar(*p, g) + 1;
+  // Centred in its 13 columns; "WED", the widest name, fills them exactly.
+  col = dayX + (dayW < 13 ? (13 - dayW) / 2 : 0);
+  for (const char* p = day; *p; p++) {
+    uint8_t n = microGetChar(*p, g);
+    col = hwPutCols(fb, col, g, n, above ? 2 : 0) + 1;
+  }
+
+  int barEnd = dayX + ((hwBarMode == HW_BAR_SECONDS) ? ti.tm_sec * 13 / 60 : 12);
+  for (int c = dayX; c <= barEnd; c++) fb[c] |= above ? 0x01 : 0x40;
+
+  mx.update(MD_MAX72XX::OFF);
+  for (int c = 0; c < 32; c++) mx.setColumn(31 - c, fb[c]);
+  mxCommit();
+}
+
 // NP MANUAL SCROLL
-#define NP_SCROLL_SPEED_MS 40
+#define NP_SCROLL_SPEED_MS SCROLL_SPEED_DEFAULT
+
 #define NP_DISPLAY_COLS    32
 
-static uint8_t  npColBuf[512];
+// Room for the whole text in the widest font (6 columns a letter with the
+// gap) plus the icon. At 512 anything past ~85 characters was cut off.
+#define NP_COL_MAX 1830
+static uint8_t  npColBuf[NP_COL_MAX];
 static int      npColCount  = 0;
 static int      npScrollPos = 0;
 static unsigned long npLastScrollMs = 0;
@@ -2623,15 +4302,15 @@ static unsigned long npLastScrollMs = 0;
 
 void npBuildBuffer() {
 
-  char cleanBuf[128];
+  char cleanBuf[sizeof(nowPlayingBuf)];
   sanitizeUtf8(nowPlayingBuf, cleanBuf, sizeof(cleanBuf));
 
   npColCount = 0;
   if (scrollIconInBuffer(scrollTypeNowPlaying) && !hideIconNowPlaying) {
-    scrollBufPrependIcon(npColBuf, npColCount, 512, npResolvedIcon(), NP_ICON_COLS);
+    scrollBufPrependIcon(npColBuf, npColCount, NP_COL_MAX, npResolvedIcon(), NP_ICON_COLS);
   }
-  for (int ci = 0; cleanBuf[ci] != '\0' && npColCount < 500; ci++) {
-    appendGlyphAuto(npColBuf, npColCount, 512, cleanBuf[ci], fontTypeNowPlaying);
+  for (int ci = 0; cleanBuf[ci] != '\0' && npColCount < NP_COL_MAX - 12; ci++) {
+    appendGlyphAuto(npColBuf, npColCount, NP_COL_MAX, cleanBuf[ci], fontTypeNowPlaying);
   }
 
   if (npColCount > 0) npColCount--;
@@ -2741,7 +4420,7 @@ bool swPriorityTick() {
     swWasActive = true;
     beginC2PCapture();
     swInit();
-    finishC2PTransition();
+    finishC2PTransition(tileTransSw, tileTransSpd[TRSPD_SW]);
     return true;
   }
 
@@ -2771,7 +4450,7 @@ bool swPriorityTick() {
       break;
 
     case NP_SCROLL_WRAP: {
-      if (now - swLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - swLastScrollMs >= spd(SPD_STOPWATCH)) {
         swLastScrollMs = now;
         swScrollPos++;
         if (swScrollPos >= swColCount) {
@@ -2795,7 +4474,7 @@ bool swPriorityTick() {
         swPauseStartMs = now;
         break;
       }
-      if (now - swLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - swLastScrollMs >= spd(SPD_STOPWATCH)) {
         swLastScrollMs = now;
         swScrollPos++;
         swDrawAtPos(swScrollPos);
@@ -2816,7 +4495,7 @@ bool swPriorityTick() {
       break;
 
     case NP_SCROLL_LEFT:
-      if (now - swLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - swLastScrollMs >= spd(SPD_STOPWATCH)) {
         swLastScrollMs = now;
         swScrollPos--;
         if (swScrollPos <= 0) {
@@ -2925,7 +4604,7 @@ void timerTickRender() {
       }
       break;
     case NP_SCROLL_WRAP:
-      if (now - timerLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - timerLastScrollMs >= spd(SPD_TIMER)) {
         timerLastScrollMs = now;
         timerScrollPos++;
         if (timerScrollPos >= timerColCount) {
@@ -2939,7 +4618,7 @@ void timerTickRender() {
     case NP_SCROLL_RIGHT: {
       int maxPos = timerColCount - 32;
       if (maxPos <= 0) { timerState = NP_PAUSE_SHORT; timerPauseStartMs = now; break; }
-      if (now - timerLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - timerLastScrollMs >= spd(SPD_TIMER)) {
         timerLastScrollMs = now;
         timerScrollPos++;
         timerDrawAtPos(timerScrollPos);
@@ -2955,7 +4634,7 @@ void timerTickRender() {
       if (now - timerPauseStartMs >= NP_PAUSE_MS) { timerState = NP_SCROLL_LEFT; timerLastScrollMs = now; }
       break;
     case NP_SCROLL_LEFT:
-      if (now - timerLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - timerLastScrollMs >= spd(SPD_TIMER)) {
         timerLastScrollMs = now;
         timerScrollPos--;
         if (timerScrollPos <= 0) {
@@ -3004,7 +4683,7 @@ bool timerPriorityTick() {
     timerWasActive = true;
     beginC2PCapture();
     timerInit();
-    finishC2PTransition();
+    finishC2PTransition(tileTransTmr, tileTransSpd[TRSPD_TMR]);
     return true;
   }
   if (timerFinished) {
@@ -3024,33 +4703,128 @@ bool timerPriorityTick() {
   return true;
 }
 
+// ALARM DISPLAY
+//
+// A ringing alarm shows the clock, blinking, so the panel is still telling you
+// the time while it asks to be stopped. HH:MM in 24h whatever the hour tile is
+// set to, because that is the way the alarm itself was entered. Five glyphs
+// never come near 32 columns, so there is nothing here to scroll.
+
+static uint8_t alarmColBuf[80];
+static int     alarmColCount     = 0;
+bool           alarmBlinkOn      = true;
+unsigned long  alarmBlinkLastMs  = 0;
+#define ALARM_BLINK_MS 450
+
+void alarmBuildBuffer() {
+  char txt[8];
+  struct tm ti;
+  if (readLocalTime(ti)) {
+    snprintf(txt, sizeof(txt), "%02d:%02d", ti.tm_hour, ti.tm_min);
+  } else if (alarmRingingIdx >= 0) {
+    // No clock to read: show what the alarm was set to, which is the only other
+    // honest thing to put there.
+    snprintf(txt, sizeof(txt), "%02u:%02u", (unsigned)alarms[alarmRingingIdx].hour,
+                                            (unsigned)alarms[alarmRingingIdx].minute);
+  } else {
+    strcpy(txt, "--:--");
+  }
+  alarmColCount = 0;
+  for (int ci = 0; txt[ci] != '\0' && alarmColCount < 70; ci++) {
+    appendGlyphAuto(alarmColBuf, alarmColCount, 80, txt[ci], fontType);
+  }
+  if (alarmColCount > 0) alarmColCount--;
+}
+
+void alarmDrawAtPos(int pos) {
+  mx.update(MD_MAX72XX::OFF);
+  for (int col = 0; col < 32; col++) {
+    int src = pos + col;
+    uint8_t val = (src >= 0 && src < alarmColCount) ? alarmColBuf[src] : 0x00;
+    mx.setColumn(31 - col, val);
+  }
+  mxCommit();
+}
+
+void alarmBlankScreen() {
+  mx.update(MD_MAX72XX::OFF);
+  for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
+  mxCommit();
+}
+
+void alarmDrawCentered() {
+  alarmBuildBuffer();
+  alarmDrawAtPos(-((32 - alarmColCount) / 2));
+}
+
+void alarmInit() {
+  alarmBlankScreen();
+  alarmBlinkOn     = true;
+  alarmBlinkLastMs = millis();
+  alarmDrawCentered();
+}
+
+void alarmBlinkTick() {
+  unsigned long now = millis();
+  if (now - alarmBlinkLastMs < ALARM_BLINK_MS) return;
+  alarmBlinkLastMs = now;
+  alarmBlinkOn = !alarmBlinkOn;
+  // Rebuilt on the way back on rather than once at the start, so the minute
+  // rolls over on screen while the alarm is still ringing.
+  if (alarmBlinkOn) alarmDrawCentered();
+  else              alarmBlankScreen();
+}
+
+bool alarmPriorityTick() {
+  if (!alarmRinging) {
+    if (alarmWasActive) {
+      alarmWasActive = false;
+      resumeCircuitTileFromPriority();
+    }
+    return false;
+  }
+  if (!alarmWasActive) {
+    alarmWasActive = true;
+    beginC2PCapture();
+    alarmInit();
+    finishC2PTransition(tileTransAlarm, tileTransSpd[TRSPD_ALARM]);
+    return true;
+  }
+  alarmBlinkTick();
+  return true;
+}
+
 void notifBuildBuffer() {
   char cleanBuf[204];
   sanitizeUtf8(notifBuf, cleanBuf, sizeof(cleanBuf));
   notifColCount = 0;
-  if (scrollIconInBuffer(scrollTypeNotif) && !hideIconNotif) {
-    scrollBufPrependIcon(notifColBuf, notifColCount, 512, resolveTileIcon(iconSelNotif, notifIcon), NP_ICON_COLS);
+  if (scrollIconInBuffer(notifScrollType()) && !notifHideIcon()) {
+    scrollBufPrependIcon(notifColBuf, notifColCount, NOTIF_COL_MAX,
+                         notifIconOverride ? notifIconOverride : resolveTileIcon(iconSelNotif, notifIcon),
+                         NP_ICON_COLS);
   }
-  for (int ci = 0; cleanBuf[ci] != '\0' && notifColCount < 500; ci++) {
-    appendGlyphAuto(notifColBuf, notifColCount, 512, cleanBuf[ci], fontTypeNotif);
+  for (int ci = 0; cleanBuf[ci] != '\0' && notifColCount < NOTIF_COL_MAX - 12; ci++) {
+    appendGlyphAuto(notifColBuf, notifColCount, NOTIF_COL_MAX, cleanBuf[ci], notifFontType());
   }
   if (notifColCount > 0) notifColCount--;
 }
 void notifDrawAtPos(int pos) {
   mx.update(MD_MAX72XX::OFF);
-  if (!hideIconNotif && !scrollIconInBuffer(scrollTypeNotif)) {
+  if (!notifHideIcon() && !scrollIconInBuffer(notifScrollType())) {
 
+    const uint8_t* nIcon = notifIconOverride ? notifIconOverride
+                                             : resolveTileIcon(iconSelNotif, notifIcon);
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (resolveTileIcon(iconSelNotif, notifIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (nIcon[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
     mx.setColumn(31 - NP_ICON_COLS, 0x00);
   }
 
-  bool fullWidth = hideIconNotif || scrollIconInBuffer(scrollTypeNotif);
+  bool fullWidth = notifHideIcon() || scrollIconInBuffer(notifScrollType());
   int textOffset = fullWidth ? 0 : (NP_ICON_COLS + NP_SEP_COLS);
   int textCols   = fullWidth ? 32 : NP_TEXT_COLS;
   for (int col = 0; col < textCols; col++) {
@@ -3075,14 +4849,14 @@ void notifInit() {
 
 // MEMENTO DISPLAY
 void mementoBuildBuffer() {
-  char cleanBuf[128];
+  char cleanBuf[sizeof(mementoBuf)];
   sanitizeUtf8(mementoBuf, cleanBuf, sizeof(cleanBuf));
   mementoColCount = 0;
   if (scrollIconInBuffer(scrollTypeReminder) && !hideIconReminder) {
-    scrollBufPrependIcon(mementoColBuf, mementoColCount, 512, resolveTileIcon(iconSelReminder, mementoIcon), NP_ICON_COLS);
+    scrollBufPrependIcon(mementoColBuf, mementoColCount, MEMENTO_COL_MAX, resolveTileIcon(iconSelReminder, mementoIcon), NP_ICON_COLS);
   }
-  for (int ci = 0; cleanBuf[ci] != '\0' && mementoColCount < 500; ci++) {
-    appendGlyphAuto(mementoColBuf, mementoColCount, 512, cleanBuf[ci], fontTypeReminder);
+  for (int ci = 0; cleanBuf[ci] != '\0' && mementoColCount < MEMENTO_COL_MAX - 12; ci++) {
+    appendGlyphAuto(mementoColBuf, mementoColCount, MEMENTO_COL_MAX, cleanBuf[ci], fontTypeReminder);
   }
   if (mementoColCount > 0) mementoColCount--;
 }
@@ -3091,10 +4865,12 @@ void mementoDrawAtPos(int pos) {
   mx.update(MD_MAX72XX::OFF);
   if (!hideIconReminder && !scrollIconInBuffer(scrollTypeReminder)) {
 
+    // Resolved once rather than 64 times inside the loop below.
+    const uint8_t* memIconBmp = resolveTileIcon(iconSelReminder, mementoIcon);
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (resolveTileIcon(iconSelReminder, mementoIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (memIconBmp[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -3470,6 +5246,8 @@ void resumeAfterNotif() {
     ssRender();
   } else if (cur.id == ITEM_CURRENCY) {
     currencyInit();
+  } else if (socialIndexForItem(cur.id) >= 0) {
+    socialInit(cur.id);
   } else {
     mx.update(MD_MAX72XX::OFF);
     for (int i = 0; i < 32; i++) mx.setColumn(i, 0x00);
@@ -3487,7 +5265,7 @@ bool notifTick() {
       break;
     case NP_PAUSE_BEFORE_RIGHT:
       if (now - notifPauseMs >= NP_PAUSE_MS) {
-        if (scrollIsWrap(scrollTypeNotif)) {
+        if (scrollIsWrap(notifScrollType())) {
           notifWrapPass = 0;
           notifScrollPos = 0;
           notifState = NP_SCROLL_WRAP;
@@ -3498,7 +5276,7 @@ bool notifTick() {
       }
       break;
     case NP_SCROLL_WRAP: {
-      if (now - notifLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - notifLastScrollMs >= notifScrollSpeed()) {
         notifLastScrollMs = now;
         notifScrollPos++;
         if (notifScrollPos >= notifColCount) {
@@ -3506,24 +5284,26 @@ bool notifTick() {
           if (notifWrapPass >= SCROLL_WRAP_PASSES) {
 
             notifActive = false;
+            notifIconOverride = nullptr;
+            webAccessAlertActive = false;
             notifBuf[0] = '\0';
             resumeAfterNotif();
             return false;
           }
-          notifScrollPos = -((hideIconNotif || scrollIconInBuffer(scrollTypeNotif)) ? 32 : NP_TEXT_COLS);
+          notifScrollPos = -((notifHideIcon() || scrollIconInBuffer(notifScrollType())) ? 32 : NP_TEXT_COLS);
         }
         notifDrawAtPos(notifScrollPos);
       }
       break;
     }
     case NP_SCROLL_RIGHT: {
-      int maxPos = notifColCount - ((hideIconNotif || scrollIconInBuffer(scrollTypeNotif)) ? 32 : NP_TEXT_COLS);
+      int maxPos = notifColCount - ((notifHideIcon() || scrollIconInBuffer(notifScrollType())) ? 32 : NP_TEXT_COLS);
       if (maxPos <= 0) {
         notifState = NP_PAUSE_SHORT;
         notifPauseMs = now;
         break;
       }
-      if (now - notifLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - notifLastScrollMs >= notifScrollSpeed()) {
         notifLastScrollMs = now;
         notifScrollPos++;
         notifDrawAtPos(notifScrollPos);
@@ -3542,7 +5322,7 @@ bool notifTick() {
       }
       break;
     case NP_SCROLL_LEFT:
-      if (now - notifLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - notifLastScrollMs >= notifScrollSpeed()) {
         notifLastScrollMs = now;
         notifScrollPos--;
         if (notifScrollPos <= 0) {
@@ -3559,6 +5339,8 @@ bool notifTick() {
       if (now - notifPauseMs >= NP_PAUSE_MS) {
 
         notifActive = false;
+        notifIconOverride = nullptr;
+        webAccessAlertActive = false;
         notifBuf[0] = '\0';
         resumeAfterNotif();
         return false;
@@ -3567,6 +5349,8 @@ bool notifTick() {
     case NP_PAUSE_SHORT:
       if (now - notifPauseMs >= 4000UL) {
         notifActive = false;
+        notifIconOverride = nullptr;
+        webAccessAlertActive = false;
         notifBuf[0] = '\0';
         resumeAfterNotif();
         return false;
@@ -3595,10 +5379,12 @@ void ipDrawAtPos(int pos) {
   mx.update(MD_MAX72XX::OFF);
   if (!hideIconIp && !scrollIconInBuffer(scrollTypeIp)) {
 
+    // Resolved once rather than 64 times inside the loop below.
+    const uint8_t* ipIconBmp = resolveTileIcon(iconSelIp, ipIcon);
     for (int col = 0; col < NP_ICON_COLS; col++) {
       uint8_t colVal = 0;
       for (int row = 0; row < 8; row++) {
-        if (resolveTileIcon(iconSelIp, ipIcon)[row] & (0x80 >> col)) colVal |= (1 << row);
+        if (ipIconBmp[row] & (0x80 >> col)) colVal |= (1 << row);
       }
       mx.setColumn(31 - col, colVal);
     }
@@ -3647,7 +5433,7 @@ bool ipTick() {
       }
       break;
     case NP_SCROLL_WRAP: {
-      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - ipLastScrollMs >= spd(SPD_IP)) {
         ipLastScrollMs = now;
         ipScrollPos++;
         if (ipScrollPos >= ipColCount) {
@@ -3672,7 +5458,7 @@ bool ipTick() {
         ipPauseMs = now;
         break;
       }
-      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - ipLastScrollMs >= spd(SPD_IP)) {
         ipLastScrollMs = now;
         ipScrollPos++;
         ipDrawAtPos(ipScrollPos);
@@ -3691,7 +5477,7 @@ bool ipTick() {
       }
       break;
     case NP_SCROLL_LEFT:
-      if (now - ipLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - ipLastScrollMs >= spd(SPD_IP)) {
         ipLastScrollMs = now;
         ipScrollPos--;
         if (ipScrollPos <= 0) {
@@ -3737,7 +5523,7 @@ void startIpShowFromTouch() {
   ipShowActive = true;
   beginC2PCapture();
   ipInit();
-  finishC2PTransition();
+  finishC2PTransition(tileTransIp, tileTransSpd[TRSPD_IP]);
 }
 
 // NOW PLAYING (Priority Tiles)
@@ -3767,7 +5553,7 @@ bool npPriorityTick() {
     npPriorityWasActive = true;
     beginC2PCapture();
     npInit();
-    finishC2PTransition();
+    finishC2PTransition(tileTransNp, tileTransSpd[TRSPD_NP]);
     return true;
   }
 
@@ -3791,7 +5577,7 @@ bool npPriorityTick() {
       break;
 
     case NP_SCROLL_WRAP: {
-      if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
         npLastScrollMs = now;
         npScrollPos++;
         if (npScrollPos >= npColCount) {
@@ -3815,7 +5601,7 @@ bool npPriorityTick() {
         npPauseStartMs = now;
         break;
       }
-      if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
         npLastScrollMs = now;
         npScrollPos++;
         npDrawAtPos(npScrollPos);
@@ -3836,7 +5622,7 @@ bool npPriorityTick() {
       break;
 
     case NP_SCROLL_LEFT:
-      if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+      if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
         npLastScrollMs = now;
         npScrollPos--;
         if (npScrollPos <= 0) {
@@ -3888,8 +5674,8 @@ static void wxBufAppend(const uint8_t* src, int n, bool gap = true) {
 
 static void wxBufAppendMD(char ch) {
   uint8_t tmp[8];
-  uint8_t n = (fontTypeWeather == FONT_MODE_TIKO)
-                ? tikoGetChar(ch, sizeof(tmp), tmp)
+  uint8_t n = isPixelFont(fontTypeWeather)
+                ? pixGetChar(fontTypeWeather, ch, sizeof(tmp), tmp)
                 : mx.getChar(ch, sizeof(tmp), tmp);
   if (n == 0) return;
   for (int i = 0; i < n && wxColCount < 511; i++)
@@ -3987,9 +5773,19 @@ void weatherBuildBuffer() {
   int  absTemp    = abs(displayTemp);
   bool twoDigit   = (absTemp >= 10);
 
-  bool wxTiko = (fontTypeWeather == FONT_MODE_TIKO);
+  bool wxTiko = isPixelFont(fontTypeWeather);   // Tiko or Mako
   uint8_t dtmp[TIKO_MAX_COLS]; int dw;
 
+  int  hum      = weatherHumidity;
+  bool wantTemp = (wxPreset & WX_SHOW_TEMP) != 0;
+  bool wantHum  = (wxPreset & WX_SHOW_HUM) != 0 && hum >= 0;
+  bool wantDesc = (wxPreset & WX_SHOW_DESC) != 0 && weatherDesc[0] != '\0';
+  // Everything the preset asked for is missing (humidity-only preset with no
+  // humidity reading, say). Fall back to the temperature rather than leaving
+  // the matrix blank for the whole slot.
+  if (!wantTemp && !wantHum && !wantDesc) wantTemp = true;
+
+  if (wantTemp) {
   if (neg) {
     static const uint8_t CHAR_MINUS[3] = {0x08, 0x08, 0x08};
     if (wxTiko) wxBufAppend(TIKO_MINUS, 3);
@@ -4003,9 +5799,9 @@ void weatherBuildBuffer() {
     } else {
       wxBufAppend(digitGlyph(fontTypeWeather, absTemp, dtmp, dw), dw);
     }
-    wxBufAppend(TIKO_DEG, 3);
+    wxBufAppend(pixDeg(fontTypeWeather), 3);
     uint8_t utmp[TIKO_MAX_COLS];
-    uint8_t uw = tikoGetChar((tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
+    uint8_t uw = pixGetChar(fontTypeWeather, (tempUnit == 1) ? 'F' : 'C', TIKO_MAX_COLS, utmp);
     wxBufAppend(utmp, uw);
   } else {
     if (twoDigit) {
@@ -4017,13 +5813,14 @@ void weatherBuildBuffer() {
     wxBufAppend(CHAR_DEG, 5);
     wxBufAppend((tempUnit == 1) ? CHAR_F : CHAR_C, 5);
   }
+  }
 
-  if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
-  if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
-  if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
-
-  int hum = weatherHumidity;
-  if (hum >= 0) {
+  if (wantHum) {
+    if (wantTemp) {
+      if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
+      if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
+      if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
+    }
     int humTens = hum / 10;
     int humOnes = hum % 10;
     if (hum >= 100) {
@@ -4039,13 +5836,16 @@ void weatherBuildBuffer() {
     wxBufAppendMD('%');
   }
 
-  if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
-  if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
-
-  char cleanDesc[48];
-  sanitizeUtf8(weatherDesc, cleanDesc, sizeof(cleanDesc));
-  for (int ci = 0; cleanDesc[ci] != '\0' && wxColCount < 500; ci++)
-    wxBufAppendMD(cleanDesc[ci]);
+  if (wantDesc) {
+    if (wantTemp || wantHum) {
+      if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
+      if (wxColCount < 511) wxColBuf[wxColCount++] = 0x00;
+    }
+    char cleanDesc[48];
+    sanitizeUtf8(weatherDesc, cleanDesc, sizeof(cleanDesc));
+    for (int ci = 0; cleanDesc[ci] != '\0' && wxColCount < 500; ci++)
+      wxBufAppendMD(cleanDesc[ci]);
+  }
 
   if (wxColCount > 0) wxColCount--;
 }
@@ -4220,7 +6020,8 @@ bool higherPriorityTileActive(uint8_t id) {
   if (rank < 0) return false;
   for (int i = 0; i < rank; i++) {
     switch (priorityOrder[i]) {
-      case PRIORITY_ID_NOTIF:      if (notifActive) return true; break;
+      case PRIORITY_ID_NOTIF:      if (notifActive && !webAccessAlertActive) return true; break;
+      case PRIORITY_ID_WEB:        if (notifActive &&  webAccessAlertActive) return true; break;
       case PRIORITY_ID_ETS2:       if (ets2Active) return true; break;
       case PRIORITY_ID_NOWPLAYING: {
         int npIdx = -1;
@@ -4230,37 +6031,50 @@ bool higherPriorityTileActive(uint8_t id) {
       }
       case PRIORITY_ID_STOPWATCH:  if (swRunning) return true; break;
       case PRIORITY_ID_TIMER:      if (timerRunning || timerFinished) return true; break;
+      case PRIORITY_ID_ALARM:      if (alarmRinging) return true; break;
     }
   }
   return false;
+}
+
+// The names the web interface knows these by. Pulled out of
+// priorityOrderToString() so the live marker names them the same way the saved
+// order does - two switches would be two chances to disagree.
+static const char* priorityIdName(uint8_t id) {
+  switch (id) {
+    case PRIORITY_ID_NOTIF:      return "notif";
+    case PRIORITY_ID_WEB:        return "webaccess";
+    case PRIORITY_ID_ETS2:       return "ets2";
+    case PRIORITY_ID_NOWPLAYING: return "nowplaying";
+    case PRIORITY_ID_STOPWATCH:  return "stopwatch";
+    case PRIORITY_ID_TIMER:      return "timer";
+    case PRIORITY_ID_ALARM:      return "alarm";
+  }
+  return "";
 }
 
 String priorityOrderToString() {
   String out = "";
   for (int i = 0; i < NUM_PRIORITY_IDS; i++) {
     if (i > 0) out += ",";
-    switch (priorityOrder[i]) {
-      case PRIORITY_ID_NOTIF:      out += "notif";      break;
-      case PRIORITY_ID_ETS2:       out += "ets2";        break;
-      case PRIORITY_ID_NOWPLAYING: out += "nowplaying";  break;
-      case PRIORITY_ID_STOPWATCH:  out += "stopwatch";   break;
-      case PRIORITY_ID_TIMER:      out += "timer";       break;
-    }
+    out += priorityIdName(priorityOrder[i]);
   }
   return out;
 }
 
 void rebuildPriorityOrderFromEts2Order() {
+  priorityOrder[0] = PRIORITY_ID_ALARM;
   if (ets2OrderFirst) {
-    priorityOrder[0] = PRIORITY_ID_ETS2;
-    priorityOrder[1] = PRIORITY_ID_NOTIF;
-  } else {
-    priorityOrder[0] = PRIORITY_ID_NOTIF;
     priorityOrder[1] = PRIORITY_ID_ETS2;
+    priorityOrder[2] = PRIORITY_ID_NOTIF;
+  } else {
+    priorityOrder[1] = PRIORITY_ID_NOTIF;
+    priorityOrder[2] = PRIORITY_ID_ETS2;
   }
-  priorityOrder[2] = PRIORITY_ID_NOWPLAYING;
-  priorityOrder[3] = PRIORITY_ID_STOPWATCH;
-  priorityOrder[4] = PRIORITY_ID_TIMER;
+  priorityOrder[3] = PRIORITY_ID_NOWPLAYING;
+  priorityOrder[4] = PRIORITY_ID_STOPWATCH;
+  priorityOrder[5] = PRIORITY_ID_TIMER;
+  priorityOrder[6] = PRIORITY_ID_WEB;
 }
 
 // TILE TRANSITIONS: generic transition engine between 32x8 pixel frames
@@ -4301,6 +6115,16 @@ static int easedStepDelay(int s, int steps, int baseDelay, int extraDelay, int e
   return baseDelay + extraDelay * (easeZone - distFromEdge) / easeZone;
 }
 
+// Pace of the transition being played, in percent (see TILE TRANSITION SPEED).
+static uint8_t gTransPct = TRSPD_DEFAULT;
+
+// delay() scaled by that pace: 200 % halves every pause, 50 % doubles it. Never
+// under 1 ms, so even the fastest setting still shows every frame.
+static void transDelay(int ms) {
+  long d = (long)ms * 100 / gTransPct;
+  delay(d > 0 ? (unsigned long)d : 1UL);
+}
+
 static void playScrollTransition(const uint8_t *oldCols, const uint8_t *newCols, bool toLeft) {
   const int GAP = 4; // black columns between tiles, during the scroll
   const int VW  = 32 + GAP + 32;
@@ -4315,7 +6139,7 @@ static void playScrollTransition(const uint8_t *oldCols, const uint8_t *newCols,
       uint8_t frame[32];
       for (int c = 0; c < 32; c++) frame[c] = virt[s + c];
       transWriteCols(frame);
-      delay(easedStepDelay(s, STEPS, 4, 10, 8));
+      transDelay(easedStepDelay(s, STEPS, 4, 10, 8));
     }
   } else {
     // the old tile exits to the right, the new one enters from the left, with black space between them
@@ -4326,7 +6150,7 @@ static void playScrollTransition(const uint8_t *oldCols, const uint8_t *newCols,
       uint8_t frame[32];
       for (int c = 0; c < 32; c++) frame[c] = virt[s + c];
       transWriteCols(frame);
-      delay(easedStepDelay(STEPS - s, STEPS, 4, 10, 8));
+      transDelay(easedStepDelay(STEPS - s, STEPS, 4, 10, 8));
     }
   }
 }
@@ -4344,7 +6168,7 @@ static void playVerticalScrollTransition(const uint8_t *oldCols, const uint8_t *
       frame[c] = (uint8_t)((virtCol >> shift) & 0xFF);
     }
     transWriteCols(frame);
-    delay(easedStepDelay(s, STEPS, 14, 24, 3));
+    transDelay(easedStepDelay(s, STEPS, 14, 24, 3));
   }
 }
 
@@ -4361,17 +6185,17 @@ static void playFadeTransition(const uint8_t *newCols) {
   if (outDelay < 1) outDelay = 1;
   for (int lvl = target; lvl >= 0; lvl--) {
     mx.control(MD_MAX72XX::INTENSITY, (uint8_t)lvl);
-    delay(outDelay);
+    transDelay(outDelay);
   }
 
   transWriteCols(newCols); // change content while the screen is completely off
-  delay(PAUSE_MS);
+  transDelay(PAUSE_MS);
 
   int inDelay = FADE_IN_MS / (target + 1);
   if (inDelay < 1) inDelay = 1;
   for (int lvl = 0; lvl <= target; lvl++) {
     mx.control(MD_MAX72XX::INTENSITY, (uint8_t)lvl);
-    delay(inDelay);
+    transDelay(inDelay);
   }
 }
 
@@ -4394,7 +6218,7 @@ static void playMorphTransition(const uint8_t *oldCols, const uint8_t *newCols) 
       frame[c] = colVal;
     }
     transWriteCols(frame);
-    delay(14);
+    transDelay(14);
   }
   transWriteCols(newCols);
 }
@@ -4440,22 +6264,25 @@ static void playExpandTransition(const uint8_t *oldCols, const uint8_t *newCols,
     uint8_t frame[32];
     expandFrameClose(frame, oldCols, effect, s);
     transWriteCols(frame);
-    delay(6);
+    transDelay(6);
   }
   // black pause between tiles
   transWriteBlank();
-  delay(100);
+  transDelay(100);
   // Phase 2: the new tile "opens" gradually, like in Pokemon, from the chosen direction
   for (int s = 1; s <= STEPS; s++) {
     uint8_t frame[32];
     expandFrameOpen(frame, newCols, effect, s);
     transWriteCols(frame);
-    delay(6);
+    transDelay(6);
   }
   transWriteCols(newCols);
 }
 
-void playTileTransition(uint8_t effect, const uint8_t *oldCols, const uint8_t *newCols) {
+void playTileTransition(uint8_t effect, const uint8_t *oldCols, const uint8_t *newCols, uint8_t pct) {
+  // Out of range - or 0, from a caller with no setting of its own - plays at
+  // the pace the effect was drawn at.
+  gTransPct = (pct >= TRSPD_MIN && pct <= TRSPD_MAX) ? pct : TRSPD_DEFAULT;
   switch (effect) {
     case 1: playScrollTransition(oldCols, newCols, true);          break;
     case 2: playScrollTransition(oldCols, newCols, false);         break;
@@ -4480,19 +6307,48 @@ uint8_t getCircuitTileTransition(uint8_t itemId) {
     case ITEM_PRESSURE:    return tileTransPress;
     case ITEM_SCREENSAVER: return tileTransSs;
     case ITEM_CURRENCY:    return tileTransCurr;
+    case ITEM_YOUTUBE:     return tileTransYt;
+    case ITEM_HOURWEEK:    return tileTransHw;
     default:               return tileTransGlobal;
+  }
+}
+
+// The pace that goes with getCircuitTileTransition()'s effect.
+uint8_t getCircuitTileTransSpeed(uint8_t itemId) {
+  switch (itemId) {
+    case ITEM_HOUR:        return tileTransSpd[TRSPD_HOUR];
+    case ITEM_DATE:        return tileTransSpd[TRSPD_DATE];
+    case ITEM_TEMP:        return tileTransSpd[TRSPD_TEMP];
+    case ITEM_NOW_PLAYING: return tileTransSpd[TRSPD_NP];
+    case ITEM_WEATHER:     return tileTransSpd[TRSPD_WX];
+    case ITEM_MEMENTO:     return tileTransSpd[TRSPD_REM];
+    case ITEM_CANVAS:      return tileTransSpd[TRSPD_CANVAS];
+    case ITEM_PRESSURE:    return tileTransSpd[TRSPD_PRESS];
+    case ITEM_SCREENSAVER: return tileTransSpd[TRSPD_SS];
+    case ITEM_CURRENCY:    return tileTransSpd[TRSPD_CURR];
+    case ITEM_YOUTUBE:     return tileTransSpd[TRSPD_YT];
+    case ITEM_HOURWEEK:    return tileTransSpd[TRSPD_HW];
+    default:               return tileTransSpeed;
   }
 }
 
 static uint8_t gPreC2P[32];
 static uint8_t gPreP2C[32];
 void beginC2PCapture() { transCaptureCols(gPreC2P); }
-void finishC2PTransition() {
-  if (tileTransC2P == 0) return;
+// Each priority tile now supplies its own effect. Until this took a parameter,
+// tileTransNotif / Ets2 / Sw / Tmr / Ip were saved, sent in /state and editable
+// in the UI, but never read: every circuit-to-priority switch used tileTransC2P.
+// Passing 0 (or nothing) keeps the old behaviour for callers with no per-tile
+// setting of their own. The pace travels with the effect: the tile's own when
+// it supplied one, the C2P setting's when that is what plays.
+void finishC2PTransition(uint8_t tileTrans, uint8_t tileSpd) {
+  uint8_t eff = tileTrans ? tileTrans : tileTransC2P;
+  uint8_t pct = tileTrans ? tileSpd : tileTransSpd[TRSPD_C2P];
+  if (eff == 0) return;
   uint8_t newCols[32];
   transCaptureCols(newCols);
   transWriteCols(gPreC2P);
-  playTileTransition(tileTransC2P, gPreC2P, newCols);
+  playTileTransition(eff, gPreC2P, newCols, pct);
 }
 void beginP2CCapture() { transCaptureCols(gPreP2C); }
 void finishP2CTransition() {
@@ -4500,7 +6356,7 @@ void finishP2CTransition() {
   uint8_t newCols[32];
   transCaptureCols(newCols);
   transWriteCols(gPreP2C);
-  playTileTransition(tileTransP2C, gPreP2C, newCols);
+  playTileTransition(tileTransP2C, gPreP2C, newCols, tileTransSpd[TRSPD_P2C]);
 }
 
 void drawCircuitTileFrame() {
@@ -4514,6 +6370,8 @@ void drawCircuitTileFrame() {
     ssInit();
   } else if (items[currentSlot].id == ITEM_CURRENCY) {
     currencyInit();
+  } else if (socialIndexForItem(items[currentSlot].id) >= 0) {
+    socialInit(items[currentSlot].id);
   } else {
 
     mx.update(MD_MAX72XX::OFF);
@@ -4525,27 +6383,26 @@ void drawCircuitTileFrame() {
         gLastStaticDrawMs = millis();
         drawHour();
         break;
+      case ITEM_HOURWEEK:
+        gLastStaticDrawMs = millis();
+        drawHourWeekday();
+        break;
       case ITEM_DATE:
-        gStaticDrawDone = true;
-        dateInit();
+        // Latched only if the draw happened: the clear above is already on the
+        // panel, so a dateInit() that drew nothing has to be repeated rather
+        // than remembered as done.
+        gStaticDrawDone = dateInit();
         break;
       case ITEM_TEMP: {
-
-        float tf = bmp.readTemperature();
-        if (tf >= -40 && tf <= 85) {
-          lastTemp = (int)round(tf);
-        }
-        // lastTemp starts life at the -999 sentinel and is only ever
-        // overwritten once a BMP280 read actually succeeds. Previously this
-        // called tempInit(lastTemp) unconditionally, so if the very first
-        // read after boot/slot-change glitched, "-999DEG" got drawn straight
-        // to the matrix. Now we only draw once we have a real value; if we
-        // don't, gStaticDrawDone stays false and the retry logic in loop()
-        // (case ITEM_TEMP) keeps sampling every tick until one succeeds.
-        if (lastTemp != -999) {
-          gStaticDrawDone = true;
-          tempInit(lastTemp);
-        }
+        // Opportunistic fresh read, then draw unconditionally. tempInit()
+        // renders "--" for TEMP_NO_READING, so the tile can no longer end up
+        // with nothing on the matrix; loop() replaces the placeholder in place
+        // the moment a real reading lands.
+        float tf;
+        if (bmpReadTempC(tf)) lastTemp = (int)round(tf);
+        gStaticDrawDone = true;
+        gTempShownValue = lastTemp;
+        tempInit(lastTemp);
         break;
       }
       case ITEM_CANVAS:
@@ -4569,6 +6426,7 @@ void enterSlot(bool playTransition) {
   transCaptureCols(transOldCols);
 
   uint8_t transEffect = playTransition ? getCircuitTileTransition(items[currentSlot].id) : 0;
+  uint8_t transPct    = getCircuitTileTransSpeed(items[currentSlot].id);
   gSuppressHwFlash = (transEffect != 0);
   drawCircuitTileFrame();
   gSuppressHwFlash = false;
@@ -4577,7 +6435,7 @@ void enterSlot(bool playTransition) {
     uint8_t transNewCols[32];
     transCaptureCols(transNewCols);
     transWriteCols(transOldCols);
-    playTileTransition(transEffect, transOldCols, transNewCols);
+    playTileTransition(transEffect, transOldCols, transNewCols, transPct);
   }
 }
 
@@ -4632,6 +6490,7 @@ bool isValidCircuitItemId(uint8_t id) {
     case ITEM_HOUR: case ITEM_DATE: case ITEM_TEMP: case ITEM_NOW_PLAYING:
     case ITEM_WEATHER: case ITEM_MEMENTO: case ITEM_CANVAS:
     case ITEM_PRESSURE: case ITEM_SCREENSAVER: case ITEM_CURRENCY:
+    case ITEM_YOUTUBE: case ITEM_HOURWEEK:
       return true;
     default:
       return false;
@@ -4641,7 +6500,8 @@ bool isValidCircuitItemId(uint8_t id) {
 void repairItemIds() {
   static const uint8_t ALL_IDS[NUM_ITEMS] = {
     ITEM_HOUR, ITEM_DATE, ITEM_TEMP, ITEM_NOW_PLAYING, ITEM_WEATHER,
-    ITEM_MEMENTO, ITEM_CANVAS, ITEM_PRESSURE, ITEM_SCREENSAVER, ITEM_CURRENCY
+    ITEM_MEMENTO, ITEM_CANVAS, ITEM_PRESSURE, ITEM_SCREENSAVER, ITEM_CURRENCY,
+    ITEM_YOUTUBE, ITEM_HOURWEEK
   };
   bool used[16] = { false };
   bool needsFix[NUM_ITEMS] = { false };
@@ -4667,6 +6527,11 @@ void loadSettings() {
   prefs.begin("settings", true);
   buzzerOn      = prefs.getBool("buzzer", true);
   buzzerVolume  = prefs.getUChar("buzzerVol", 80);
+  // A clock from before the categories starts all four at its one volume.
+  buzzVolNotif  = prefs.getUChar("bzVolNotif", buzzerVolume);
+  buzzVolAuto   = prefs.getUChar("bzVolAuto",  buzzerVolume);
+  buzzVolAlarm  = prefs.getUChar("bzVolAlarm", buzzerVolume);
+  buzzVolTouch  = prefs.getUChar("bzVolTouch", buzzerVolume);
   prefs.getString("buzzerPreset", buzzerPreset, sizeof(buzzerPreset));
   if (strlen(buzzerPreset) == 0) strcpy(buzzerPreset, "calm");
   prefs.getString("evSndTile",  eventSoundTile,  sizeof(eventSoundTile));
@@ -4675,6 +6540,8 @@ void loadSettings() {
   if (strlen(eventSoundWifi) == 0) strcpy(eventSoundWifi, "urgent");
   prefs.getString("evSndNotif", eventSoundNotif, sizeof(eventSoundNotif));
   if (strlen(eventSoundNotif) == 0) strcpy(eventSoundNotif, "soft");
+  prefs.getString("evSndWeb", eventSoundWeb, sizeof(eventSoundWeb));
+  if (strlen(eventSoundWeb) == 0) strcpy(eventSoundWeb, "soft");
   prefs.getString("evSndEts2",  eventSoundEts2,  sizeof(eventSoundEts2));
   if (strlen(eventSoundEts2) == 0) strcpy(eventSoundEts2, "urgent");
   prefs.getString("evSndTouch", eventSoundTouch, sizeof(eventSoundTouch));
@@ -4687,10 +6554,31 @@ void loadSettings() {
   ssAnimSelected = prefs.getUChar("ssAnim", SS_ANIM_RANDOM);
   tempUnit      = prefs.getUChar("tempunit", 0);
   hourFormat    = prefs.getUChar("hourformat", 0);
+  hourLeadingZero = prefs.getBool("hourLeadZero", false);
+  hwFormat      = prefs.getUChar("hwFmt", 0);
+  hwLeadZero    = prefs.getBool("hwLeadZero", false);
+  hwBarMode     = prefs.getUChar("hwBarMode", HW_BAR_SECONDS);
+  hwBarPos      = prefs.getUChar("hwBarPos", HW_BAR_BELOW);
+  hwSwap        = prefs.getBool("hwSwap", false);
+  netTimeSync   = prefs.getBool("netTimeSync", true);
+  showGrayedContent = prefs.getBool("showGrayed", true);
+  autoSleepOn  = prefs.getBool("autoSleep", false);
+  autoSleepSec = prefs.getUInt("autoSleepSec", 1800);
+  if (autoSleepSec == 0) autoSleepSec = 1800;
+  liveTileHighlight = prefs.getBool("liveHl", true);
+  webUiDark         = prefs.getBool("uiDark", true);
+  webUiShape        = prefs.getUChar("uiShape", 0);
+  if (webUiShape > 3) webUiShape = 0;
+  prefs.getString("uiColors", webUiColors, sizeof(webUiColors));
+  prefs.getString("uiLang", webUiLang, sizeof(webUiLang));
+  if (strcmp(webUiLang, "en") != 0) strcpy(webUiLang, "ro");
+  defaultStartMode = prefs.getUChar("startMode", START_MODE_WIFI);
+  if (defaultStartMode > START_MODE_AP) defaultStartMode = START_MODE_WIFI;
   dateFormat    = prefs.getUChar("dateformat", 2);
   dateLang      = prefs.getUChar("datelang", 0);
   prefs.getString("dateCustFmt", customDateFmt, sizeof(customDateFmt));
   notifEnabled  = prefs.getBool("notifEn", true);
+  webAccessEnabled = prefs.getBool("webEn", true);
   ets2Enabled   = prefs.getBool("ets2En", true);
   ets2OrderFirst = prefs.getBool("ets2Ord", false);
   rebuildPriorityOrderFromEts2Order();
@@ -4698,6 +6586,14 @@ void loadSettings() {
   {
     uint8_t savedOrder[NUM_PRIORITY_IDS];
     size_t got = prefs.getBytes("prioOrder", savedOrder, NUM_PRIORITY_IDS);
+    // An order saved before the alarm existed is one byte short. Rather than
+    // throw the user's ranking away over it, take it as it stands and put the
+    // alarm in front - where a fresh install gets it too.
+    if (got == NUM_PRIORITY_IDS - 1) {
+      for (int i = NUM_PRIORITY_IDS - 1; i > 0; i--) savedOrder[i] = savedOrder[i - 1];
+      savedOrder[0] = PRIORITY_ID_ALARM;
+      got = NUM_PRIORITY_IDS;
+    }
     bool validPerm = (got == NUM_PRIORITY_IDS);
     if (validPerm) {
       bool seen[NUM_PRIORITY_IDS] = { false };
@@ -4722,6 +6618,8 @@ void loadSettings() {
   npAdaptiveIcon     = prefs.getBool("npAdaptIcon",   true);
   hideIconPressure   = prefs.getBool("hideIconPress", hideTileIcons);
   hideIconCurrency   = prefs.getBool("hideIconCurr",  hideTileIcons);
+  hideIconYoutube    = prefs.getBool("hideIconYt",    hideTileIcons);
+  hideIconWebAccess  = prefs.getBool("hideIconWeb",   hideTileIcons);
   hideIconIp         = prefs.getBool("hideIconIp",    hideTileIcons);
   iconSelDate       = prefs.getUChar("iconSelDate",  0);
   iconSelTemp       = prefs.getUChar("iconSelTemp",  0);
@@ -4753,9 +6651,18 @@ void loadSettings() {
   scrollTypeNowPlaying = prefs.getUChar("scrollTypeNp",     scrollType);
   scrollTypePressure   = prefs.getUChar("scrollTypePress",  0);
   scrollTypeCurrency   = prefs.getUChar("scrollTypeCurr",   0);
+  scrollTypeYoutube    = prefs.getUChar("scrollTypeYt",     scrollType);
+  scrollTypeWebAccess  = prefs.getUChar("scrollTypeWeb",    scrollType);
   scrollTypeStopwatch  = prefs.getUChar("scrollTypeSw",     scrollType);
   scrollTypeTimer      = prefs.getUChar("scrollTypeTmr",    0);
   scrollTypeIp         = prefs.getUChar("scrollTypeIp",     scrollType);
+  scrollSpeed = prefs.getUChar("scrollSpeed", NP_SCROLL_SPEED_MS);
+  if (scrollSpeed < SCROLL_SPEED_MIN || scrollSpeed > SCROLL_SPEED_MAX) scrollSpeed = NP_SCROLL_SPEED_MS;
+  for (int i = 0; i < SCROLL_SPEED_COUNT; i++) {
+    scrollSpeedTile[i] = prefs.getUChar((String("spd") + SPD_KEYS[i]).c_str(), scrollSpeed);
+    if (scrollSpeedTile[i] < SCROLL_SPEED_MIN || scrollSpeedTile[i] > SCROLL_SPEED_MAX)
+      scrollSpeedTile[i] = scrollSpeed;
+  }
 
   fontType         = prefs.getUChar("fontType",     0);
   fontTypeDate       = prefs.getUChar("fontTypeDate",   fontType);
@@ -4766,9 +6673,20 @@ void loadSettings() {
   fontTypeNowPlaying = prefs.getUChar("fontTypeNp",     fontType);
   fontTypePressure   = prefs.getUChar("fontTypePress",  fontType);
   fontTypeCurrency   = prefs.getUChar("fontTypeCurr",   fontType);
+  fontTypeYoutube    = prefs.getUChar("fontTypeYt",     fontType);
+  fontTypeWebAccess  = prefs.getUChar("fontTypeWeb",    fontType);
   fontTypeStopwatch  = prefs.getUChar("fontTypeSw",     fontType);
   fontTypeTimer      = prefs.getUChar("fontTypeTmr",    fontType);
   fontTypeIp         = prefs.getUChar("fontTypeIp",     fontType);
+  // A value this build has no font for (saved by a newer one) would reach
+  // draw paths that only know the modes above; the default always draws.
+  {
+    uint8_t* fts[] = { &fontType, &fontTypeDate, &fontTypeTemp, &fontTypeReminder,
+                       &fontTypeWeather, &fontTypeNotif, &fontTypeNowPlaying,
+                       &fontTypePressure, &fontTypeCurrency, &fontTypeYoutube,
+                       &fontTypeWebAccess, &fontTypeStopwatch, &fontTypeTimer, &fontTypeIp };
+    for (uint8_t* p : fts) if (*p >= FONT_MODE_COUNT) *p = FONT_MODE_DEFAULT;
+  }
   tileTransGlobal = prefs.getUChar("trGlobal", 0);
   tileTransHour   = prefs.getUChar("trHour",   tileTransGlobal);
   tileTransDate   = prefs.getUChar("trDate",   tileTransGlobal);
@@ -4780,13 +6698,24 @@ void loadSettings() {
   tileTransPress  = prefs.getUChar("trPress",  tileTransGlobal);
   tileTransSs     = prefs.getUChar("trSs",     tileTransGlobal);
   tileTransCurr   = prefs.getUChar("trCurr",   tileTransGlobal);
+  tileTransYt     = prefs.getUChar("trYt",     tileTransGlobal);
+  tileTransHw     = prefs.getUChar("trHw",     tileTransGlobal);
+  tileTransWeb    = prefs.getUChar("trWeb",    tileTransGlobal);
   tileTransNotif  = prefs.getUChar("trNotif",  tileTransGlobal);
   tileTransEts2   = prefs.getUChar("trEts2",   tileTransGlobal);
   tileTransSw     = prefs.getUChar("trSw",     tileTransGlobal);
   tileTransTmr    = prefs.getUChar("trTmr",    tileTransGlobal);
+  tileTransAlarm  = prefs.getUChar("trAlarm",  tileTransGlobal);
   tileTransIp     = prefs.getUChar("trIp",     tileTransGlobal);
   tileTransC2P    = prefs.getUChar("trC2P",    tileTransGlobal);
   tileTransP2C    = prefs.getUChar("trP2C",    tileTransGlobal);
+  tileTransSpeed  = prefs.getUChar("trSpeed",  TRSPD_DEFAULT);
+  if (tileTransSpeed < TRSPD_MIN || tileTransSpeed > TRSPD_MAX) tileTransSpeed = TRSPD_DEFAULT;
+  // A shorter blob from an older build leaves the newer entries on the global.
+  for (int i = 0; i < TRSPD_COUNT; i++) tileTransSpd[i] = tileTransSpeed;
+  prefs.getBytes("trSpeeds", tileTransSpd, TRSPD_COUNT);
+  for (int i = 0; i < TRSPD_COUNT; i++)
+    if (tileTransSpd[i] < TRSPD_MIN || tileTransSpd[i] > TRSPD_MAX) tileTransSpd[i] = tileTransSpeed;
   prefs.getString("evSndTimer", eventSoundTimer, sizeof(eventSoundTimer));
   if (strlen(eventSoundTimer) == 0) strcpy(eventSoundTimer, "calm");
   timerDurationSec = prefs.getUInt("timerDurSec", 300);
@@ -4795,6 +6724,39 @@ void loadSettings() {
   timerRemainingSnapMs = (unsigned long)timerDurationSec * 1000UL;
   timerFinished = false;
   timerWasActive = false;
+  // Each alarm is one packed word plus its tone. A key that was never written
+  // leaves the built-in default in place, which is what a first boot wants.
+  for (int i = 0; i < ALARM_COUNT; i++) {
+    char k[12];
+    snprintf(k, sizeof(k), "alarm%d", i);
+    uint32_t packed = prefs.getUInt(k, 0xFFFFFFFFUL);
+    if (packed != 0xFFFFFFFFUL) {
+      uint8_t h = (uint8_t)(packed & 0xFF);
+      uint8_t m = (uint8_t)((packed >> 8) & 0xFF);
+      if (h < 24 && m < 60) {
+        alarms[i].hour   = h;
+        alarms[i].minute = m;
+        alarms[i].days   = (uint8_t)((packed >> 16) & 0x7F);
+      }
+      alarms[i].enabled = ((packed >> 23) & 1) != 0;
+      // Bit 25 marks a word written by a build that knows about presence. An
+      // older one has neither bit, and an alarm it had switched on is one the
+      // owner set on purpose - so that is what comes back.
+      alarms[i].present = ((packed >> 25) & 1)
+                            ? (((packed >> 24) & 1) != 0)
+                            : alarms[i].enabled;
+    }
+    snprintf(k, sizeof(k), "alarmTone%d", i);
+    prefs.getString(k, alarms[i].tone, sizeof(alarms[i].tone));
+    if (strlen(alarms[i].tone) == 0) strcpy(alarms[i].tone, "classic");
+    alarmFired[i] = false;
+  }
+  // Nothing rings the instant the device comes up: an alarm whose minute went by
+  // while it was off has gone by, and one whose minute is now gets picked up by
+  // the first alarmTick() after the clock is set.
+  alarmRinging    = false;
+  alarmRingingIdx = -1;
+  alarmWasActive  = false;
   for (int i = 0; i < NUM_ITEMS; i++) {
     String base = "it" + String(i);
     items[i].id          = prefs.getUChar((base + "id").c_str(),  items[i].id);
@@ -4804,6 +6766,9 @@ void loadSettings() {
   }
 
   repairItemIds();
+  tileHiddenMask = (uint16_t)prefs.getUShort("tileHidden", 0);
+  prioHiddenMask = prefs.getUChar("prioHidden", 0);
+  applyTileHiddenMask();
   curBrightness = prefs.getUChar("bright",  BRIGHTNESS);
   dimAutoOn     = prefs.getBool("dimAuto",  false);
   dimFromH      = prefs.getUChar("dimFH",   22);
@@ -4813,9 +6778,24 @@ void loadSettings() {
   dimLevel      = prefs.getUChar("dimLvl",  1);
   prefs.getString("wxCity",   weatherCity,   sizeof(weatherCity));
   prefs.getString("wxApiKey", weatherApiKey, sizeof(weatherApiKey));
+  // A key mangled by the old masked-field bug is not a key. Drop it, so the
+  // tile says "no key" and asks for a new one instead of spending every fetch
+  // on a 401 nobody can see.
+  if (weatherApiKey[0] && !wxKeyLooksValid(String(weatherApiKey))) weatherApiKey[0] = '\0';
   prefs.getString("wxLang",   weatherLang,   sizeof(weatherLang));
+  wxPreset = prefs.getUChar("wxPreset", WX_SHOW_ALL);
+  if (wxPreset == 0 || wxPreset > WX_SHOW_ALL) wxPreset = WX_SHOW_ALL;
   weatherLat = prefs.getFloat("wxLat", weatherLat);
   weatherLon = prefs.getFloat("wxLon", weatherLon);
+  {
+    // Social tiles: three slots stored under indexed keys.
+    prefs.getString("socH0", social[SOC_YT].handle, sizeof(social[SOC_YT].handle));
+    prefs.getString("socK0", social[SOC_YT].apiKey, sizeof(social[SOC_YT].apiKey));
+    social[SOC_YT].showName = prefs.getBool("socN0", false);
+    social[SOC_YT].count = 0;
+    social[SOC_YT].valid = false;
+    iconSelYoutube = prefs.getUChar("icoYt", 0);
+  }
   prefs.getString("currBase",  currencyBase,  sizeof(currencyBase));
   if (strlen(currencyBase) == 0) strcpy(currencyBase, "EUR");
   prefs.getString("currQuote", currencyQuote, sizeof(currencyQuote));
@@ -4827,21 +6807,75 @@ void loadSettings() {
   sortItems();
 }
 
+// DEFERRED SETTINGS WRITE
+//
+// saveSettings() pushes 118 keys into NVS. It used to run synchronously on every
+// single change - each dropdown in Scroll Type, each brightness tap on the touch
+// sensor - so one UI interaction meant 118 NVS transactions, and holding the
+// touch pad meant a burst of them. Callers now mark the settings dirty instead
+// and loop() does one real write once the changes stop.
+static bool          settingsDirty   = false;
+static unsigned long settingsDirtyMs = 0;
+#define SETTINGS_FLUSH_MS 800UL
+
+void saveSettingsDeferred() {
+  settingsDirty   = true;
+  settingsDirtyMs = millis();
+}
+
+// Write now if anything is pending - used before a deliberate reboot.
+void saveSettingsFlush() {
+  if (!settingsDirty) return;
+  settingsDirty = false;
+  saveSettings();
+}
+
+// Drop anything pending - used by the factory reset, so a queued write cannot
+// repopulate the namespace we just wiped.
+void saveSettingsCancel() { settingsDirty = false; }
+
+static void settingsFlushTick() {
+  if (!settingsDirty) return;
+  if (millis() - settingsDirtyMs < SETTINGS_FLUSH_MS) return;
+  saveSettingsFlush();
+}
+
 void saveSettings() {
   prefs.begin("settings", false);
   prefs.putBool("buzzer", buzzerOn);
   prefs.putUChar("buzzerVol", buzzerVolume);
+  prefs.putUChar("bzVolNotif", buzzVolNotif);
+  prefs.putUChar("bzVolAuto",  buzzVolAuto);
+  prefs.putUChar("bzVolAlarm", buzzVolAlarm);
+  prefs.putUChar("bzVolTouch", buzzVolTouch);
   prefs.putString("buzzerPreset", buzzerPreset);
   prefs.putUChar("npmode", npDisplayMode);
   prefs.putUChar("ssAnim", ssAnimSelected);
   prefs.putUChar("tempunit", tempUnit);
   prefs.putUChar("hourformat", hourFormat);
+  prefs.putBool("hourLeadZero", hourLeadingZero);
+  prefs.putUChar("hwFmt", hwFormat);
+  prefs.putBool("hwLeadZero", hwLeadZero);
+  prefs.putUChar("hwBarMode", hwBarMode);
+  prefs.putUChar("hwBarPos", hwBarPos);
+  prefs.putBool("hwSwap", hwSwap);
+  prefs.putBool("netTimeSync", netTimeSync);
+  prefs.putBool("showGrayed", showGrayedContent);
+  prefs.putBool("autoSleep", autoSleepOn);
+  prefs.putUInt("autoSleepSec", autoSleepSec);
+  prefs.putBool("liveHl", liveTileHighlight);
+  prefs.putBool("uiDark", webUiDark);
+  prefs.putUChar("uiShape", webUiShape);
+  prefs.putString("uiColors", webUiColors);
+  prefs.putString("uiLang", webUiLang);
+  prefs.putUChar("startMode", defaultStartMode);
   prefs.putUChar("dateformat", dateFormat);
   prefs.putUChar("datelang", dateLang);
   prefs.putString("dateCustFmt", customDateFmt);
   prefs.putUChar("touchTap", touchTapAction);
   prefs.putUChar("touchDbl", touchDoubleTapAction);
   prefs.putBool("notifEn", notifEnabled);
+  prefs.putBool("webEn", webAccessEnabled);
   prefs.putBool("ets2En", ets2Enabled);
   prefs.putBool("ets2Ord", ets2OrderFirst);
   prefs.putBool("npIsPrio", nowPlayingIsPriority);
@@ -4856,6 +6890,8 @@ void saveSettings() {
   prefs.putBool("npAdaptIcon",   npAdaptiveIcon);
   prefs.putBool("hideIconPress", hideIconPressure);
   prefs.putBool("hideIconCurr",  hideIconCurrency);
+  prefs.putBool("hideIconYt",    hideIconYoutube);
+  prefs.putBool("hideIconWeb",   hideIconWebAccess);
   prefs.putBool("hideIconIp",    hideIconIp);
   prefs.putUChar("iconSelDate",  iconSelDate);
   prefs.putUChar("iconSelTemp",  iconSelTemp);
@@ -4882,9 +6918,14 @@ void saveSettings() {
   prefs.putUChar("scrollTypeNp",    scrollTypeNowPlaying);
   prefs.putUChar("scrollTypePress", scrollTypePressure);
   prefs.putUChar("scrollTypeCurr",  scrollTypeCurrency);
+  prefs.putUChar("scrollTypeYt",    scrollTypeYoutube);
+  prefs.putUChar("scrollTypeWeb",   scrollTypeWebAccess);
   prefs.putUChar("scrollTypeSw",    scrollTypeStopwatch);
   prefs.putUChar("scrollTypeTmr",   scrollTypeTimer);
   prefs.putUChar("scrollTypeIp",    scrollTypeIp);
+  prefs.putUChar("scrollSpeed", scrollSpeed);
+  for (int i = 0; i < SCROLL_SPEED_COUNT; i++)
+    prefs.putUChar((String("spd") + SPD_KEYS[i]).c_str(), scrollSpeedTile[i]);
 
   prefs.putUChar("fontType",     fontType);
   prefs.putUChar("fontTypeDate",  fontTypeDate);
@@ -4895,6 +6936,8 @@ void saveSettings() {
   prefs.putUChar("fontTypeNp",    fontTypeNowPlaying);
   prefs.putUChar("fontTypePress", fontTypePressure);
   prefs.putUChar("fontTypeCurr",  fontTypeCurrency);
+  prefs.putUChar("fontTypeYt",    fontTypeYoutube);
+  prefs.putUChar("fontTypeWeb",   fontTypeWebAccess);
   prefs.putUChar("fontTypeSw",    fontTypeStopwatch);
   prefs.putUChar("fontTypeTmr",   fontTypeTimer);
   prefs.putUChar("fontTypeIp",    fontTypeIp);
@@ -4909,16 +6952,36 @@ void saveSettings() {
   prefs.putUChar("trPress",  tileTransPress);
   prefs.putUChar("trSs",     tileTransSs);
   prefs.putUChar("trCurr",   tileTransCurr);
+  prefs.putUChar("trYt",     tileTransYt);
+  prefs.putUChar("trHw",     tileTransHw);
+  prefs.putUChar("trWeb",    tileTransWeb);
   prefs.putUChar("trNotif",  tileTransNotif);
   prefs.putUChar("trEts2",   tileTransEts2);
   prefs.putUChar("trSw",     tileTransSw);
   prefs.putUChar("trTmr",    tileTransTmr);
+  prefs.putUChar("trAlarm",  tileTransAlarm);
   prefs.putUChar("trIp",     tileTransIp);
   prefs.putUChar("trC2P",    tileTransC2P);
   prefs.putUChar("trP2C",    tileTransP2C);
+  prefs.putUChar("trSpeed",  tileTransSpeed);
+  prefs.putBytes("trSpeeds", tileTransSpd, TRSPD_COUNT);
   prefs.putString("evSndTimer", eventSoundTimer);
   prefs.putUInt("timerDurSec", timerDurationSec);
   prefs.putUChar("timerPreset", timerPreset);
+  for (int i = 0; i < ALARM_COUNT; i++) {
+    char k[12];
+    snprintf(k, sizeof(k), "alarm%d", i);
+    prefs.putUInt(k, (uint32_t)alarms[i].hour
+                   | ((uint32_t)alarms[i].minute << 8)
+                   | ((uint32_t)(alarms[i].days & 0x7F) << 16)
+                   | ((uint32_t)(alarms[i].enabled ? 1 : 0) << 23)
+                   | ((uint32_t)(alarms[i].present ? 1 : 0) << 24)
+                   | (1UL << 25));
+    snprintf(k, sizeof(k), "alarmTone%d", i);
+    prefs.putString(k, alarms[i].tone);
+  }
+  prefs.putUShort("tileHidden", tileHiddenMask);
+  prefs.putUChar("prioHidden", prioHiddenMask);
   for (int i = 0; i < NUM_ITEMS; i++) {
     String base = "it" + String(i);
     prefs.putUChar((base + "id").c_str(),   items[i].id);
@@ -4936,8 +6999,15 @@ void saveSettings() {
   prefs.putString("wxCity",   weatherCity);
   prefs.putString("wxApiKey", weatherApiKey);
   prefs.putString("wxLang",   weatherLang);
+  prefs.putUChar("wxPreset", wxPreset);
   prefs.putFloat("wxLat",    weatherLat);
   prefs.putFloat("wxLon",    weatherLon);
+  {
+    prefs.putString("socH0", social[SOC_YT].handle);
+    prefs.putString("socK0", social[SOC_YT].apiKey);
+    prefs.putBool("socN0", social[SOC_YT].showName);
+    prefs.putUChar("icoYt", iconSelYoutube);
+  }
   prefs.putString("currBase",  currencyBase);
   prefs.putString("currQuote", currencyQuote);
   prefs.putBool("currCompare", currencyCompareEnabled);
@@ -5010,8008 +7080,47 @@ String scanNetworks() {
 }
 
 // HTML Web Interface for Octoglow
-const char PORTAL_HTML[] PROGMEM = R"PORTALHTML(
-<!doctype html>
-<html lang=ro>
-<meta charset=UTF-8>
-<meta content="width=device-width,initial-scale=1,viewport-fit=cover" name=viewport>
-<title>Octoglow</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Ccircle cx='128' cy='128' r='128' fill='%23EADDFF' opacity='.137'/%3E%3Ccircle cx='128' cy='128' r='107.52' fill='%23EADDFF' opacity='.255'/%3E%3Ccircle cx='128' cy='128' r='92.16' fill='%23EADDFF' opacity='.392'/%3E%3Ccircle cx='128' cy='25.6' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='230.4' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='230.4' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='25.6' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='128' r='71.68' fill='%236750A4'/%3E%3Ccircle cx='99.328' cy='99.328' r='23.04' fill='%23FFFFFF'/%3E%3C/svg%3E">
-<link href=https://fonts.googleapis.com rel=preconnect>
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500&family=Roboto:wght@400;500&display=swap" rel=stylesheet>
-<style>
-  :root {
-    --pri: #d0bcff;
-    --on-pri: #381e72;
-    --pri-con: #4f378b;
-    --on-pri-con: #eaddff;
-    --sec: #ccc2dc;
-    --sec-con: #4a4458;
-    --on-sec-con: #e8def8;
-    --bg: #1c1b1f;
-    --on-bg: #e6e1e5;
-    --surf: #1c1b1f;
-    --on-surf: #e6e1e5;
-    --surf-var: #49454f;
-    --on-surf-var: #cac4d0;
-    --surf-low: #1d1b20;
-    --surf-con: #211f26;
-    --surf-high: #2b2930;
-    --surf-highest: #36343b;
-    --outline: #938f99;
-    --outline-var: #49454f;
-    --inv-surf: #e6e1e5;
-    --inv-on-surf: #313033;
-    --err: #f2b8b5;
-    --err-con: #8c1d18;
-    --blue-con: #0d2247;
-    --blue: #aac7ff;
-    --teal-con: #003731;
-    --teal: #6cf9d8;
-    --amber-con: #3b2a00;
-    --amber: #ffdf99;
-    --grn-con: #003824;
-    --grn: #6dd7a1;
-    --pri-txt: var(--pri)
-  }
-
-  body.light {
-    --bg: #fef7ff;
-    --on-bg: #1d1b20;
-    --surf: #fef7ff;
-    --on-surf: #1d1b20;
-    --surf-var: #e7e0eb;
-    --on-surf-var: #49454f;
-    --surf-low: #f7f2fa;
-    --surf-con: #f3edf7;
-    --surf-high: #ece6f0;
-    --surf-highest: #e6e0e9;
-    --outline: #79747e;
-    --outline-var: #cac4d0;
-    --inv-surf: #313033;
-    --inv-on-surf: #f4eff4;
-    --err: #ba1a1a;
-    --err-con: #ffdad6;
-    --blue-con: #d5e3ff;
-    --blue: #0d2247;
-    --teal-con: #a1f2de;
-    --teal: #003731;
-    --amber-con: #ffe08c;
-    --amber: #3b2a00;
-    --grn-con: #a1f2c6;
-    --grn: #003824
-  }
-
-  body.light .sl {
-    color: var(--pri-con)
-  }
-
-  body.light {
-    --pri-txt: var(--pri-con)
-  }
-
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    -webkit-tap-highlight-color: transparent;
-    -webkit-touch-callout: none
-  }
-
-  html {
-    -webkit-tap-highlight-color: transparent
-  }
-
-  body {
-    background: var(--bg);
-    color: var(--on-bg);
-    -webkit-font-smoothing: antialiased;
-    min-height: 100vh;
-    font-family: Roboto, sans-serif;
-    -webkit-tap-highlight-color: transparent;
-    overflow-x: hidden
-  }
-
-  .screen {
-    flex-direction: column;
-    min-height: 100vh;
-    display: none
-  }
-
-  .screen.active {
-    animation: .22s cubic-bezier(.2, 0, 0, 1) slide-in;
-    display: flex
-  }
-
-  /* Nothing renders until the initial /state payload is in - only the
-     "Loading: User Settings" dialog is allowed to be visible. This has to
-     be plain CSS (not something a script adds later) so it applies on the
-     very first paint, before any script has had a chance to run. */
-  body.boot-hide>*:not(#us-load-scrim):not(#us-load-dlg) {
-    visibility: hidden !important
-  }
-
-  @keyframes slide-in {
-    0% {
-      opacity: 0;
-      transform: translate(24px)
-    }
-
-    to {
-      opacity: 1;
-      transform: none
-    }
-  }
-
-  .top-bar {
-    background: var(--surf);
-    z-index: 10;
-    align-items: center;
-    gap: 4px;
-    min-height: 64px;
-    padding: 8px 4px;
-    transition: background .2s, box-shadow .2s;
-    display: flex;
-    position: sticky;
-    top: 0
-  }
-
-  .top-bar.raised {
-    background: color-mix(in srgb, var(--surf-high) 90%, var(--pri) 10%);
-    box-shadow: 0 1px 0 var(--outline-var)
-  }
-
-  .bar-lead {
-    width: 48px;
-    height: 48px;
-    color: var(--on-surf-var);
-    cursor: pointer;
-    background: 0 0;
-    border: none;
-    border-radius: 50%;
-    flex-shrink: 0;
-    justify-content: center;
-    align-items: center;
-    transition: background .15s;
-    display: flex
-  }
-
-  .bar-lead:hover {
-    background: color-mix(in srgb, var(--on-surf)8%, transparent)
-  }
-
-  .bar-lead:active {
-    background: color-mix(in srgb, var(--on-surf)12%, transparent)
-  }
-
-  .bar-avatar {
-    background: var(--pri-con);
-    width: 40px;
-    height: 40px;
-    color: var(--on-pri-con);
-    border-radius: 50%;
-    flex-shrink: 0;
-    justify-content: center;
-    align-items: center;
-    margin-left: 4px;
-    display: flex
-  }
-
-  .bar-text {
-    flex: 1;
-    padding-left: 4px
-  }
-
-  .bar-title {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 22px;
-    font-weight: 400
-  }
-
-  .home-title {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 30px;
-    font-weight: 500;
-    text-align: center;
-    letter-spacing: .1px
-  }
-
-  .bar-sub {
-    color: var(--on-surf-var);
-    letter-spacing: .3px;
-    margin-top: 1px;
-    font-size: 12px
-  }
-
-  .content {
-    flex: 1;
-    padding: 4px 16px 80px
-  }
-
-  .sl {
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: var(--pri);
-    padding: 20px 4px 8px;
-    font-size: 11px;
-    font-weight: 500
-  }
-
-  .sl:first-child {
-    padding-top: 8px
-  }
-
-  .card {
-    background: var(--surf-low);
-    border-radius: 12px;
-    margin-bottom: 4px;
-    overflow: hidden
-  }
-
-  .li {
-    cursor: pointer;
-    border-bottom: 1px solid var(--outline-var);
-    -webkit-tap-highlight-color: transparent;
-    align-items: center;
-    gap: 16px;
-    min-height: 72px;
-    padding: 0 16px;
-    transition: background .12s;
-    display: flex;
-    position: relative;
-    overflow: hidden
-  }
-
-  .li:last-child {
-    border-bottom: none
-  }
-
-  .sel-row {
-    cursor: pointer;
-    border-bottom: 1px solid var(--outline-var);
-    -webkit-tap-highlight-color: transparent;
-    align-items: center;
-    gap: 16px;
-    min-height: 56px;
-    padding: 0 16px;
-    transition: background .12s;
-    display: flex;
-    position: relative;
-    overflow: hidden
-  }
-
-  .sel-row:last-child {
-    border-bottom: none
-  }
-
-  .sel-row:hover {
-    background: color-mix(in srgb, var(--on-surf)6%, transparent)
-  }
-
-  .sel-row:active {
-    background: color-mix(in srgb, var(--on-surf)12%, transparent)
-  }
-
-  .sel-radio {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 2px solid var(--outline);
-    flex: 0 0 auto;
-    position: relative;
-    transition: border-color .15s
-  }
-
-  .sel-radio-on {
-    border-color: var(--pri)
-  }
-
-  .sel-radio-on:after {
-    content: "";
-    position: absolute;
-    inset: 3px;
-    border-radius: 50%;
-    background: var(--pri)
-  }
-
-  .sel-label {
-    font-size: 14px;
-    color: var(--on-surf)
-  }
-
-  .li:after {
-    content: "";
-    background: var(--on-surf);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity .3s;
-    position: absolute;
-    inset: 0
-  }
-
-  .li:active:after {
-    opacity: .12;
-    transition: none
-  }
-
-  .li:hover {
-    background: color-mix(in srgb, var(--on-surf)6%, transparent)
-  }
-
-  .li.static {
-    cursor: default
-  }
-
-  .li.static:hover {
-    background: 0 0
-  }
-
-  .li.static:after {
-    display: none
-  }
-
-  .li.static.hoverable:hover {
-    background: color-mix(in srgb, var(--on-surf)6%, transparent)
-  }
-
-  .lic {
-    border-radius: 50%;
-    flex-shrink: 0;
-    justify-content: center;
-    align-items: center;
-    width: 40px;
-    height: 40px;
-    display: flex;
-    overflow: hidden
-  }
-
-  .lc-pur {
-    background: var(--pri-con);
-    color: var(--pri)
-  }
-
-  .lc-blu {
-    background: var(--pri-con);
-    color: var(--pri)
-  }
-
-  .lc-tea {
-    background: var(--pri-con);
-    color: var(--pri)
-  }
-
-  .lc-amb {
-    background: var(--pri-con);
-    color: var(--pri)
-  }
-
-  .lc-grn {
-    background: var(--pri-con);
-    color: var(--pri)
-  }
-
-  .sugg-box {
-    border-radius: 20px;
-    padding: 10px 10px 8px;
-    background: color-mix(in srgb, var(--pri) 12%, var(--surf-high));
-    border: 1px solid color-mix(in srgb, var(--pri) 35%, transparent);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    overflow: hidden
-  }
-
-  .sugg-box-pad {
-    padding-top: 20px;
-    margin-top: 12px
-  }
-
-  .sugg-box-ap .sugg-title {
-    margin-top: 6px
-  }
-
-  .sugg-title {
-    font-family: Google Sans, sans-serif;
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: .8px;
-    text-transform: uppercase;
-    color: var(--pri);
-    opacity: .85;
-    padding: 0;
-    margin-top: -4px;
-    margin-bottom: 4px;
-    margin-left: 6px
-  }
-
-  .sugg-rows {
-    display: flex;
-    flex-direction: column;
-    gap: 0
-  }
-
-  .sugg-row {
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-height: 38px;
-    padding: 7px 8px;
-    border-radius: 0;
-    transition: background .12s
-  }
-
-  .sugg-rows .sugg-row:only-child {
-    border-radius: 12px
-  }
-
-  .sugg-rows .sugg-row:first-child:not(:only-child) {
-    border-radius: 12px 12px 0 0
-  }
-
-  .sugg-rows .sugg-row:last-child:not(:only-child) {
-    border-radius: 0 0 12px 12px
-  }
-
-  .sugg-row:hover {
-    background: color-mix(in srgb, var(--pri) 14%, transparent)
-  }
-
-  .sugg-row:active {
-    background: color-mix(in srgb, var(--pri) 22%, transparent)
-  }
-
-  .sugg-row-icon {
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    color: var(--pri);
-    opacity: .65
-  }
-
-  .sugg-row-icon svg {
-    width: 100%;
-    height: 100%
-  }
-
-  .sugg-row-text {
-    flex: 1;
-    font-family: Google Sans, sans-serif;
-    font-size: 13px;
-    color: var(--on-surf)
-  }
-
-  .li-body {
-    flex: 1;
-    min-width: 0;
-    text-align: left
-  }
-
-  .li-head {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 16px;
-    font-weight: 400
-  }
-
-  .li-sub {
-    color: var(--on-surf-var);
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    margin-top: 2px;
-    font-size: 13px;
-    overflow: hidden
-  }
-
-  .li-trail {
-    color: var(--on-surf-var);
-    flex-shrink: 0;
-    align-items: center;
-    gap: 8px;
-    display: flex
-  }
-
-  .chevron {
-    opacity: .6;
-    align-items: center;
-    display: flex
-  }
-
-  .chip {
-    letter-spacing: .4px;
-    border-radius: 8px;
-    align-items: center;
-    padding: 4px 12px;
-    font-size: 12px;
-    font-weight: 500;
-    display: inline-flex
-  }
-
-  .chip-ok {
-    background: var(--grn-con);
-    color: var(--grn)
-  }
-
-  .chip-ap {
-    background: var(--amber-con);
-    color: var(--amber)
-  }
-
-  .ip-val {
-    color: var(--on-surf);
-    font-weight: 400
-  }
-
-  .copy-btn {
-    background: var(--surf-high);
-    color: var(--blue);
-    cursor: pointer;
-    letter-spacing: .1px;
-    white-space: nowrap;
-    border: none;
-    border-radius: 100px;
-    padding: 6px 14px;
-    font-family: Google Sans, sans-serif;
-    font-size: 12px;
-    font-weight: 500
-  }
-
-  .sw {
-    cursor: pointer;
-    flex-shrink: 0;
-    align-items: center;
-    width: 52px;
-    height: 32px;
-    display: inline-flex;
-    position: relative
-  }
-
-  .sw input {
-    opacity: 0;
-    pointer-events: none;
-    width: 0;
-    height: 0;
-    position: absolute
-  }
-
-  .sw-track {
-    background: var(--surf-var);
-    border: 2px solid var(--outline);
-    pointer-events: none;
-    border-radius: 16px;
-    transition: background .2s, border-color .2s;
-    position: absolute;
-    inset: 0
-  }
-
-  .sw input:checked~.sw-track {
-    background: var(--pri);
-    border-color: var(--pri)
-  }
-
-  .sw-thumb {
-    background: var(--outline);
-    pointer-events: none;
-    border-radius: 50%;
-    width: 16px;
-    height: 16px;
-    transition: left .2s cubic-bezier(.4, 0, .2, 1), width .2s, height .2s, background .2s, margin .2s;
-    position: absolute;
-    top: 50%;
-    left: 6px;
-    transform: translateY(-50%);
-    box-shadow: 0 1px 3px #00000080
-  }
-
-  .sw input:checked~.sw-thumb {
-    background: var(--on-pri);
-    width: 24px;
-    height: 24px;
-    margin-top: 0;
-    top: 50%;
-    left: 26px;
-    transform: translateY(-50%)
-  }
-
-  .btn-row {
-    gap: 8px;
-    margin-top: 12px;
-    display: flex
-  }
-
-  .mbtn {
-    letter-spacing: .1px;
-    cursor: pointer;
-    border: none;
-    border-radius: 100px;
-    flex: 1;
-    justify-content: center;
-    align-items: center;
-    gap: 6px;
-    height: 40px;
-    padding: 0 20px;
-    font-family: Google Sans, sans-serif;
-    font-size: 14px;
-    font-weight: 500;
-    transition: opacity .15s, transform .1s;
-    display: inline-flex;
-    position: relative;
-    overflow: hidden
-  }
-
-  .mbtn:disabled {
-    opacity: .38;
-    pointer-events: none
-  }
-
-  .mbtn:active {
-    transform: scale(.97)
-  }
-
-  .mbtn-fill {
-    background: var(--pri);
-    color: var(--on-pri)
-  }
-
-  .mbtn-ton {
-    background: var(--pri-con);
-    color: var(--on-pri-con)
-  }
-
-  .wlist {
-    background: var(--surf-low);
-    border-radius: 12px;
-    max-height: 400px;
-    margin-bottom: 8px;
-    overflow: hidden auto
-  }
-
-  .wlist::-webkit-scrollbar {
-    width: 4px
-  }
-
-  .wlist::-webkit-scrollbar-thumb {
-    background: var(--outline-var);
-    border-radius: 2px
-  }
-
-  .wlist .li {
-    min-height: 64px
-  }
-
-  .wlist .cur-net {
-    cursor: pointer
-  }
-
-  #lang-list::-webkit-scrollbar {
-    width: 4px
-  }
-
-  #lang-list::-webkit-scrollbar-track {
-    background: transparent
-  }
-
-  #lang-list::-webkit-scrollbar-thumb {
-    background: var(--outline-var);
-    border-radius: 2px
-  }
-
-  #lang-list::-webkit-scrollbar-thumb:hover {
-    background: var(--on-surf-var)
-  }
-
-  #iconpicker-body::-webkit-scrollbar {
-    width: 4px
-  }
-
-  #iconpicker-body::-webkit-scrollbar-track {
-    background: transparent
-  }
-
-  #iconpicker-body::-webkit-scrollbar-thumb {
-    background: var(--outline-var);
-    border-radius: 2px
-  }
-
-  #iconpicker-body::-webkit-scrollbar-thumb:hover {
-    background: var(--on-surf-var)
-  }
-
-  #help-topic-body {
-    scrollbar-width: thin;
-    scrollbar-color: var(--outline-var) transparent;
-    margin: 0 -24px;
-    padding: 0 24px
-  }
-
-  #help-topic-body::-webkit-scrollbar {
-    width: 4px
-  }
-
-  #help-topic-body::-webkit-scrollbar-track {
-    background: transparent
-  }
-
-  #help-topic-body::-webkit-scrollbar-thumb {
-    background: var(--outline-var);
-    border-radius: 2px
-  }
-
-  #help-topic-body::-webkit-scrollbar-thumb:hover {
-    background: var(--on-surf-var)
-  }
-
-  .wi {
-    cursor: pointer;
-    border-bottom: 1px solid var(--outline-var);
-    color: var(--on-surf);
-    align-items: center;
-    gap: 12px;
-    padding: 14px 16px;
-    font-size: 14px;
-    transition: background .12s;
-    display: flex
-  }
-
-  .wi:last-child {
-    border-bottom: none
-  }
-
-  .wi:hover {
-    background: color-mix(in srgb, var(--on-surf)6%, transparent)
-  }
-
-  .wi.sel {
-    background: color-mix(in srgb, var(--pri)14%, transparent)
-  }
-
-  .wi.sel .wi-name {
-    color: var(--pri)
-  }
-
-  .wi-name {
-    flex: 1
-  }
-
-  .bars {
-    align-items: flex-end;
-    gap: 2px;
-    height: 14px;
-    display: flex
-  }
-
-  .bar {
-    background: var(--outline);
-    border-radius: 1.5px;
-    width: 3px
-  }
-
-  .bar.on {
-    background: var(--pri)
-  }
-
-  .scan-hint {
-    text-align: center;
-    color: var(--on-surf-var);
-    padding: 24px 16px;
-    font-family: Google Sans, sans-serif;
-    font-size: 14px
-  }
-
-  .spin-ring {
-    width: 20px;
-    height: 20px;
-    border: 3px solid var(--outline-var);
-    border-top-color: var(--pri);
-    border-radius: 50%;
-    display: inline-block;
-    vertical-align: middle;
-    margin-right: 8px;
-    animation: spin-rot .8s linear infinite
-  }
-
-  @keyframes spin-rot {
-    to {
-      transform: rotate(360deg)
-    }
-  }
-
-  .tf-wrap {
-    background: var(--surf-high);
-    border-bottom: 2px solid var(--outline);
-    border-radius: 4px 4px 0 0;
-    margin-bottom: 8px;
-    padding: 0 16px;
-    display: none
-  }
-
-  .tf-wrap.open {
-    display: block
-  }
-
-  .tf-wrap:focus-within {
-    border-bottom-color: var(--pri)
-  }
-
-  .tf-wrap label {
-    letter-spacing: .4px;
-    color: var(--on-surf-var);
-    padding-top: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    display: block
-  }
-
-  .tf-wrap:focus-within label {
-    color: var(--pri)
-  }
-
-  .tf-wrap input {
-    width: 100%;
-    color: var(--on-surf);
-    background: 0 0;
-    border: none;
-    outline: none;
-    padding: 6px 0 10px;
-    font-family: Roboto, sans-serif;
-    font-size: 16px
-  }
-
-  .msg {
-    border-radius: 4px;
-    margin-top: 10px;
-    padding: 12px 16px;
-    font-size: 14px;
-    animation: .2s snk;
-    display: none
-  }
-
-  @keyframes snk {
-    0% {
-      opacity: 0;
-      transform: translateY(4px)
-    }
-
-    to {
-      opacity: 1;
-      transform: none
-    }
-  }
-
-  .msg.ok {
-    background: var(--grn-con);
-    color: var(--grn)
-  }
-
-  .msg.err {
-    background: var(--err-con);
-    color: var(--err)
-  }
-
-  .tile-item {
-    border-bottom: 1px solid var(--outline-var);
-    cursor: grab;
-    user-select: none;
-    align-items: center;
-    gap: 16px;
-    min-height: 72px;
-    padding: 0 16px;
-    transition: background .12s;
-    display: flex
-  }
-
-  .tile-item:last-child {
-    border-bottom: none
-  }
-
-  .tile-item.drag-over {
-    background: color-mix(in srgb, var(--pri)14%, transparent)
-  }
-
-  .tile-item.dragging {
-    opacity: .4
-  }
-
-  .drag-handle {
-    color: var(--outline);
-    cursor: grab;
-    flex-shrink: 0;
-    align-items: center;
-    display: flex
-  }
-
-  .tile-body {
-    flex: 1;
-    min-width: 0
-  }
-
-  .tile-head {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 16px;
-    font-weight: 400
-  }
-
-  .tile-sub {
-    color: var(--on-surf-var);
-    margin-top: 2px;
-    font-size: 13px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 100%
-  }
-
-  .np-wrap {
-    display: block
-  }
-
-  .np-expand {
-    background: var(--surf-con);
-    max-height: 0;
-    padding: 0 16px;
-    transition: max-height .3s cubic-bezier(.4, 0, .2, 1), padding .3s;
-    overflow: hidden
-  }
-
-  .np-expand.open {
-    max-height: 200px;
-    padding: 4px 16px 16px
-  }
-
-  .dim-sched-wrap {
-    max-height: 0;
-    opacity: 0;
-    overflow: hidden;
-    transition: max-height .35s cubic-bezier(.4, 0, .2, 1), opacity .25s ease
-  }
-
-  .dim-sched-wrap.open {
-    max-height: 260px;
-    opacity: 1;
-    transition: max-height .35s cubic-bezier(.4, 0, .2, 1), opacity .3s ease .05s
-  }
-
-  .np-status-row {
-    color: var(--on-surf-var);
-    align-items: center;
-    gap: 8px;
-    padding: 10px 0 12px;
-    font-size: 13px;
-    display: flex
-  }
-
-  .seg {
-    border: 1px solid var(--outline);
-    border-radius: 100px;
-    margin-top: 4px;
-    display: flex;
-    overflow: hidden
-  }
-
-  .sb {
-    color: var(--on-surf-var);
-    border: none;
-    border-right: 1px solid var(--outline);
-    cursor: pointer;
-    letter-spacing: .1px;
-    background: 0 0;
-    flex: 1;
-    padding: 8px 6px;
-    font-family: Google Sans, sans-serif;
-    font-size: 12px;
-    font-weight: 500;
-    transition: background .15s, color .15s
-  }
-
-  .sb:last-child {
-    border-right: none
-  }
-
-  .sb.on {
-    background: var(--sec-con);
-    color: var(--on-sec-con)
-  }
-
-  .dur-row {
-    align-items: center;
-    gap: 8px;
-    padding-top: 2px;
-    display: flex
-  }
-
-  .dur-row input[type=range] {
-    accent-color: var(--pri);
-    cursor: pointer;
-    flex: 1
-  }
-
-  .dur-val {
-    color: var(--pri);
-    text-align: right;
-    min-width: 32px;
-    font-size: 12px;
-    font-weight: 500
-  }
-
-  .drag-hint {
-    text-align: center;
-    color: var(--outline);
-    padding: 8px 0 4px;
-    font-size: 12px
-  }
-
-  .bottom-sheet {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background: var(--surf-high);
-    border-radius: 28px 28px 0 0;
-    z-index: 101;
-    padding: 0 0 env(safe-area-inset-bottom);
-    transform: translateY(100%);
-    transition: transform .35s cubic-bezier(.2, 0, 0, 1);
-    max-width: 600px;
-    margin: 0 auto
-  }
-
-  .bottom-sheet.open {
-    transform: translateY(0)
-  }
-
-  .bs-handle {
-    width: 32px;
-    height: 4px;
-    background: var(--on-surf-var);
-    border-radius: 2px;
-    margin: 12px auto 0;
-    opacity: .4
-  }
-
-  .bs-title {
-    font-family: Google Sans, sans-serif;
-    font-size: 18px;
-    color: var(--on-surf);
-    padding: 16px 24px 4px;
-    font-weight: 500
-  }
-
-  .bs-body {
-    padding: 8px 24px 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 20px
-  }
-
-  .bs-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px
-  }
-
-  .bs-label {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 15px
-  }
-
-  .bs-sub {
-    color: var(--on-surf-var);
-    font-size: 12px;
-    margin-top: 2px
-  }
-
-  .simple-slider {
-    accent-color: var(--pri);
-    cursor: pointer;
-    flex: 1
-  }
-
-  .br-val {
-    color: var(--pri);
-    text-align: right;
-    min-width: 32px;
-    font-size: 12px;
-    font-weight: 500
-  }
-
-  .time-input {
-    background: var(--surf-con);
-    border: 1.5px solid var(--outline-var);
-    border-radius: 12px;
-    color: var(--on-surf);
-    font-size: 16px;
-    padding: 8px 12px 8px 12px;
-    width: 110px;
-    text-align: center;
-    outline: none;
-    font-family: Google Sans, sans-serif;
-    color-scheme: dark
-  }
-
-  .time-input:focus {
-    border-color: var(--pri)
-  }
-
-  .time-input::-webkit-calendar-picker-indicator {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='%23cac4d0'%3E%3Cpath d='M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z'/%3E%3C/svg%3E");
-    cursor: pointer
-  }
-
-  #s-bright .card .li {
-    border-bottom: none
-  }
-
-  #s-bright #dim-sched .li {
-    border-bottom: none
-  }
-
-  #pgrid .tile-item {
-    border-bottom: none
-  }
-
-  .bs-sep {
-    height: 1px;
-    background: var(--outline-var);
-    margin: 4px 0
-  }
-
-  .np-gear-btn {
-    background: 0 0;
-    border: none;
-    color: var(--on-surf-var);
-    cursor: pointer;
-    border-radius: 50%;
-    width: 36px;
-    height: 36px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: background .15s
-  }
-
-  .np-gear-btn:hover {
-    background: color-mix(in srgb, var(--on-surf)10%, transparent)
-  }
-
-  .np-gear-btn:active {
-    background: color-mix(in srgb, var(--on-surf)16%, transparent)
-  }
-
-  .np-gear-btn {
-    background: 0 0;
-    border: none;
-    color: var(--on-surf-var);
-    cursor: pointer;
-    border-radius: 50%;
-    width: 36px;
-    height: 36px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: background .15s
-  }
-
-  .np-gear-btn:hover {
-    background: color-mix(in srgb, var(--on-surf)10%, transparent)
-  }
-
-  .np-gear-btn:active {
-    background: color-mix(in srgb, var(--on-surf)16%, transparent)
-  }
-
-  .sw-toggle-btn.playing {
-    color: var(--pri);
-    background: color-mix(in srgb, var(--pri)16%, transparent)
-  }
-
-  .md-scrim {
-    background: #00000066;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity .25s;
-    position: fixed;
-    inset: 0;
-    z-index: 100
-  }
-
-  .md-scrim.open {
-    opacity: 1;
-    pointer-events: auto
-  }
-
-  .md-dialog {
-    background: var(--surf-high);
-    border-radius: 28px;
-    box-shadow: 0 4px 32px #0006;
-    max-width: 360px;
-    width: calc(100% - 48px);
-    position: fixed;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%) scale(.9);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity .25s, transform .25s cubic-bezier(.2, 0, 0, 1);
-    z-index: 101;
-    overflow: hidden
-  }
-
-  .md-dialog.open {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translate(-50%, -50%) scale(1)
-  }
-
-  .mdd-head {
-    align-items: center;
-    gap: 16px;
-    padding: 24px 24px 16px;
-    display: flex
-  }
-
-  .mdd-icon {
-    background: var(--pri-con);
-    border-radius: 50%;
-    color: var(--pri);
-    flex-shrink: 0;
-    justify-content: center;
-    align-items: center;
-    width: 40px;
-    height: 40px;
-    display: flex
-  }
-
-  .mdd-title {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 18px;
-    font-weight: 500;
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap
-  }
-
-  .mdd-body {
-    padding: 0 24px 12px
-  }
-
-  .mdd-tf-wrap {
-    background: var(--surf-var);
-    border-bottom: 2px solid var(--outline);
-    border-radius: 4px 4px 0 0;
-    padding: 0 16px;
-    margin-top: 4px
-  }
-
-  .mdd-tf-wrap:focus-within {
-    border-bottom-color: var(--pri)
-  }
-
-  .mdd-label {
-    letter-spacing: .4px;
-    color: var(--on-surf-var);
-    padding-top: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    display: block
-  }
-
-  .mdd-tf-wrap:focus-within .mdd-label {
-    color: var(--pri)
-  }
-
-  .mdd-input {
-    width: 100%;
-    color: var(--on-surf);
-    background: 0 0;
-    border: none;
-    outline: none;
-    padding: 6px 0 10px;
-    font-family: Roboto, sans-serif;
-    font-size: 16px
-  }
-
-  .mdd-actions {
-    gap: 8px;
-    justify-content: flex-end;
-    padding: 8px 16px 20px;
-    display: flex
-  }
-
-  #home-bar {
-    background-color: var(--bg);
-    background-image: linear-gradient(180deg, color-mix(in srgb, var(--pri-con) 50%, transparent) 0%, var(--bg) 100%)
-  }
-
-  .wave-hand {
-    display: inline-block;
-    transform-origin: 50% 82%;
-    animation: wave-once 1.2s ease-in-out 1
-  }
-
-  @keyframes wave-once {
-    0% {
-      transform: rotate(0deg)
-    }
-
-    10% {
-      transform: rotate(14deg)
-    }
-
-    20% {
-      transform: rotate(-8deg)
-    }
-
-    30% {
-      transform: rotate(14deg)
-    }
-
-    40% {
-      transform: rotate(-4deg)
-    }
-
-    50% {
-      transform: rotate(10deg)
-    }
-
-    60%,
-    100% {
-      transform: rotate(0deg)
-    }
-  }
-
-  .greet-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    vertical-align: middle;
-    cursor: pointer
-  }
-
-  .greet-icon {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 1;
-    transition: opacity .2s
-  }
-
-  .greet-icon.hidden-icon {
-    opacity: 0;
-    pointer-events: none
-  }
-
-  #display-card .li {
-    border-bottom: none
-  }
-
-  #periferice-card .li {
-    border-bottom: none
-  }
-
-  #nlist .li {
-    border-bottom: none
-  }
-
-  #display-settings-card .li {
-    border-bottom: none
-  }
-
-  .tile-item:hover {
-    background: color-mix(in srgb, var(--on-surf)6%, transparent)
-  }
-
-  .cvx-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: 10px
-  }
-
-  .cvx-grid {
-    display: grid;
-    grid-template-columns: repeat(32, 1fr);
-    grid-template-rows: repeat(8, 1fr);
-    gap: 2px;
-    width: 100%;
-    aspect-ratio: 32/8;
-    background: var(--surf-con);
-    border-radius: 12px;
-    padding: 8px;
-    touch-action: none;
-    user-select: none;
-    -webkit-user-select: none
-  }
-
-  .cvx-px {
-    border-radius: 50%;
-    background: var(--surf-var);
-    transition: background .06s;
-    cursor: pointer
-  }
-
-  .cvx-px.on {
-    background: var(--pri)
-  }
-
-  .cvx-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end
-  }
-
-  .cvx-clear-btn {
-    background: 0 0;
-    border: 1px solid var(--outline-var);
-    color: var(--on-surf-var);
-    cursor: pointer;
-    letter-spacing: .1px;
-    border-radius: 100px;
-    padding: 6px 16px;
-    font-family: Google Sans, sans-serif;
-    font-size: 12px;
-    font-weight: 500
-  }
-
-  .cvx-clear-btn:hover {
-    background: color-mix(in srgb, var(--on-surf)8%, transparent)
-  }
-
-  .toast-wrap {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 24px;
-    display: flex;
-    justify-content: center;
-    z-index: 500;
-    pointer-events: none
-  }
-
-  .toast {
-    background: var(--surf-high);
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 13px;
-    font-weight: 500;
-    padding: 10px 20px 10px 14px;
-    border-radius: 100px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
-    max-width: 90vw;
-    text-align: center;
-    opacity: 0;
-    transform: translateY(12px);
-    transition: opacity .2s ease, transform .2s ease;
-    display: flex;
-    align-items: center;
-    gap: 10px
-  }
-
-  .toast.show {
-    opacity: 1;
-    transform: translateY(0)
-  }
-
-  .toast-icon {
-    flex-shrink: 0;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: var(--pri);
-    color: #381e72;
-    display: flex;
-    align-items: center;
-    justify-content: center
-  }
-
-  .toast-icon svg {
-    width: 14px;
-    height: 14px
-  }
-
-  .accent-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    padding: 18px 16px
-  }
-
-  .accent-swatch {
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-    position: relative;
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .1);
-    transition: transform .12s
-  }
-
-  .accent-swatch:active {
-    transform: scale(.92)
-  }
-
-  .accent-swatch:before {
-    content: "";
-    position: absolute;
-    inset: -4px;
-    border-radius: 50%;
-    border: 2px solid var(--on-surf);
-    opacity: 0;
-    transition: opacity .12s
-  }
-
-  .accent-swatch.sel:before {
-    opacity: 1
-  }
-
-  .accent-swatch svg {
-    position: absolute;
-    inset: 0;
-    margin: auto;
-    width: 20px;
-    height: 20px;
-    opacity: 0;
-    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .4))
-  }
-
-  .accent-swatch.sel svg {
-    opacity: 1
-  }
-
-  .accent-custom-row {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 14px 16px;
-    transition: background .12s;
-    position: relative
-  }
-
-  .accent-custom-row:hover {
-    background: color-mix(in srgb, var(--on-surf) 6%, transparent)
-  }
-
-  .accent-custom-swatch {
-    flex-shrink: 0;
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    position: relative;
-    overflow: hidden;
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15);
-    transition: box-shadow .12s
-  }
-
-  .accent-custom-swatch.sel {
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15), 0 0 0 3px var(--surf-low), 0 0 0 5px var(--on-surf)
-  }
-
-  .accent-custom-swatch input[type=color] {
-    position: absolute;
-    inset: -8px;
-    width: calc(100% + 16px);
-    height: calc(100% + 16px);
-    border: none;
-    padding: 0;
-    cursor: pointer;
-    background: 0 0
-  }
-
-  .accent-custom-body {
-    flex: 1;
-    min-width: 0;
-    text-align: left
-  }
-
-  .accent-custom-title {
-    color: var(--on-surf);
-    font-family: Google Sans, sans-serif;
-    font-size: 16px
-  }
-
-  .accent-custom-sub {
-    color: var(--on-surf-var);
-    font-size: 13px;
-    margin-top: 2px
-  }
-
-  .accent-custom-check {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity .12s
-  }
-
-  .accent-custom-check svg {
-    width: 20px;
-    height: 20px;
-    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .4))
-  }
-
-  .accent-custom-swatch.sel .accent-custom-check {
-    opacity: 1
-  }
-</style>
-
-<body class=boot-hide>
-  <script>
-    (function() {
-      try {
-        var v = localStorage.getItem(`darkMode`);
-        if (v === `0`) document.body.classList.add(`light`)
-      } catch (e) {}
-    })()
-  </script>
-  <div class="screen active" id=s-home>
-    <div class=top-bar id=home-bar style="flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:40px 16px 28px;gap:0">
-      <div class=home-title id=home-title>Octoglow</div><span id=home-sub style=display:none></span>
-    </div>
-    <div class=content><span id=h-ip style=display:none></span>
-      <div class=sl>Conexiune</div>
-      <div class=card>
-        <div onclick="go('s-wifi')" class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>WiFi</div>
-            <div class=li-sub id=h-ssid>Se incarca…</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="go('s-ap')" class=li style="border-bottom:none">
-          <div class="lic lc-blu"><svg viewbox="0 -960 960 960" fill=currentColor height=20 width=20>
-              <path d="M200-120q-33 0-56.5-23.5T120-200v-160q0-33 23.5-56.5T200-440h400v-160h80v160h80q33 0 56.5 23.5T840-360v160q0 33-23.5 56.5T760-120H200Zm0-80h560v-160H200v160Zm108.5-51.5Q320-263 320-280t-11.5-28.5Q297-320 280-320t-28.5 11.5Q240-297 240-280t11.5 28.5Q263-240 280-240t28.5-11.5Zm140 0Q460-263 460-280t-11.5-28.5Q437-320 420-320t-28.5 11.5Q380-297 380-280t11.5 28.5Q403-240 420-240t28.5-11.5Zm140 0Q600-263 600-280t-11.5-28.5Q577-320 560-320t-28.5 11.5Q520-297 520-280t11.5 28.5Q543-240 560-240t28.5-11.5ZM570-630l-58-58q26-24 58-38t70-14q38 0 70 14t58 38l-58 58q-14-14-31.5-22t-38.5-8q-21 0-38.5 8T570-630ZM470-730l-56-56q44-44 102-69t124-25q66 0 124 25t102 69l-56 56q-33-33-76.5-51.5T640-800q-50 0-93.5 18.5T470-730ZM200-200v-160 160Z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>AP</div>
-            <div class=li-sub id=h-ap-sub>Configureaza reteaua proprie</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl>Display</div>
-      <div class=card id=display-card>
-        <div onclick="go('s-tiles')" class=li>
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Tile Manager</div>
-            <div class=li-sub id=h-tiles-sub>Ora · Data · Temperatura</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="go('s-langmgr')" class=li>
-          <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Language Manager</div>
-            <div class=li-sub id=h-lang-sub>Limba afisare meteo</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="go('s-bright')" class=li style="border-bottom:none">
-          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c-.39.39-1.03.39-1.41 0-.39-.39-.39-1.02 0-1.41l1.06-1.06c.39-.39 1.03-.39 1.41 0 .39.39.39 1.02 0 1.41L5.99 19.41z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Luminozitate</div>
-            <div class=li-sub id=h-bright-sub>Nivel 4</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl>Periferice</div>
-      <div class=card id=periferice-card>
-        <div onclick="go('s-buzzer')" class=li>
-          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Buzzer</div>
-            <div class=li-sub id=h-bsub-home>Volum si tonuri presetate</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="go('s-touch')" class=li style="border-bottom:none">
-          <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Touch Sensor</div>
-            <div class=li-sub>Tap si Double Tap actions</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl>Despre</div>
-      <div class=card>
-        <div onclick="go('s-about')" class=li>
-          <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>About</div>
-            <div class=li-sub>Versiune, IP, uptime</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=screen id=s-about>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>About</div>
-      </div>
-    </div>
-    <div class=content style="display:flex;flex-direction:column;align-items:center;text-align:center">
-      <div style="width:84px;height:84px;margin:24px 0 16px"><svg viewBox="0 0 256 256" width="84" height="84">
-          <circle cx="128" cy="128" r="128" fill="var(--on-pri-con)" opacity="0.137" />
-          <circle cx="128" cy="128" r="107.52" fill="var(--on-pri-con)" opacity="0.255" />
-          <circle cx="128" cy="128" r="92.16" fill="var(--on-pri-con)" opacity="0.392" />
-          <circle cx="128.00" cy="25.60" r="11.52" fill="var(--pri-con)" />
-          <circle cx="200.41" cy="55.59" r="11.52" fill="var(--pri-con)" />
-          <circle cx="230.40" cy="128.00" r="11.52" fill="var(--pri-con)" />
-          <circle cx="200.41" cy="200.41" r="11.52" fill="var(--pri-con)" />
-          <circle cx="128.00" cy="230.40" r="11.52" fill="var(--pri-con)" />
-          <circle cx="55.59" cy="200.41" r="11.52" fill="var(--pri-con)" />
-          <circle cx="25.60" cy="128.00" r="11.52" fill="var(--pri-con)" />
-          <circle cx="55.59" cy="55.59" r="11.52" fill="var(--pri-con)" />
-          <circle cx="128" cy="128" r="71.68" fill="var(--pri-con)" />
-          <circle cx="99.328" cy="99.328" r="23.04" fill="#FFFFFF" />
-        </svg></div>
-      <div style="font-family:Google Sans,sans-serif;font-size:28px;color:var(--on-surf);font-weight:500">Octoglow</div>
-      <div style="color:var(--on-surf-var);font-size:13px;margin-top:4px;letter-spacing:.3px">Firmware pentru ceas inteligent ESP32</div>
-      <div class=sl style="width:100%;text-align:left;margin-top:24px">Info</div>
-      <div class=card style="width:100%;text-align:left">
-        <div class="li static hoverable" style="border-bottom:none">
-          <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.9 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.66-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Adresa IP</div>
-            <div class="li-sub ip-val" id=about-ip>-</div>
-          </div>
-        </div>
-        <div class="li static hoverable" style="border-bottom:none">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 8a4 4 0 0 0-4 4 1 1 0 0 0 2 0 2 2 0 0 1 2-2 1 1 0 0 0 0-2zm0-6C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Uptime</div>
-            <div class=li-sub id=about-uptime>-</div>
-          </div>
-        </div>
-      </div>
-      <div class=sl style="width:100%;text-align:left">User</div>
-      <div class=card style="width:100%;text-align:left">
-        <div onclick="openUserAccountDlg()" class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>User Account</div>
-            <div class=li-sub>Schimba utilizatorul sau parola</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="go('s-accent-color')" class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10c1.38 0 2.5-1.12 2.5-2.5 0-.61-.23-1.2-.64-1.67-.08-.1-.13-.21-.13-.33 0-.28.22-.5.5-.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 8 6.5 8 8 8.67 8 9.5 7.33 11 6.5 11zm3-4C8.67 7 8 6.33 8 5.5S8.67 4 9.5 4s1.5.67 1.5 1.5S10.33 7 9.5 7zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 4 14.5 4s1.5.67 1.5 1.5S15.33 7 14.5 7zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 8 17.5 8s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Accent Color</div>
-            <div class=li-sub>Personalizeaza culoarea de accent</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div class="li static hoverable" style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Dark Mode</div>
-            <div class=li-sub>Tema intunecata a interfetei</div>
-          </div>
-          <div class=li-trail>
-            <div class=sw onclick=toggleDarkMode()><input type=checkbox id=dark-mode-cb checked><span class=sw-track></span><span class=sw-thumb></span></div>
-          </div>
-        </div>
-        <div onclick="go('s-help-manager')" class=li style="border-bottom:none">
-          <div class="lic lc-blu"><svg viewbox="0 -960 960 960" fill=currentColor height=20 width=20>
-              <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Help Manager</div>
-            <div class=li-sub>Ajutor pentru setari si conectare</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl style="width:100%;text-align:left">Software</div>
-      <div class=card style="width:100%;text-align:left">
-        <div class="li static hoverable" style="border-bottom:none">
-          <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Version</div>
-            <div class=li-sub id=sw-version>-</div>
-          </div>
-        </div>
-        <div onclick="openSwUpdateDlg()" class=li style="border-bottom:none">
-          <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Software Updates</div>
-            <div class=li-sub>Verifica daca exista o versiune noua</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=screen id=s-help-manager>
-    <div class=top-bar><button onclick="go('s-about')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Help Manager</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Subiecte de ajutor</div>
-      <div class=card>
-        <div onclick="openHelpTopicDlg('sender')" class=li style="border-bottom:none">
-          <div class="lic lc-blu"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Octoglow Sender</div>
-            <div class=li-sub>Cum trimiti continut catre ceas</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="openHelpTopicDlg('ap')" class=li style="border-bottom:none">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3a4.237 4.237 0 0 0-6 0zm-4-4l2 2a7.074 7.074 0 0 1 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>AP</div>
-            <div class=li-sub>Conectare prin modul Access Point</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="openHelpTopicDlg('lang')" class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Switch a Tile/Interface Language</div>
-            <div class=li-sub>Schimba limba tile-urilor sau a interfetei</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=md-scrim id=help-topic-scrim onclick=closeHelpTopicDlg()></div>
-  <div class=md-dialog id=help-topic-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
-          <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
-        </svg></div>
-      <div class=mdd-title id=help-topic-title>Subiect</div>
-    </div>
-    <div class=mdd-body>
-      <div id=help-topic-body style="color:var(--on-surf-var);font-size:13px;line-height:1.6;max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeHelpTopicDlg()>OK</button></div>
-  </div>
-  <div class=screen id=s-accent-color>
-    <div class=top-bar><button onclick="go('s-about')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Accent Color</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Preseturi</div>
-      <div class=card>
-        <div class=accent-grid id=accent-preset-grid></div>
-      </div>
-      <div class=sl>Personalizat</div>
-      <div class=card>
-        <div class=accent-custom-row>
-          <div class=accent-custom-swatch id=accent-custom-swatch-wrap><input type=color id=accent-custom-input oninput="onAccentCustomPick(this.value)" value=#d0bcff><div class=accent-custom-check id=accent-custom-check></div></div>
-          <div class=accent-custom-body>
-            <div class=accent-custom-title>Culoare personalizata</div>
-            <div class=accent-custom-sub>Alege orice culoare din paleta</div>
-          </div>
-        </div>
-        <div onclick=resetAccentColor() class=li style="border-bottom:none">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 5V2L8 6l4 4V7c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Reseteaza la implicit</div>
-            <div class=li-sub>Revino la culoarea originala</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=md-scrim id=useracct-scrim onclick=closeUserAccountDlg()></div>
-  <div class=md-dialog id=useracct-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
-        </svg></div>
-      <div class=mdd-title>User Account</div>
-    </div>
-    <div class=mdd-body>
-      <div class=mdd-tf-wrap><label class=mdd-label>User</label><input class=mdd-input id=ua-user-in autocomplete=username maxlength=32></div>
-      <div class=mdd-tf-wrap id=ua-curpass-wrap style=display:none><label class=mdd-label>Parola actuala</label><input class=mdd-input id=ua-curpass-in type=password autocomplete=current-password maxlength=64></div>
-      <div class=mdd-tf-wrap><label class=mdd-label>New Password</label><input class=mdd-input id=ua-newpass-in type=password autocomplete=new-password maxlength=64 placeholder="Lasa gol pentru a pastra parola actuala"></div>
-      <div class=msg id=ua-msg></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeUserAccountDlg()>Anuleaza</button><button class="mbtn mbtn-fill" id=ua-save-btn onclick=saveUserAccount()>Salveaza</button></div>
-  </div>
-  <div class=md-scrim id=sw-update-scrim onclick=closeSwUpdateDlg()></div>
-  <div class=md-dialog id=sw-update-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
-        </svg></div>
-      <div class=mdd-title id=sw-update-title>Software Updates</div>
-    </div>
-    <div class=mdd-body>
-      <div id=sw-searching style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 0;gap:16px"><span class=spin-ring></span>
-        <div style="color:var(--on-surf-var);font-size:14px">Searching for updates...</div>
-      </div>
-      <div id=sw-uptodate style="display:none;text-align:center;padding:20px 0;color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:15px">You are up to date</div>
-      <div id=sw-checkerr style="display:none;text-align:center;padding:20px 0;color:var(--err);font-size:14px">Nu s-a putut verifica actualizarea. Incearca din nou.</div>
-      <div id=sw-newupdate style="display:none">
-        <div style="color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:15px;font-weight:500;margin-bottom:6px">There is a new update available</div>
-        <div id=sw-ver-compare style="color:var(--pri);font-family:Google Sans,sans-serif;font-size:19px;font-weight:500;margin-bottom:14px">0.1 → 0.2</div>
-        <div id=sw-update-desc style="color:var(--on-surf-var);font-size:13px;line-height:1.6;max-height:180px;overflow-y:auto;white-space:pre-wrap"></div>
-      </div>
-      <div id=sw-installing style="display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 0;gap:16px"><span class=spin-ring></span>
-        <div style="color:var(--on-surf-var);font-size:14px" id=sw-install-status>Se instaleaza update-ul...</div>
-      </div>
-    </div>
-    <div class=mdd-actions id=sw-actions-uptodate style="display:none"><button class="mbtn mbtn-fill" onclick=closeSwUpdateDlg()>OK</button></div>
-    <div class=mdd-actions id=sw-actions-newupdate style="display:none"><button class="mbtn mbtn-ton" onclick=closeSwUpdateDlg()>Cancel</button><button class="mbtn mbtn-fill" onclick=installSwUpdate()>Install</button></div>
-  </div>
-  <div class=screen id=s-bright>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Luminozitate</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=card>
-        <div class="li static">
-          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.02 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.02 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.02 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.02 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM5.99 19.41c-.39.39-1.03.39-1.41 0-.39-.39-.39-1.02 0-1.41l1.06-1.06c.39-.39 1.03-.39 1.41 0 .39.39.39 1.02 0 1.41L5.99 19.41z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head id=bright-screen-lbl>Nivel 4</div>
-            <div class=li-sub>0 – 16</div>
-          </div>
-        </div>
-        <div class="li static" style="padding:4px 16px 12px">
-          <div class="dur-row" style="width:100%"><input type=range min=0 max=16 step=1 class=simple-slider id=bright-slider oninput=onBrightInput(this.value)><span class="dur-val" id=br-val>4</span></div>
-        </div>
-      </div>
-      <div class=card>
-        <div class="li static hoverable">
-          <div class="lic lc-pur"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36-.98 1.37-2.58 2.26-4.4 2.26-2.98 0-5.4-2.42-5.4-5.4 0-1.81.89-3.42 2.26-4.4-.44-.06-.9-.1-1.36-.1z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Dim automat</div>
-            <div class=li-sub>Reduce luminozitatea noaptea</div>
-          </div>
-          <div class=li-trail>
-            <div class=sw onclick=toggleDimAuto()><input type=checkbox id=dim-auto-cb><span class=sw-track></span><span class=sw-thumb></span></div>
-          </div>
-        </div>
-        <div id=dim-sched class=dim-sched-wrap>
-          <div class="li static">
-            <div class=li-body style="padding-left:0">
-              <div class=li-head>Interval</div>
-              <div class=li-sub>De la / pana la</div>
-            </div>
-            <div class=li-trail style="display:flex;align-items:center;gap:8px"><input type=time class=time-input id=dim-from value=22:00><span style="color:var(--on-surf-var)">–</span><input type=time class=time-input id=dim-to value=07:00></div>
-          </div>
-          <div class="li static" style="padding:4px 16px 8px;flex-direction:column;align-items:flex-start;gap:8px">
-            <div class=li-head>Luminozitate noapte</div>
-            <div class="dur-row" style="width:100%"><input type=range min=0 max=16 step=1 class=simple-slider id=dim-level-slider value=1 oninput=onDimLevelInput(this.value)><span class="dur-val" id=dim-level-lbl>1</span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=screen id=s-buzzer>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Buzzer Settings</div>
-      </div>
-      <div class=sw style="margin-right:8px" onclick=toggleBuzzer()><input checked id=btog-cb type=checkbox><span class=sw-track></span><span class=sw-thumb></span></div>
-    </div>
-    <div class=content><span id=h-bsub style=display:none>Beep la schimbarea tile-ului</span>
-      <div class=sl>Event Sound Assignment</div>
-      <div class=card id=event-sound-card></div>
-    </div>
-  </div>
-  <div class=screen id=s-touch>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Touch Sensor Actions</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Gesture Actions</div>
-      <div class=card id=touch-action-card></div>
-    </div>
-  </div>
-  <div class=screen id=s-wifi>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>WiFi</div>
-      </div><button class=bar-lead onclick=doScan() title=Scan id=scan-btn><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M17.65 6.35A7.96 7.96 0 0012 4C7.58 4 4 7.58 4 12s3.58 8 8 8 8-3.58 8-8h-2c0 3.31-2.69 6-6 6s-6-2.69-6-6 2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
-        </svg></button><button class=bar-lead onclick=openDisconDialog() title="Comuta in modul AP" id=switch-ap-btn style=display:none><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
-          <path d="M200-120q-33 0-56.5-23.5T120-200v-160q0-33 23.5-56.5T200-440h400v-160h80v160h80q33 0 56.5 23.5T840-360v160q0 33-23.5 56.5T760-120H200Zm0-80h560v-160H200v160Zm108.5-51.5Q320-263 320-280t-11.5-28.5Q297-320 280-320t-28.5 11.5Q240-297 240-280t11.5 28.5Q263-240 280-240t28.5-11.5Zm140 0Q460-263 460-280t-11.5-28.5Q437-320 420-320t-28.5 11.5Q380-297 380-280t11.5 28.5Q403-240 420-240t28.5-11.5Zm140 0Q600-263 600-280t-11.5-28.5Q577-320 560-320t-28.5 11.5Q520-297 520-280t11.5 28.5Q543-240 560-240t28.5-11.5ZM570-630l-58-58q26-24 58-38t70-14q38 0 70 14t58 38l-58 58q-14-14-31.5-22t-38.5-8q-21 0-38.5 8T570-630ZM470-730l-56-56q44-44 102-69t124-25q66 0 124 25t102 69l-56 56q-33-33-76.5-51.5T640-800q-50 0-93.5 18.5T470-730ZM200-200v-160 160Z" />
-        </svg></button><button class=bar-lead onclick=openSwitchWifiDialog() title="Comuta in modul WiFi" id=switch-wifi-btn style=display:none><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-        </svg></button>
-    </div>
-    <div class=content><span id=w-ssid style=display:none></span><span id=w-ip style=display:none></span>
-      <div class=sl>Retele WiFi</div>
-      <div class=wlist id=nlist>
-        <div class=scan-hint><span class=spin-ring></span>Se cauta retele…</div>
-      </div>
-
-      <div class=md-scrim id=md-scrim onclick=closeDialog()></div>
-      <div class=md-dialog id=conn-dlg>
-        <div class=mdd-head>
-          <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-              <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-            </svg></div>
-          <div class=mdd-title id=dlg-ssid-name>Conecteaza la retea</div>
-        </div>
-        <div class=mdd-body id=dlg-pass-body>
-          <div class=mdd-tf-wrap><label class=mdd-label>Parola WiFi</label><input class=mdd-input placeholder="Introdu parola" autocomplete=off id=pass-in type=password></div>
-        </div>
-        <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDialog()>Anuleaza</button><button class="mbtn mbtn-fill" id=conn-btn onclick=doConnect()>Conecteaza</button></div>
-      </div>
-    </div>
-  </div>
-  <div class=screen id=s-ap>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Access Point</div>
-      </div><button class=bar-lead onclick="openHelpTopicDlg('ap')" title="Ajutor AP"><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
-          <path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z" />
-        </svg></button><button class=bar-lead onclick=openDisconDialog() title="Comuta in modul AP" id=ap-switch-btn style=display:none><svg viewbox="0 -960 960 960" fill=currentColor height=24 width=24>
-          <path d="M200-120q-33 0-56.5-23.5T120-200v-160q0-33 23.5-56.5T200-440h400v-160h80v160h80q33 0 56.5 23.5T840-360v160q0 33-23.5 56.5T760-120H200Zm0-80h560v-160H200v160Zm108.5-51.5Q320-263 320-280t-11.5-28.5Q297-320 280-320t-28.5 11.5Q240-297 240-280t11.5 28.5Q263-240 280-240t28.5-11.5Zm140 0Q460-263 460-280t-11.5-28.5Q437-320 420-320t-28.5 11.5Q380-297 380-280t11.5 28.5Q403-240 420-240t28.5-11.5Zm140 0Q600-263 600-280t-11.5-28.5Q577-320 560-320t-28.5 11.5Q520-297 520-280t11.5 28.5Q543-240 560-240t28.5-11.5ZM570-630l-58-58q26-24 58-38t70-14q38 0 70 14t58 38l-58 58q-14-14-31.5-22t-38.5-8q-21 0-38.5 8T570-630ZM470-730l-56-56q44-44 102-69t124-25q66 0 124 25t102 69l-56 56q-33-33-76.5-51.5T640-800q-50 0-93.5 18.5T470-730ZM200-200v-160 160Z" />
-        </svg></button>
-    </div>
-    <div class=content>
-      <div class=sl>Configurare Retea AP</div>
-      <div class=card style="padding:6px 16px 18px">
-        <div class=mdd-tf-wrap><label class=mdd-label>Nume retea (SSID)</label><input class=mdd-input id=ap-ssid-in placeholder="ex: Octoglow" maxlength=32 autocomplete=off></div>
-        <div class=mdd-tf-wrap style="margin-top:10px;display:flex;align-items:center;padding-right:8px">
-          <div style="flex:1"><label class=mdd-label>Parola (minim 8 caractere; lasa gol pentru a pastra parola curenta)</label><input class=mdd-input id=ap-pass-in type=password placeholder="Parola retea" maxlength=64 autocomplete=off oninput=onApPassInput()></div><button type=button id=ap-pass-eye onclick=toggleApPassVis() style="background:none;border:none;cursor:pointer;padding:4px;color:var(--on-surf-var);flex-shrink:0;display:flex;align-items:center;align-self:flex-end;margin-bottom:6px" title="Arata/ascunde parola"><svg id=ap-pass-eye-icon width=20 height=20 viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" />
-            </svg></button>
-        </div>
-        <div class=msg id=ap-msg></div><button class="mbtn mbtn-fill" style="width:100%;margin-top:16px" onclick=saveApSettings() id=ap-save-btn>Salveaza</button>
-      </div>
-      <div class="sugg-box sugg-box-ap">
-        <div class=sugg-title>Looking for something else?</div>
-        <div class=sugg-rows>
-          <div onclick="go('s-about')" class=sugg-row>
-            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
-                <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.9 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.66-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z" />
-              </svg></div>
-            <div class=sugg-row-text>See My IP Address</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=md-scrim id=discon-scrim onclick=closeDisconDialog()></div>
-  <div class=md-dialog id=discon-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-        </svg></div>
-      <div class=mdd-title id=discon-ssid-name>Comutare in modul AP</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:14px;padding:4px 0 8px">Doresti sa opresti conexiunea WiFi si sa pornesti modul Access Point?</div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDisconDialog()>Anuleaza</button><button class="mbtn mbtn-fill" onclick=doDisconnect()>Confirma</button></div>
-  </div>
-  <div class=md-scrim id=switch-wifi-scrim onclick=closeSwitchWifiDialog()></div>
-  <div class=md-dialog id=switch-wifi-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
-        </svg></div>
-      <div class=mdd-title>Comutare in modul WiFi</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:14px;padding:4px 0 8px">Doresti sa opresti modul Access Point si sa te reconectezi la reteaua WiFi salvata anterior?</div>
-      <div class=msg id=switch-wifi-msg></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeSwitchWifiDialog()>Anuleaza</button><button class="mbtn mbtn-fill" id=switch-wifi-confirm-btn onclick=doSwitchToWifi()>Confirma</button></div>
-  </div>
-  <div class=screen id=s-tiles>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Tile Manager</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Setari Afisare</div>
-      <div class=card id=display-settings-card>
-        <div onclick="go('s-hideicons')" class=li>
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Disable Tile Icons</div>
-            <div class=li-sub>Ascunde iconitele din stanga tile-urilor</div>
-          </div>
-          <div class=li-trail>
-            <div class=sw onclick="event.stopPropagation();toggleHideIcons()"><input type=checkbox id=hide-icons-cb><span class=sw-track></span><span class=sw-thumb></span></div><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span>
-          </div>
-        </div>
-        <div class="li" onclick="go('s-iconsettings')">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Icon Settings</div>
-            <div class=li-sub>Alege iconita afisata pentru fiecare tile</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div class="li" onclick="go('s-scrolltype')">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M13 3c-4.42 0-8 3.58-8 8H2l3.89 3.89.07.14L10 11H7c0-3.31 2.69-6 6-6s6 2.69 6 6-2.69 6-6 6c-1.66 0-3.14-.69-4.22-1.78l-1.42 1.42C8.68 18.11 10.75 19 13 19c4.42 0 8-3.58 8-8s-3.58-8-8-8zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Scroll Type</div>
-            <div class=li-sub>Modul de scroll al textului pe tile-uri</div>
-          </div>
-          <div class=li-trail><select class=evsnd-select onclick="event.stopPropagation()" onchange=setScrollType(this.value) id=scroll-type-sel style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">
-              <option value=0 selected>Bounce</option>
-              <option value=1>Wrap</option>
-              <option value=2>Bounce + Icon</option>
-              <option value=3>Wrap + Icon</option>
-            </select><span class=chevron onclick="event.stopPropagation();go('s-scrolltype')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div class="li" onclick="go('s-tiletransition')">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Tile Transition</div>
-            <div class=li-sub>Efectul de tranzitie intre tile-uri</div>
-          </div>
-          <div class=li-trail><select class=evsnd-select onclick="event.stopPropagation()" onchange=setTileTransitionGlobal(this.value) id=tile-transition-sel style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">
-              <option value=0 selected>Nothing</option>
-              <option value=1>Scroll Left</option>
-              <option value=2>Scroll Right</option>
-              <option value=3>Scroll Up</option>
-              <option value=4>Scroll Down</option>
-              <option value=5>Morph</option>
-              <option value=6>Fade In &amp; Out</option>
-              <option value=7>Expand Left</option>
-              <option value=8>Expand Right</option>
-              <option value=9>Expand Centre</option>
-            </select><span class=chevron onclick="event.stopPropagation();go('s-tiletransition')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div class="li" style="border-bottom:none" onclick="go('s-fonttype')">
-          <div class="lic lc-tea"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M9.93 13.5h4.14L12 7.98zM20 2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-4.05 16.5l-1.14-3H9.17l-1.12 3H5.96l5.11-13h1.86l5.11 13h-2.09z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Font Type</div>
-            <div class=li-sub>Fontul folosit pentru textul de pe tile-uri</div>
-          </div>
-          <div class=li-trail><select class=evsnd-select onclick="event.stopPropagation()" onchange=setFontType(this.value) id=font-type-sel style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">
-              <option value=0 selected>Marymba</option>
-              <option value=1>Tiko</option>
-            </select><span class=chevron onclick="event.stopPropagation();go('s-fonttype')"><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-      <div class=sl>Circuit Tiles</div>
-      <div class=card id=tgrid></div>
-      <div class=sl>Priority Tiles</div>
-      <div class=card id=pgrid></div>
-      <div class="sugg-box sugg-box-pad">
-        <div class=sugg-title>Looking for something else?</div>
-        <div class=sugg-rows>
-          <div onclick="go('s-buzzer')" class=sugg-row>
-            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
-                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
-              </svg></div>
-            <div class=sugg-row-text>Buzzer Tones</div>
-          </div>
-          <div onclick="go('s-touch')" class=sugg-row>
-            <div class=sugg-row-icon><svg viewbox="0 0 24 24" fill=currentColor>
-                <path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z" />
-              </svg></div>
-            <div class=sugg-row-text>Touch Sensor Actions</div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class=md-scrim id=sett-scrim onclick=closeSettingsDlg()></div>
-    <div class=md-dialog id=sett-dlg>
-      <div class=mdd-head>
-        <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-            <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
-          </svg></div>
-        <div class=mdd-title>Setari Display</div>
-      </div>
-      <div class=mdd-body>
-        <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:4px 0 12px;font-weight:500">Ce sa afiseze ceasul</div>
-        <div style="display:flex;flex-direction:column;gap:8px" id=sett-items-list></div>
-        <div style="height:16px"></div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0 4px;border-top:1px solid var(--outline-var)">
-          <div>
-            <div style="color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:15px">Buzzer</div>
-            <div style="color:var(--on-surf-var);font-size:12px;margin-top:2px">Beep la schimbarea tile-ului</div>
-          </div>
-          <div class=sw onclick=toggleBuzzerSett()><input id=sett-buz-cb type=checkbox><span class=sw-track></span><span class=sw-thumb></span></div>
-        </div>
-      </div>
-      <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeSettingsDlg()>Gata</button></div>
-    </div>
-  </div>
-  <div class=md-scrim id=np-sett-scrim onclick=closeNpSettingsDlg()></div>
-  <div class=md-dialog id=np-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-        </svg></div>
-      <div class=mdd-title>Now Playing</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Ce sa afiseze pe ceas</div>
-      <div class=card id=np-mode-list></div>
-      <div style="height:16px"></div>
-      <div class=card>
-        <div class=li style="border-bottom:none">
-          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></div>
-          <div class=li-body>
-            <div class=li-head>Adaptive Icon</div>
-            <div class=li-sub>Arata o iconita diferita cand sursa e un player video (Chrome, Edge etc.)</div>
-          </div>
-          <div class=li-trail>
-            <div class=sw onclick="toggleNpAdaptiveIcon()"><input type=checkbox id=np-adaptive-icon-cb checked><span class=sw-track></span><span class=sw-thumb></span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeNpSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=np-icon-sett-scrim onclick=closeNpIconSettingsDlg()></div>
-  <div class=md-dialog id=np-icon-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-        </svg></div>
-      <div class=mdd-title>Now Playing - Iconita</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;padding:0 0 12px">Alege o iconita separata pentru cand se detecteaza Muzica si pentru cand se detecteaza Video. Pe Automat se foloseste setarea Adaptive Icon.</div>
-      <div class=card id=np-icon-sett-list></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeNpIconSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=temp-sett-scrim onclick=closeTempSettingsDlg()></div>
-  <div class=md-dialog id=temp-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M15 13V5c0-1.66-1.34-3-3-3S9 3.34 9 5v8c-1.21.91-2 2.37-2 4 0 2.76 2.24 5 5 5s5-2.24 5-5c0-1.63-.79-3.09-2-4z" />
-        </svg></div>
-      <div class=mdd-title>Temperatura</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Unitate de masura</div>
-      <div class=card id=temp-unit-list></div>
-      <div style="height:16px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=temp-dur-slider oninput="onTempDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=temp-dur-val>10s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeTempSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=hour-sett-scrim onclick=closeHourSettingsDlg()></div>
-  <div class=md-dialog id=hour-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" />
-        </svg></div>
-      <div class=mdd-title>Ora</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Format afisare</div>
-      <div class=card id=hour-fmt-list></div>
-      <div style="height:16px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=hour-dur-slider oninput="onHourDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=hour-dur-val>10s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeHourSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=date-sett-scrim onclick=closeDateSettingsDlg()></div>
-  <div class=md-dialog id=date-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z" />
-        </svg></div>
-      <div class=mdd-title>Data</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Format afisare</div>
-      <div class=card id=date-fmt-list></div>
-      <div style="height:16px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=date-dur-slider oninput="onDateDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=date-dur-val>10s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeDateSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=date-custom-scrim onclick=closeCustomDateFmtDlg()></div>
-  <div class=md-dialog id=date-custom-dlg style="max-width:420px">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z" />
-        </svg></div>
-      <div class=mdd-title>Format Personalizat</div>
-    </div>
-    <div class=mdd-body>
-      <div class=mdd-tf-wrap><label class=mdd-label>Format (Y / M / D / W)</label><input class=mdd-input id=date-custom-in placeholder="ex: DD.MM.YYYY" autocomplete=off maxlength=20 oninput=onCustomDateFmtInput()></div>
-      <div id=date-custom-preview style="font-family:Google Sans,sans-serif;font-size:22px;color:var(--pri);text-align:center;padding:12px 0 4px;letter-spacing:1px;min-height:28px"></div>
-      <div class=msg id=date-custom-msg></div>
-      <div style="color:var(--on-surf-var);font-size:12px;line-height:1.7;padding-top:14px;margin-top:4px;border-top:1px solid var(--outline-var)">
-        <b>Y</b> = an &nbsp;(YY sau YYYY)<br>
-        <b>M</b> = luna &nbsp;(MM)<br>
-        <b>D</b> = zi &nbsp;(DD)<br>
-        <b>W</b> = zi saptamana &nbsp;(oricati, ex: W, WWW, WWWW...)<br>
-        <b>/ . ( ) spatiu</b> = separator<br>
-        <span style="opacity:.75">Exemple: DD/MM/YYYY &middot; DD.MM.YYYY &middot; (WWW) DD.MM &middot; WWWW</span>
-      </div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeCustomDateFmtDlg()>Anuleaza</button><button class="mbtn mbtn-fill" id=date-custom-save-btn onclick=saveCustomDateFmt()>Salveaza</button></div>
-  </div>
-  <div class=md-scrim id=memo-sett-scrim onclick=closeMemoSettingsDlg()></div>
-  <div class=md-dialog id=memo-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
-        </svg></div>
-      <div class=mdd-title>Memento</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 12px;font-weight:500">Mesaj de afisat</div>
-      <div class=mdd-tf-wrap><label class=mdd-label>Text memento (max 120 caractere)</label><input class=mdd-input id=memo-text-in placeholder="ex: Ia medicamentele!" autocomplete=off maxlength=120 oninput=onMemoInput()></div>
-      <div id=memo-char-count style="color:var(--on-surf-var);font-size:11px;text-align:right;margin-top:4px">0 / 120</div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeMemoSettingsDlg()>Anuleaza</button><button class="mbtn mbtn-fill" id=memo-save-btn onclick=saveMemoSettings()>Salveaza</button></div>
-  </div>
-  <div class=md-scrim id=canvas-sett-scrim onclick=closeCanvasSettingsDlg()></div>
-  <div class=md-dialog id=canvas-sett-dlg style="max-width:480px">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewBox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z" />
-        </svg></div>
-      <div class=mdd-title>Canvas</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 10px;font-weight:500">Deseneaza pe grila ceasului (8&times;32)</div>
-      <div class=cvx-wrap>
-        <div class=cvx-grid id=cvx-grid></div>
-        <div class=cvx-actions><button type=button class=cvx-clear-btn onclick=clearCanvasGrid()>Sterge tot</button></div>
-        <div style="height:6px"></div>
-        <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-        <div class=dur-row><input type=range min=2 max=30 step=1 id=canvas-dur-slider oninput="onCanvasDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=canvas-dur-val>10s</span></div>
-      </div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeCanvasSettingsDlg()>Anuleaza</button><button class="mbtn mbtn-fill" onclick=saveCanvasSettings()>Salveaza</button></div>
-  </div>
-  <div class=md-scrim id=sw-result-scrim onclick=closeSwResultDlg()></div>
-  <div class=md-dialog id=sw-result-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewBox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z" />
-        </svg></div>
-      <div class=mdd-title>Stopwatch</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 10px;font-weight:500">Counted time</div>
-      <div id=sw-result-time style="color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:32px;font-weight:500;letter-spacing:.5px;padding:4px 0 8px">00:00:00:00</div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeSwResultDlg()>OK</button></div>
-  </div>
-  <style>
-    .wx-suggest {
-      background: var(--surf-con);
-      border-radius: 0 0 12px 12px;
-      overflow: hidden;
-      margin-top: 2px;
-      display: none
-    }
-
-    .wx-suggest.open {
-      display: block
-    }
-
-    .wx-si {
-      cursor: pointer;
-      color: var(--on-surf);
-      padding: 12px 16px;
-      font-size: 14px;
-      border-bottom: 1px solid var(--outline-var);
-      transition: background .12s
-    }
-
-    .wx-si:last-child {
-      border-bottom: none
-    }
-
-    .wx-si:hover {
-      background: color-mix(in srgb, var(--on-surf)8%, transparent)
-    }
-
-    .wx-si-main {
-      font-family: Google Sans, sans-serif
-    }
-
-    .wx-si-sub {
-      color: var(--on-surf-var);
-      font-size: 12px;
-      margin-top: 2px
-    }
-
-    .wx-sel-badge {
-      background: var(--grn-con);
-      color: var(--grn);
-      border-radius: 8px;
-      padding: 4px 12px;
-      font-size: 12px;
-      font-weight: 500;
-      margin-top: 8px;
-      display: none
-    }
-
-    .wx-no-key-hint {
-      color: var(--on-surf-var);
-      font-size: 12px;
-      margin-top: 6px;
-      display: none
-    }
-  </style>
-  <div class=md-scrim id=wx-sett-scrim onclick=closeWxSettingsDlg()></div>
-  <div class=md-dialog id=wx-sett-dlg style="max-width:420px">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z" />
-        </svg></div>
-      <div class=mdd-title>Setari Meteo</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">OpenWeatherMap API Key</div>
-      <div class=mdd-tf-wrap style="display:flex;align-items:center;padding-right:8px">
-        <div style="flex:1"><label class=mdd-label>API Key (openweathermap.org)</label><input class=mdd-input id=wx-key-in placeholder="Cola cheie aici" type=password autocomplete=off oninput=onWxKeyInput()></div><button type=button id=wx-key-vis onclick=toggleWxKeyVis() style="background:none;border:none;cursor:pointer;padding:4px;color:var(--on-surf-var);flex-shrink:0;display:flex;align-items:center;align-self:flex-end;margin-bottom:6px" title="Arata/ascunde cheia"><svg id=wx-eye-icon width=20 height=20 viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" />
-          </svg></button>
-      </div>
-      <div class=wx-no-key-hint id=wx-no-key-hint>Introdu mai intai cheia API - e necesara pentru cautare</div>
-      <div style="height:14px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Cauta Localitate</div>
-      <div class=mdd-tf-wrap><label class=mdd-label>Scrie numele localitatii</label><input class=mdd-input id=wx-search-in placeholder="ex: Moisei,RO sau Baia Mare,RO" autocomplete=off oninput=onWxSearch() onfocus=onWxSearch()></div>
-      <div class=wx-suggest id=wx-suggest></div>
-      <div class=wx-sel-badge id=wx-sel-badge></div>
-      <div id=wx-status style="color:var(--on-surf-var);font-size:13px;margin-top:10px;min-height:18px"></div>
-      <div style="height:14px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Unitate temperatura</div>
-      <div class=card id=wx-unit-list></div>
-    </div>
-    <div id=wx-saving style="display:none;flex-direction:column;align-items:center;justify-content:center;padding:32px 24px 40px;gap:18px;transition:opacity .25s">
-      <div style="width:40px;height:40px;border:3px solid var(--surf-var);border-top-color:var(--pri);border-radius:50%;animation:wx-spin .8s linear infinite"></div>
-      <div style="color:var(--on-surf-var);font-size:15px;font-family:Google Sans,sans-serif">Se salveaza datele...</div>
-    </div>
-    <style>
-      @keyframes wx-spin {
-        to {
-          transform: rotate(360deg)
-        }
-      }
-
-      #wx-sett-dlg .mdd-body,
-      #wx-sett-dlg .mdd-actions {
-        transition: opacity .2s
-      }
-    </style>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeWxSettingsDlg()>Anuleaza</button><button class="mbtn mbtn-fill" id=wx-save-btn onclick=saveWxSettings() disabled>Gata</button></div>
-  </div>
-  <div class=md-scrim id=pressure-sett-scrim onclick=closePressureSettingsDlg()></div>
-  <div class=md-dialog id=pressure-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20.38 8.57l-1.23 1.85a8 8 0 0 1-.22 7.58H5.07A8 8 0 0 1 15.58 6.85l1.85-1.23A10 10 0 0 0 3.35 19a2 2 0 0 0 1.72 1h13.85a2 2 0 0 0 1.74-1a10 10 0 0 0-.27-10.44zm-9.79 6.84a2 2 0 0 0 2.83 0l5.66-8.49l-8.49 5.66a2 2 0 0 0 0 2.83z" />
-        </svg></div>
-      <div class=mdd-title>Atmospheric Pressure</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=pressure-dur-slider oninput="onPressureDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=pressure-dur-val>10s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closePressureSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=ss-sett-scrim onclick=closeSsSettingsDlg()></div>
-  <div class=md-dialog id=ss-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7l-2 3v1h8v-1l-2-3h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12zM8 13l2.03-2.03 1.5 1.5L15.5 8.5 17 10l-5.5 5.5z" />
-        </svg></div>
-      <div class=mdd-title>Screen Saver</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Animatie</div>
-      <div class=card id=ss-anim-list></div>
-      <div style="height:14px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=ss-dur-slider oninput="onSsDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=ss-dur-val>8s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-fill" onclick=closeSsSettingsDlg()>Gata</button></div>
-  </div>
-  <div class=md-scrim id=currency-sett-scrim onclick=closeCurrencySettingsDlg()></div>
-  <div class=md-dialog id=currency-sett-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M11.8 10.9c-2.27-.59-3-1.2-3-2.15 0-1.09 1.01-1.85 2.7-1.85 1.78 0 2.44.85 2.5 2.1h2.21c-.07-1.72-1.12-3.3-3.21-3.81V3h-3v2.16c-1.94.42-3.5 1.68-3.5 3.61 0 2.31 1.91 3.46 4.7 4.13 2.5.6 3 1.48 3 2.41 0 .69-.49 1.79-2.7 1.79-2.06 0-2.87-.92-2.98-2.1h-2.2c.12 2.19 1.76 3.42 3.68 3.83V21h3v-2.15c1.95-.37 3.5-1.5 3.5-3.55 0-2.84-2.43-3.81-4.7-4.4z" />
-        </svg></div>
-      <div class=mdd-title>Currency Standards</div>
-    </div>
-    <div class=mdd-body>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Moneda principala</div><select id=currency-base-sel style="width:100%;background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:8px 10px;font-family:Google Sans,sans-serif;font-size:14px">
-        <option value=EUR>EUR</option>
-        <option value=USD>USD</option>
-        <option value=GBP>GBP</option>
-        <option value=CHF>CHF</option>
-        <option value=JPY>JPY</option>
-        <option value=CAD>CAD</option>
-        <option value=AUD>AUD</option>
-        <option value=RON>RON</option>
-      </select>
-      <div style="height:14px"></div>
-      <div class="li static" style="padding:0 0 4px;border-bottom:none">
-        <div class=li-body>
-          <div class=li-head>Enable Comparison</div>
-          <div class=li-sub>Compara cu o a doua moneda</div>
-        </div>
-        <div class=li-trail>
-          <div class=sw onclick=toggleCurrencyCompare()><input type=checkbox id=currency-compare-cb><span class=sw-track></span><span class=sw-thumb></span></div>
-        </div>
-      </div>
-      <div id=currency-quote-wrap style="display:none">
-        <div style="height:14px"></div>
-        <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Moneda secundara</div><select id=currency-quote-sel style="width:100%;background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:8px 10px;font-family:Google Sans,sans-serif;font-size:14px">
-          <option value=EUR>EUR</option>
-          <option value=USD>USD</option>
-          <option value=GBP>GBP</option>
-          <option value=CHF>CHF</option>
-          <option value=JPY>JPY</option>
-          <option value=CAD>CAD</option>
-          <option value=AUD>AUD</option>
-          <option value=RON>RON</option>
-        </select>
-      </div>
-      <div style="height:14px"></div>
-      <div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:0 0 6px;font-weight:500">Timp Afisare</div>
-      <div class=dur-row><input type=range min=2 max=30 step=1 id=currency-dur-slider oninput="onCurrencyDurInput(this.value)" onchange="saveSettings()"><span class=dur-val id=currency-dur-val>10s</span></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeCurrencySettingsDlg()>Anuleaza</button><button class="mbtn mbtn-fill" onclick=saveCurrencySettings()>Gata</button></div>
-  </div>
-  <div class=screen id=s-scrolltype>
-    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Scroll Type</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Scroll individual per tile</div>
-      <div class=card id=scrolltype-list></div>
-    </div>
-  </div>
-  <div class=screen id=s-fonttype>
-    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Font Type</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Font individual per tile</div>
-      <div class=card id=fonttype-list></div>
-    </div>
-  </div>
-  <div class=screen id=s-iconsettings>
-    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Icon Settings</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Iconita afisata per tile</div>
-      <div class=card id=iconsettings-list></div>
-    </div>
-  </div>
-  <div class=screen id=s-iconsettings-weather>
-    <div class=top-bar><button onclick="go('s-iconsettings')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Icon Settings - Meteo</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>O iconita pentru fiecare stare meteo</div>
-      <div class=card id=iconsettings-weather-list></div>
-    </div>
-  </div>
-  <div class=md-scrim id=iconpicker-scrim onclick=closeIconPicker()></div>
-  <div class=md-dialog id=iconpicker-dlg style="max-height:78vh;display:flex;flex-direction:column">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z" />
-        </svg></div>
-      <div class=mdd-title id=iconpicker-title>Alege iconita</div>
-    </div>
-    <div class=mdd-body id=iconpicker-body style="overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent">
-      <div id=iconpicker-grid style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:4px 0 8px"></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeIconPicker()>Inchide</button></div>
-  </div>
-  <div class=screen id=s-hideicons>
-    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Disable Tile Icons</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Iconite individuale per tile</div>
-      <div class=card id=hideicons-list></div>
-    </div>
-  </div>
-  <div class=screen id=s-tiletransition>
-    <div class=top-bar><button onclick="go('s-tiles')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Tile Transition</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Circuit Tiles</div>
-      <div class=card id=transition-circuit-list></div>
-      <!--
-      <div class=sl>Priority Tiles</div>
-      <div class=card id=transition-priority-list></div>
-      -->
-      <div class=sl>Tranzitii Speciale</div>
-      <div class=card id=transition-special-list></div>
-    </div>
-  </div>
-  <div class=screen id=s-langmgr>
-    <div class=top-bar><button onclick="go('s-home')" class=bar-lead><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-        </svg></button>
-      <div class=bar-text>
-        <div class=bar-title>Language Manager</div>
-      </div>
-    </div>
-    <div class=content>
-      <div class=sl>Categorii</div>
-      <div class=card>
-        <div onclick="openLangPicker()" class=li style="border-bottom:none">
-          <div class="lic lc-grn"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>OpenWeatherMap Language</div>
-            <div class=li-sub id=owm-lang-sub>English (en)</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-        <div onclick="openDateLangPicker(event)" class=li style="border-bottom:none">
-          <div class="lic lc-amb"><svg viewbox="0 0 24 24" fill=currentColor height=20 width=20>
-              <path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z" />
-            </svg></div>
-          <div class=li-body>
-            <div class=li-head>Date Language</div>
-            <div class=li-sub id=date-lang-sub>English (en)</div>
-          </div>
-          <div class=li-trail><span class=chevron><svg viewbox="0 0 24 24" fill=currentColor height=18 width=18>
-                <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-              </svg></span></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class=md-scrim id=date-lang-scrim onclick=closeDateLangPicker()></div>
-  <div class=md-dialog id=date-lang-dlg style="max-width:400px">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
-        </svg></div>
-      <div class=mdd-title>Limba Data</div>
-    </div>
-    <div class=mdd-body style="padding:0 24px 8px">
-      <div id=date-lang-list style="max-height:320px;overflow-y:auto;margin:0 -24px;border-top:1px solid var(--outline-var);scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeDateLangPicker()>Anuleaza</button></div>
-  </div>
-  <div class=md-scrim id=lang-scrim onclick=closeLangPicker()></div>
-  <div class=md-dialog id=lang-dlg style="max-width:400px">
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
-        </svg></div>
-      <div class=mdd-title>OpenWeatherMap Language</div>
-    </div>
-    <div class=mdd-body style="padding:0 24px 8px">
-      <div class=mdd-tf-wrap style="margin-bottom:10px"><label class=mdd-label>Cauta limba</label><input class=mdd-input id=lang-search placeholder="ex: Romanian, English..." oninput=filterLangs()></div>
-      <div id=lang-list style="max-height:320px;overflow-y:auto;margin:0 -24px;border-top:1px solid var(--outline-var);scrollbar-width:thin;scrollbar-color:var(--outline-var) transparent"></div>
-    </div>
-    <div class=mdd-actions><button class="mbtn mbtn-ton" onclick=closeLangPicker()>Anuleaza</button></div>
-  </div>
-  <div class=md-scrim id=oor-scrim></div>
-  <div class=md-dialog id=oor-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" height=24 width=24>
-          <path fill=currentColor d="M2 22h3v-3H2v3zm5 0h3v-8H7v8zm5 0h3v-13h-3v13z" />
-          <circle cx=18.5 cy=8.5 r=6 fill=var(--err-con) />
-          <text x=18.5 y=11.6 text-anchor=middle font-family="Google Sans,sans-serif" font-size=8.5 font-weight=700 fill=var(--err)>?</text>
-        </svg></div>
-      <div class=mdd-title>Octoglow is out of range</div>
-    </div>
-    <div class=mdd-body>
-      <div style="display:flex;align-items:center;gap:10px;padding:4px 0 20px 9px;color:var(--on-surf-var);font-size:14px;line-height:1.5"><span class=spin-ring style="flex-shrink:0;margin-right:0"></span>Your device is out of range or is not successfully connected. Reconnecting…</div>
-    </div>
-  </div>
-  <div class="md-scrim open" id=us-load-scrim></div>
-  <div class="md-dialog open" id=us-load-dlg>
-    <div class=mdd-head>
-      <div class=mdd-icon><svg viewbox="0 0 24 24" fill=currentColor height=24 width=24>
-          <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
-        </svg></div>
-      <div class=mdd-title>Loading: User Settings</div>
-    </div>
-    <div class=mdd-body>
-      <div style="display:flex;align-items:center;gap:10px;padding:4px 0 4px 9px;color:var(--on-surf-var);font-size:14px;line-height:1.5"><span class=spin-ring style="flex-shrink:0;margin-right:0"></span><span id=us-load-status>Se incarca setarile utilizatorului de pe dispozitiv…</span></div>
-    </div>
-    <div class=mdd-actions id=us-load-actions style="display:none"><button class="mbtn mbtn-ton" onclick="location.reload()">Reincarca pagina</button></div>
-  </div>
-  <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
-  <script>
-    // Never persist Tile Manager data before the complete /state response has
-    // arrived. A failed response used to leave the UI with a short fallback
-    // list, which the next save could overwrite into persistent settings.
-    var stateLoadComplete = !1,
-      EXPECTED_CIRCUIT_TILE_COUNT = 10,
-      apSsidCache = ``,
-      selSSID = ``,
-      selSec = !1,
-      bOn = !0,
-      items = [],
-      npM = 0,
-      npAdaptiveIconV = !0,
-      tempUnitV = 0,
-      lastTempV = -999,
-      wxValidV = !1,
-      wxTempV = -999,
-      wxHumidityV = -1,
-      wxDescV = ``,
-      pressureHpaV = 0,
-      pressureTrendV = 0,
-      currencyBaseV = `EUR`,
-      currencyQuoteV = `RON`,
-      currencyCompareV = !1,
-      currencyRateV = 0,
-      currencyTrendV = 0,
-      currencyValidV = !1,
-      dragSrc = null,
-      brightLevel = 4,
-      dimAuto = !1,
-      dimFrom = `22:00`,
-      dimTo = `07:00`,
-      dimLevel = 1,
-      notifEn = !0,
-      ets2En = !0,
-      isApMode = !1,
-      dragSrc2 = null,
-      dragCtx = null,
-      hideTileIcons = !1,
-      indivHideIcons = {
-        date: !1,
-        temp: !1,
-        reminder: !1,
-        weather: !1,
-        notif: !1,
-        nowplaying: !1,
-        pressure: !1,
-        currency: !1,
-        ip: !1
-      },
-      indivIcon = {
-        date: 0,
-        temp: 0,
-        reminder: 0,
-        notif: 0,
-        nowplayingMusic: 0,
-        nowplayingVideo: 0,
-        pressure: 0,
-        currency: 0,
-        ip: 0
-      },
-      indivWxIcon = {
-        sunny: 0,
-        cloud: 0,
-        rain: 0,
-        storm: 0,
-        snow: 0,
-        wind: 0,
-        night: 0
-      },
-      ICON_CATALOG = [{
-        id: 1,
-        n: `Data`,
-        rows: [0b01111110, 0b11111111, 0b11111111, 0b10000001, 0b10000001, 0b10000001, 0b10000001, 0b01111110]
-      }, {
-        id: 2,
-        n: `Temperatura`,
-        rows: [0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00101100, 0b00100100, 0b00011000]
-      }, {
-        id: 3,
-        n: `Memento`,
-        rows: [0b00100100, 0b01011010, 0b00111100, 0b00111100, 0b00111100, 0b01111110, 0b00011000, 0b00000000]
-      }, {
-        id: 4,
-        n: `Music Note`,
-        rows: [0b11100000, 0b10011100, 0b10000100, 0b10000100, 0b11000100, 0b11100110, 0b11000111, 0b00000110]
-      }, {
-        id: 5,
-        n: `Mail`,
-        rows: [0b00000000, 0b01111110, 0b11000011, 0b10100101, 0b10011001, 0b10000001, 0b01111110, 0b00000000]
-      }, {
-        id: 6,
-        n: `Up Arrow`,
-        rows: [0b00011000, 0b00111100, 0b01111110, 0b11011011, 0b10011001, 0b00011000, 0b00011000, 0b00011000]
-      }, {
-        id: 7,
-        n: `Down Arrow`,
-        rows: [0b00011000, 0b00011000, 0b00011000, 0b10011001, 0b11011011, 0b01111110, 0b00111100, 0b00011000]
-      }, {
-        id: 8,
-        n: `Minus`,
-        rows: [0b00000000, 0b00000000, 0b00000000, 0b01111110, 0b01111110, 0b00000000, 0b00000000, 0b00000000]
-      }, {
-        id: 9,
-        n: `Sun`,
-        rows: [0b00011000, 0b01000010, 0b00011000, 0b10111101, 0b10111101, 0b00011000, 0b01000010, 0b00011000]
-      }, {
-        id: 10,
-        n: `Cloud`,
-        rows: [0b00000000, 0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b00000000, 0b00000000]
-      }, {
-        id: 11,
-        n: `Cloud Rain`,
-        rows: [0b00000000, 0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b01010100, 0b00101010]
-      }, {
-        id: 12,
-        n: `Furtuna`,
-        rows: [0b00111000, 0b01000110, 0b10000001, 0b10000001, 0b01111110, 0b00100100, 0b01101100, 0b01001000]
-      }, {
-        id: 13,
-        n: `Ninsoare`,
-        rows: [0b00111000, 0b01000110, 0b10000001, 0b10010001, 0b00111000, 0b01010010, 0b11100111, 0b01000010]
-      }, {
-        id: 14,
-        n: `Vant`,
-        rows: [0b00001100, 0b00010010, 0b00000010, 0b11111100, 0b00000000, 0b11111000, 0b00000100, 0b00001000]
-      }, {
-        id: 15,
-        n: `Luna`,
-        rows: [0b00111100, 0b01110000, 0b11100000, 0b11100000, 0b11100000, 0b11100000, 0b01110000, 0b00111100]
-      }, {
-        id: 16,
-        n: `Signal Bar`,
-        rows: [0b00000001, 0b00000011, 0b00001011, 0b00011011, 0b01011011, 0b11011011, 0b11011011, 0b00000000]
-      }, {
-        id: 17,
-        n: `Access Point`,
-        rows: [0b00011000, 0b01000010, 0b00011000, 0b10111101, 0b10111101, 0b00011000, 0b01000010, 0b00011000]
-      }, {
-        id: 18,
-        n: `Exclamare`,
-        rows: [0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000, 0b00011000, 0b00011000]
-      }, {
-        id: 19,
-        n: `Pauza`,
-        rows: [0b00000000, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b01100110, 0b00000000]
-      }, {
-        id: 20,
-        n: `Euro`,
-        rows: [0b00011000, 0b00100100, 0b01110000, 0b00100000, 0b01110000, 0b00100100, 0b00011000, 0b00000000]
-      }, {
-        id: 21,
-        n: `Bluetooth`,
-        rows: [0b00001000, 0b00101100, 0b00011010, 0b00001100, 0b00001100, 0b00011010, 0b00101100, 0b00001000]
-      }, {
-        id: 22,
-        n: `Blocat`,
-        rows: [0b00000000, 0b00111100, 0b01000110, 0b01001010, 0b01010010, 0b01100010, 0b00111100, 0b00000000]
-      }, {
-        id: 23,
-        n: `WiFi`,
-        rows: [0b00000010, 0b00001001, 0b00000101, 0b00110101, 0b00110101, 0b00000101, 0b00001001, 0b00000010]
-      }, {
-        id: 24,
-        n: `Video`,
-        rows: [0b00000000, 0b01111110, 0b11101111, 0b11100111, 0b11100111, 0b11101111, 0b01111110, 0b00000000]
-      }],
-      scrollTypeV = 0,
-      indivScroll = {
-        date: 0,
-        temp: 0,
-        reminder: 0,
-        weather: 0,
-        notif: 0,
-        nowplaying: 0,
-        pressure: 0,
-        stopwatch: 0,
-        currency: 0,
-        ip: 0
-      },
-      SCROLL_TYPE_OPTIONS = [{
-        v: 0,
-        n: `Bounce`
-      }, {
-        v: 1,
-        n: `Wrap`
-      }, {
-        v: 2,
-        n: `Bounce + Icon`
-      }, {
-        v: 3,
-        n: `Wrap + Icon`
-      }],
-      fontTypeV = 0,
-      indivFont = {
-        date: 0,
-        temp: 0,
-        reminder: 0,
-        weather: 0,
-        notif: 0,
-        nowplaying: 0,
-        pressure: 0,
-        stopwatch: 0,
-        currency: 0,
-        ip: 0
-      },
-      FONT_TYPE_OPTIONS = [{
-        v: 0,
-        n: `Marymba`
-      }, {
-        v: 1,
-        n: `Tiko`
-      }],
-      buzzerVolume = 80,
-      buzzerPreset = `calm`,
-      BUZZER_PRESETS = [{
-        id: `calm`,
-        name: `Calm`
-      }, {
-        id: `loud`,
-        name: `Loud`
-      }, {
-        id: `urgent`,
-        name: `Urgent`
-      }, {
-        id: `soft`,
-        name: `Soft`
-      }, {
-        id: `double`,
-        name: `Double Beep`
-      }, {
-        id: `triple`,
-        name: `Triple Beep`
-      }],
-      evSndTile = `calm`,
-      evSndWifi = `urgent`,
-      evSndNotif = `soft`,
-      evSndEts2 = `urgent`,
-      evSndTouch = `soft`,
-      touchTapAction = 8,
-      touchDoubleTapAction = 0,
-      TOUCH_ACTIONS = [{
-        id: 0,
-        name: `Do nothing`
-      }, {
-        id: 1,
-        name: `Previous tile`
-      }, {
-        id: 2,
-        name: `Next tile`
-      }, {
-        id: 3,
-        name: `Turn screen ON/OFF`
-      }, {
-        id: 4,
-        name: `Increase brightness`
-      }, {
-        id: 5,
-        name: `Decrease brightness`
-      }, {
-        id: 6,
-        name: `Mute / Unmute Buzzer`
-      }, {
-        id: 7,
-        name: `Restart ESP32`
-      }, {
-        id: 8,
-        name: `Show IP Address`
-      }],
-      EVENT_SOUND_OPTIONS = [{
-        id: `none`,
-        name: `None`
-      }, {
-        id: `calm`,
-        name: `Calm`
-      }, {
-        id: `loud`,
-        name: `Loud`
-      }, {
-        id: `urgent`,
-        name: `Urgent`
-      }, {
-        id: `soft`,
-        name: `Soft`
-      }, {
-        id: `double`,
-        name: `Double Beep`
-      }, {
-        id: `triple`,
-        name: `Triple Beep`
-      }, {
-        id: `chime`,
-        name: `Chime`
-      }, {
-        id: `bell`,
-        name: `Bell`
-      }, {
-        id: `doorbell`,
-        name: `Doorbell`
-      }, {
-        id: `xylophone`,
-        name: `Xylophone`
-      }, {
-        id: `harp`,
-        name: `Harp Glissando`
-      }, {
-        id: `marimba`,
-        name: `Marimba`
-      }, {
-        id: `crystal`,
-        name: `Crystal Sparkle`
-      }, {
-        id: `wave`,
-        name: `Gentle Wave`
-      }, {
-        id: `lullaby`,
-        name: `Lullaby`
-      }, {
-        id: `pingpong`,
-        name: `Ping Pong`
-      }, {
-        id: `sos`,
-        name: `SOS`
-      }, {
-        id: `siren`,
-        name: `Siren`
-      }, {
-        id: `klaxon`,
-        name: `Klaxon`
-      }, {
-        id: `laser`,
-        name: `Laser Zap`
-      }, {
-        id: `robot`,
-        name: `Robot Blips`
-      }, {
-        id: `fanfare`,
-        name: `Fanfare`
-      }, {
-        id: `powerdown`,
-        name: `Power Down`
-      }, {
-        id: `powerup`,
-        name: `Power Up`
-      }, {
-        id: `heartbeat`,
-        name: `Heartbeat`
-      }, {
-        id: `scifi`,
-        name: `Sci-Fi`
-      }, {
-        id: `arcade`,
-        name: `Arcade`
-      }, {
-        id: `zen`,
-        name: `Zen Gong`
-      }, {
-        id: `bubble`,
-        name: `Bubbles`
-      }, {
-        id: `whistle`,
-        name: `Whistle`
-      }, {
-        id: `boldalert`,
-        name: `Bold Alert`
-      }],
-      priorityItems = [{
-        id: `notif`,
-        enabled: !0
-      }, {
-        id: `ets2`,
-        enabled: !0
-      }, {
-        id: `stopwatch`,
-        enabled: !0
-      }],
-      swRunning = !1,
-      swElapsedMs = 0,
-      swLastText = `00:00:00:00`,
-      ssAnimV = 0,
-      SS_ANIM_OPTIONS = [`Random`, `Pong`, `Fireworks`, `Equalizer`],
-      NAMES = [`Ora`, `Data`, `Temperatura`, `Now Playing`, `Meteo`, `Memento`, `Canvas`, ``, `Atmospheric Pressure`, `Screen Saver`, ``, `Currency Standards`],
-      ISVG = [`<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M15 13V5c0-1.66-1.34-3-3-3S9 3.34 9 5v8c-1.21.91-2 2.37-2 4 0 2.76 2.24 5 5 5s5-2.24 5-5c0-1.63-.79-3.09-2-4zm-3 7c-1.65 0-3-1.35-3-3 0-1.3.84-2.4 2-2.82V5c0-.55.45-1 1-1s1 .45 1 1v9.18c1.16.42 2 1.52 2 2.82 0 1.65-1.35 3-3 3z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h6v6H4V4zm0 10h6v6H4v-6zm10-10h6v6h-6V4zm0 10h6v6h-6v-6z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20.38 8.57l-1.23 1.85a8 8 0 0 1-.22 7.58H5.07A8 8 0 0 1 15.58 6.85l1.85-1.23A10 10 0 0 0 3.35 19a2 2 0 0 0 1.72 1h13.85a2 2 0 0 0 1.74-1a10 10 0 0 0-.27-10.44zm-9.79 6.84a2 2 0 0 0 2.83 0l5.66-8.49l-8.49 5.66a2 2 0 0 0 0 2.83z"/></svg>`, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7l-2 3v1h8v-1l-2-3h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12zM8 13l2.03-2.03 1.5 1.5L15.5 8.5 17 10l-5.5 5.5z"/></svg>`, ``, `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11.8 10.9c-2.27-.59-3-1.2-3-2.15 0-1.09 1.01-1.85 2.7-1.85 1.78 0 2.44.85 2.5 2.1h2.21c-.07-1.72-1.12-3.3-3.21-3.81V3h-3v2.16c-1.94.42-3.5 1.68-3.5 3.61 0 2.31 1.91 3.46 4.7 4.13 2.5.6 3 1.48 3 2.41 0 .69-.49 1.79-2.7 1.79-2.06 0-2.87-.92-2.98-2.1h-2.2c.12 2.19 1.76 3.42 3.68 3.83V21h3v-2.15c1.95-.37 3.5-1.5 3.5-3.55 0-2.84-2.43-3.81-4.7-4.4z"/></svg>`],
-      ILCLS = [`lc-pur`, `lc-blu`, `lc-tea`, `lc-amb`, `lc-grn`, `lc-tea`, `lc-blu`, `lc-pur`, `lc-blu`, `lc-pur`, `lc-pur`, `lc-amb`];
-    var SCROLL_TILES = [{
-      key: `date`,
-      label: `Date`,
-      cls: `lc-blu`,
-      svg: ISVG[1]
-    }, {
-      key: `temp`,
-      label: `Temperature`,
-      cls: `lc-tea`,
-      svg: ISVG[2]
-    }, {
-      key: `reminder`,
-      label: `Reminder`,
-      cls: `lc-tea`,
-      svg: ISVG[5]
-    }, {
-      key: `weather`,
-      label: `Weather`,
-      cls: `lc-grn`,
-      svg: ISVG[4]
-    }, {
-      key: `notif`,
-      label: `PC Notifications`,
-      cls: `lc-pur`,
-      svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`
-    }, {
-      key: `nowplaying`,
-      label: `Now Playing`,
-      cls: `lc-amb`,
-      svg: ISVG[3]
-    }, {
-      key: `pressure`,
-      label: `Atmospheric Pressure`,
-      cls: `lc-blu`,
-      svg: ISVG[8]
-    }, {
-      key: `currency`,
-      label: `Currency Standards`,
-      cls: `lc-amb`,
-      svg: ISVG[11]
-    }, {
-      key: `stopwatch`,
-      label: `Stopwatch`,
-      cls: `lc-grn`,
-      hasIcon: !1,
-      svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>`
-    }, {
-      key: `ip`,
-      label: `Show IP Address`,
-      cls: `lc-blu`,
-      svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
-    }];
-    var fwVersion = `0.1`,
-      bootUptimeSec = 0,
-      uptimeFetchedAt = 0,
-      aboutTickTimer = null;
-
-    function pad2(n) {
-      return (n < 10 ? `0` : ``) + n
-    }
-
-    function formatUptime(sec) {
-      sec = Math.max(0, Math.floor(sec));
-      var h = Math.floor(sec / 3600),
-        m = Math.floor((sec % 3600) / 60),
-        s = sec % 60;
-      return h + `h ` + pad2(m) + `m ` + pad2(s) + `s`
-    }
-
-    function applyAboutState(s) {
-      var ipEl = document.getElementById(`about-ip`);
-      if (ipEl) ipEl.textContent = s.ip || `-`;
-      var verEl = document.getElementById(`about-version`);
-      if (verEl) verEl.textContent = s.version || fwVersion;
-      var swVerEl = document.getElementById(`sw-version`);
-      if (swVerEl) swVerEl.textContent = s.version || fwVersion;
-      if (s.version) fwVersion = s.version;
-      if (s.uptime !== void 0) {
-        bootUptimeSec = s.uptime;
-        uptimeFetchedAt = Date.now();
-        var upEl = document.getElementById(`about-uptime`);
-        if (upEl) upEl.textContent = formatUptime(bootUptimeSec)
-      }
-    }
-
-    function fetchAboutState(attempt) {
-      attempt = attempt || 0;
-      fetch(`/state`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        applyAboutState(s)
-      }).catch(function() {
-        // Previously an empty catch: on failure the "-" placeholders in the
-        // HTML just stayed forever, with no retry and no feedback. Retry a
-        // few times with backoff instead - this endpoint is the same /state
-        // this page depends on everywhere else, so a transient failure here
-        // shouldn't be a dead end.
-        if (attempt < 3) setTimeout(function() { fetchAboutState(attempt + 1) }, 500 * (attempt + 1))
-      })
-    }
-
-    function refreshAboutState() {
-      // Paint instantly from the dashboard's own already-loaded state if we
-      // have it (no need to wait on a second network round trip), then still
-      // do our own fetch so Uptime keeps ticking from a fresh value.
-      withInitialState(function(s) {
-        applyAboutState(s)
-      });
-      fetchAboutState(0)
-    }
-
-    function tickAboutUptime() {
-      if (uptimeFetchedAt === 0) return;
-      var elapsed = (Date.now() - uptimeFetchedAt) / 1000;
-      var upEl = document.getElementById(`about-uptime`);
-      if (upEl) upEl.textContent = formatUptime(bootUptimeSec + elapsed)
-    }
-
-    function startAboutTick() {
-      stopAboutTick();
-      aboutTickTimer = setInterval(tickAboutUptime, 1000)
-    }
-
-    function stopAboutTick() {
-      if (aboutTickTimer) {
-        clearInterval(aboutTickTimer);
-        aboutTickTimer = null
-      }
-    }
-    var SW_REPO_BASE = `https://raw.githubusercontent.com/Adium1000/Octoglow/main/Updater/`,
-      SW_VER_URL = SW_REPO_BASE + `UpdaterNewVersion.MD`,
-      SW_DESC_URL = SW_REPO_BASE + `UpdaterVersionDescription.MD`,
-      SW_BIN_URL = SW_REPO_BASE + `Update.bin`,
-      swServerVersion = ``,
-      swUpdating = !1;
-
-    function swCompareVersions(a, b) {
-      var pa = String(a).trim().split(`.`).map(function(x) {
-        return parseInt(x, 10) || 0
-      });
-      var pb = String(b).trim().split(`.`).map(function(x) {
-        return parseInt(x, 10) || 0
-      });
-      var len = Math.max(pa.length, pb.length);
-      for (var i = 0; i < len; i++) {
-        var na = pa[i] || 0,
-          nb = pb[i] || 0;
-        if (na > nb) return 1;
-        if (na < nb) return -1
-      }
-      return 0
-    }
-
-    function swShowState(state) {
-      [`sw-searching`, `sw-uptodate`, `sw-checkerr`, `sw-newupdate`, `sw-installing`].forEach(function(id) {
-        var el = document.getElementById(id);
-        if (el) el.style.display = `none`
-      });
-      [`sw-actions-uptodate`, `sw-actions-newupdate`].forEach(function(id) {
-        var el = document.getElementById(id);
-        if (el) el.style.display = `none`
-      });
-      var el = document.getElementById(state);
-      if (el) el.style.display = (state === `sw-newupdate` ? `block` : `flex`);
-      if (state === `sw-uptodate`) document.getElementById(`sw-actions-uptodate`).style.display = `flex`;
-      if (state === `sw-newupdate`) document.getElementById(`sw-actions-newupdate`).style.display = `flex`
-    }
-
-    var helpTopics = {
-      sender: {
-        title: `Octoglow Sender`,
-        body: `<p>Octoglow Sender is an app that makes your machine communicate with your Octoglow device by sending data over the internet to your Octoglow device.</p>` +
-          `<p>You can download Octoglow Sender directly from <a href="https://github.com/Adium1000/Octoglow" target="_blank" rel="noopener" style="color:var(--pri)">this repository</a>.</p>` +
-          `<p>For the following tiles you will need Octoglow Sender:</p>` +
-          `<ul style="margin:0;padding-left:18px">` +
-          `<li style="margin-bottom:8px"><b>Now Playing</b> detects the song currently playing on your machine (Spotify, browser, etc.) via the Windows Media Session and sends it every few seconds.</li>` +
-          `<li style="margin-bottom:8px"><b>Windows Notifications</b> listens for toast notifications on Windows and forwards them to the clock (with automatic diacritics removal and truncation to a maximum character count).</li>` +
-          `<li><b>Euro Truck Simulator 2</b> if the game is running, reads live telemetry (current speed) and streams it to the clock in real time. Requires an extra one-time plugin install in-game, see Setting Up ETS2 Speed Integration.</li>` +
-          `</ul>`
-      },
-      ap: {
-        title: `AP`,
-        body: `<p>AP mode allows your Octoglow to create its own Wi-Fi network if your home connection fails or needs troubleshooting; in this mode, some tiles may not be able to sync with the Internet connection.</p>`
-      },
-      lang: {
-        title: `Switch a Tile/Interface Language`,
-        body: `<p>If you want to change the interface language or the language of a specific tile, you can do so in the language manager. The most commonly supported languages are Romanian and English, but some tiles may also support other languages.</p>`
-      }
-    };
-
-    var TILE_HELP_SVG = `<svg width="18" height="18" viewBox="0 -960 960 960" fill="currentColor"><path d="M513.5-254.5Q528-269 528-290t-14.5-35.5Q499-340 478-340t-35.5 14.5Q428-311 428-290t14.5 35.5Q457-240 478-240t35.5-14.5ZM442-394h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>`;
-
-    function openTileHelpDlg(e, key) {
-      if (e) e.stopPropagation();
-      openHelpTopicDlg(key)
-    }
-
-    function openHelpTopicDlg(key) {
-      var topic = helpTopics[key];
-      if (!topic) return;
-      document.getElementById(`help-topic-title`).textContent = topic.title;
-      document.getElementById(`help-topic-body`).innerHTML = topic.body;
-      document.getElementById(`help-topic-scrim`).classList.add(`open`);
-      document.getElementById(`help-topic-dlg`).classList.add(`open`)
-    }
-
-    function closeHelpTopicDlg() {
-      document.getElementById(`help-topic-scrim`).classList.remove(`open`);
-      document.getElementById(`help-topic-dlg`).classList.remove(`open`)
-    }
-
-    function openSwUpdateDlg() {
-      document.getElementById(`sw-update-scrim`).classList.add(`open`);
-      document.getElementById(`sw-update-dlg`).classList.add(`open`);
-      swShowState(`sw-searching`);
-      swCheckForUpdates()
-    }
-
-    function closeSwUpdateDlg() {
-      if (swUpdating) return;
-      document.getElementById(`sw-update-scrim`).classList.remove(`open`);
-      document.getElementById(`sw-update-dlg`).classList.remove(`open`)
-    }
-
-    function swCheckForUpdates() {
-      fetch(SW_VER_URL, {
-        cache: `no-store`
-      }).then(function(r) {
-        if (!r.ok) throw new Error(`ver`);
-        return r.text()
-      }).then(function(txt) {
-        swServerVersion = txt.trim();
-        if (swCompareVersions(swServerVersion, fwVersion) > 0) {
-          return fetch(SW_DESC_URL, {
-            cache: `no-store`
-          }).then(function(r) {
-            return r.ok ? r.text() : ``
-          }).then(function(desc) {
-            document.getElementById(`sw-ver-compare`).textContent = fwVersion + ` → ` + swServerVersion;
-            document.getElementById(`sw-update-desc`).textContent = desc.trim();
-            swShowState(`sw-newupdate`)
-          })
-        } else {
-          swShowState(`sw-uptodate`)
-        }
-      }).catch(function() {
-        swShowState(`sw-checkerr`)
-      })
-    }
-
-    function installSwUpdate() {
-      swUpdating = !0;
-      swShowState(`sw-installing`);
-      document.getElementById(`sw-install-status`).textContent = `Se descarca update-ul...`;
-      fetch(SW_BIN_URL, {
-        cache: `no-store`
-      }).then(function(r) {
-        if (!r.ok) throw new Error(`bin`);
-        return r.arrayBuffer()
-      }).then(function(buf) {
-        document.getElementById(`sw-install-status`).textContent = `Se instaleaza update-ul...`;
-        var blob = new Blob([buf], {
-          type: `application/octet-stream`
-        });
-        var fd = new FormData();
-        fd.append(`update`, blob, `update.bin`);
-        return fetch(`/swupdateupload`, {
-          method: `POST`,
-          body: fd
-        })
-      }).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        if (d && d.ok) {
-          document.getElementById(`sw-install-status`).textContent = `Update instalat. Se reporneste...`
-        } else {
-          document.getElementById(`sw-install-status`).textContent = `Eroare la instalare: ` + ((d && d.err) || `necunoscuta`);
-          swUpdating = !1
-        }
-      }).catch(function() {
-        document.getElementById(`sw-install-status`).textContent = `Eroare la descarcarea/instalarea update-ului.`;
-        swUpdating = !1
-      })
-    }
-
-    var ACCENT_DEFAULT_HEX = `#d0bcff`;
-    var ACCENT_PRESETS = [`#d0bcff`, `#aac7ff`, `#6cf9d8`, `#6dd7a1`, `#c4e17f`, `#ffdf99`, `#ffb787`, `#ffb4ab`, `#ffb1c8`, `#b8c4ff`];
-    var ACCENT_CHECK_SVG = `<svg viewbox="0 0 24 24" fill=currentColor><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`;
-
-    function hexToHsl(hex) {
-      hex = hex.replace(`#`, ``);
-      if (hex.length === 3) hex = hex.split(``).map(function(c) {
-        return c + c
-      }).join(``);
-      var r = parseInt(hex.substr(0, 2), 16) / 255,
-        g = parseInt(hex.substr(2, 2), 16) / 255,
-        b = parseInt(hex.substr(4, 2), 16) / 255;
-      var max = Math.max(r, g, b),
-        min = Math.min(r, g, b);
-      var h = 0,
-        s = 0,
-        l = (max + min) / 2;
-      if (max !== min) {
-        var d = max - min;
-        s = l > .5 ? d / (2 - max - min) : d / (max + min);
-        if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-        else if (max === g) h = (b - r) / d + 2;
-        else h = (r - g) / d + 4;
-        h *= 60
-      }
-      return {
-        h: h,
-        s: s * 100,
-        l: l * 100
-      }
-    }
-
-    function hslToHex(h, s, l) {
-      h = ((h % 360) + 360) % 360;
-      s /= 100;
-      l /= 100;
-      var c = (1 - Math.abs(2 * l - 1)) * s,
-        x = c * (1 - Math.abs((h / 60) % 2 - 1)),
-        m = l - c / 2,
-        r = 0,
-        g = 0,
-        b = 0;
-      if (h < 60) {
-        r = c;
-        g = x
-      } else if (h < 120) {
-        r = x;
-        g = c
-      } else if (h < 180) {
-        g = c;
-        b = x
-      } else if (h < 240) {
-        g = x;
-        b = c
-      } else if (h < 300) {
-        r = x;
-        b = c
-      } else {
-        r = c;
-        b = x
-      }
-      var toHex = function(v) {
-        var n = Math.round((v + m) * 255);
-        n = Math.max(0, Math.min(255, n));
-        var s2 = n.toString(16);
-        return s2.length === 1 ? `0` + s2 : s2
-      };
-      return `#` + toHex(r) + toHex(g) + toHex(b)
-    }
-
-    function tonalFromHex(hex) {
-      var hsl = hexToHsl(hex);
-      var h = hsl.h;
-      return {
-        pri: hslToHex(h, 78, 85),
-        onPri: hslToHex(h, 42, 22),
-        priCon: hslToHex(h, 38, 35),
-        onPriCon: hslToHex(h, 62, 92)
-      }
-    }
-
-    var accentCurrentHex = ACCENT_DEFAULT_HEX;
-
-    function applyAccentColor(hex, persist) {
-      var t = tonalFromHex(hex);
-      var root = document.documentElement.style;
-      root.setProperty(`--pri`, t.pri);
-      root.setProperty(`--on-pri`, t.onPri);
-      root.setProperty(`--pri-con`, t.priCon);
-      root.setProperty(`--on-pri-con`, t.onPriCon);
-      accentCurrentHex = hex;
-      var customInput = document.getElementById(`accent-custom-input`);
-      if (customInput) customInput.value = hex;
-      buildAccentPresetGrid();
-      updateAccentCustomSel();
-      try {
-        localStorage.setItem(`accentColor`, hex)
-      } catch (e) {}
-      if (persist !== !1) {
-        fetch(`/accentsett`, {
-          method: `POST`,
-          headers: {
-            "Content-Type": `application/x-www-form-urlencoded`
-          },
-          body: `hex=` + encodeURIComponent(hex)
-        }).catch(function() {})
-      }
-    }
-
-    function buildAccentPresetGrid() {
-      var g = document.getElementById(`accent-preset-grid`);
-      if (!g) return;
-      g.innerHTML = ``;
-      ACCENT_PRESETS.forEach(function(hex) {
-        var t = tonalFromHex(hex);
-        var isSel = accentCurrentHex.toLowerCase() === hex.toLowerCase();
-        var d = document.createElement(`div`);
-        d.className = `accent-swatch` + (isSel ? ` sel` : ``);
-        d.style.background = t.pri;
-        d.style.color = t.onPri;
-        d.onclick = function() {
-          applyAccentColor(hex)
-        };
-        if (isSel) d.innerHTML = ACCENT_CHECK_SVG;
-        g.appendChild(d)
-      })
-    }
-
-    function updateAccentCustomSel() {
-      var wrap = document.getElementById(`accent-custom-swatch-wrap`);
-      var chk = document.getElementById(`accent-custom-check`);
-      if (!wrap) return;
-      var isCustom = !ACCENT_PRESETS.some(function(h) {
-        return h.toLowerCase() === accentCurrentHex.toLowerCase()
-      });
-      wrap.classList.toggle(`sel`, isCustom);
-      if (chk) {
-        var t = tonalFromHex(accentCurrentHex);
-        chk.style.color = t.onPri;
-        chk.innerHTML = isCustom ? ACCENT_CHECK_SVG : ``
-      }
-    }
-
-    function onAccentCustomPick(hex) {
-      applyAccentColor(hex)
-    }
-
-    function resetAccentColor() {
-      applyAccentColor(ACCENT_DEFAULT_HEX)
-    }
-
-    function loadAccentColor() {
-      var saved = null;
-      try {
-        saved = localStorage.getItem(`accentColor`)
-      } catch (e) {}
-      applyAccentColor(saved || ACCENT_DEFAULT_HEX, !1)
-    }
-
-    var darkModeOn = !0;
-
-    function applyDarkMode(on, persist) {
-      darkModeOn = on;
-      document.body.classList.toggle(`light`, !on);
-      var cb = document.getElementById(`dark-mode-cb`);
-      if (cb) cb.checked = on;
-      if (persist !== !1) {
-        try {
-          localStorage.setItem(`darkMode`, on ? `1` : `0`)
-        } catch (e) {}
-      }
-    }
-
-    function toggleDarkMode() {
-      applyDarkMode(!darkModeOn)
-    }
-
-    function loadDarkMode() {
-      var saved = null;
-      try {
-        saved = localStorage.getItem(`darkMode`)
-      } catch (e) {}
-      applyDarkMode(saved === null ? !0 : saved === `1`, !1)
-    }
-
-    function go(id) {
-      if (id === `s-accent-color`) {
-        var customInput = document.getElementById(`accent-custom-input`);
-        if (customInput) customInput.value = accentCurrentHex;
-        buildAccentPresetGrid();
-        updateAccentCustomSel()
-      }
-      if (id === `s-bright`) {
-        var sl = document.getElementById(`bright-slider`);
-        if (sl) sl.value = brightLevel;
-        var bv = document.getElementById(`br-val`);
-        if (bv) bv.textContent = brightLevel;
-        var lbl = document.getElementById(`bright-screen-lbl`);
-        if (lbl) lbl.textContent = `Nivel ` + brightLevel;
-        var cb = document.getElementById(`dim-auto-cb`);
-        if (cb) cb.checked = dimAuto;
-        document.getElementById(`dim-sched`).classList.toggle(`open`, dimAuto);
-        var df = document.getElementById(`dim-from`);
-        if (df) df.value = dimFrom;
-        var dt = document.getElementById(`dim-to`);
-        if (dt) dt.value = dimTo;
-        var ds = document.getElementById(`dim-level-slider`);
-        if (ds) ds.value = dimLevel;
-        var dl = document.getElementById(`dim-level-lbl`);
-        if (dl) dl.textContent = dimLevel
-      }
-      if (id === `s-buzzer`) {
-        var bcb = document.getElementById(`btog-cb`);
-        if (bcb) bcb.checked = bOn;
-        var bs = document.getElementById(`buzzer-vol-slider`);
-        if (bs) bs.value = buzzerVolume;
-        var bv = document.getElementById(`buzzer-vol-val`);
-        if (bv) bv.textContent = buzzerVolume;
-        var bl = document.getElementById(`buzzer-vol-lbl`);
-        if (bl) bl.textContent = `Volum ` + buzzerVolume + `%`;
-        buildBuzzerPresets();
-        buildEventSoundCard()
-      }
-      if (id === `s-touch`) {
-        buildTouchActionCard()
-      }
-      if (id === `s-scrolltype`) {
-        buildScrollTypeList()
-      }
-      if (id === `s-fonttype`) {
-        buildFontTypeList()
-      }
-      if (id === `s-hideicons`) {
-        buildHideIconsList()
-      }
-      if (id === `s-iconsettings`) {
-        buildIconSettingsList()
-      }
-      if (id === `s-iconsettings-weather`) {
-        buildIconSettingsWeatherList()
-      }
-      if (id === `s-ap`) {
-        loadApSettings()
-      }
-      document.querySelectorAll(`.screen`).forEach(function(s) {
-        s.classList.remove(`active`)
-      }), document.getElementById(id).classList.add(`active`), window.scrollTo(0, 0), id === `s-tiles` && (buildGrid(), buildPriorityGrid());
-      if (id === `s-wifi`) {
-        startWifiAutoScan()
-      } else {
-        stopWifiAutoScan()
-      }
-      if (id === `s-about`) {
-        refreshAboutState();
-        startAboutTick()
-      } else {
-        stopAboutTick()
-      }
-      document.getElementById(`lang-scrim`).classList.remove(`open`);
-      document.getElementById(`lang-dlg`).classList.remove(`open`);
-    }
-
-    function rssi2b(r) {
-      return r >= -55 ? 4 : r >= -70 ? 3 : r >= -80 ? 2 : 1
-    }
-
-    function bHtml(n) {
-      var h = `<div class="bars">`;
-      return [3, 5, 9, 13].forEach(function(px, i) {
-        h += `<div class="bar` + (i < n ? ` on` : ``) + `" style="height:` + px + `px"></div>`
-      }), h + `</div>`
-    }
-    var wifiAutoScanTimer = null;
-    var wifiScanRunning = !1;
-
-    function startWifiAutoScan() {
-      stopWifiAutoScan();
-      doScan();
-      wifiAutoScanTimer = setInterval(function() {
-        if (document.getElementById(`s-wifi`).classList.contains(`active`) && !document.getElementById(`conn-dlg`).classList.contains(`open`)) {
-          doScanSilent()
-        }
-      }, 15000)
-    }
-
-    function stopWifiAutoScan() {
-      if (wifiAutoScanTimer) {
-        clearInterval(wifiAutoScanTimer);
-        wifiAutoScanTimer = null
-      }
-    }
-
-    function wifiSvgForBars(bars) {
-      if (bars >= 4) {
-        return `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
-      } else if (bars === 3) {
-        return `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9z" opacity=".3"/><path d="M5 13l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13zm4 4 3 3 3-3c-1.65-1.66-4.34-1.66-6 0z"/></svg>`
-      } else if (bars === 2) {
-        return `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm4 4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" opacity=".3"/><path d="M9 17l3 3 3-3c-1.65-1.66-4.34-1.66-6 0z"/></svg>`
-      } else {
-        return `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm4 4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13zm4 4 3 3 3-3c-1.65-1.66-4.34-1.66-6 0z" opacity=".3"/></svg>`
-      }
-    }
-
-    function buildNetItem(n, curSSID) {
-      var isCur = (n.ssid === curSSID && curSSID !== `-` && curSSID !== ``);
-      var bars = rssi2b(n.rssi);
-      var wifiSvg = wifiSvgForBars(bars);
-      var lockSvg = n.secured ? `<svg width="18" height="18" viewBox="0 0 24 24" fill="var(--on-surf-var)"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>` : ``;
-      var authTxt = n.auth || ``;
-      var d = document.createElement(`div`);
-      d.className = `li` + (isCur ? ` cur-net` : ``);
-      d.dataset.ssid = n.ssid;
-      d.innerHTML = `<div class="lic lc-pur">` + wifiSvg + `</div><div class="li-body"><div class="li-head" style="` + (isCur ? `color:var(--pri-txt)` : ``) + `">` + n.ssid + `</div><div class="li-sub">` + authTxt + `</div></div><div class="li-trail">` + lockSvg + `</div>`;
-      d.onclick = function() {
-        if (isCur) {
-          openDisconDialog(n.ssid);
-          return;
-        }
-        document.querySelectorAll(`#nlist .li`).forEach(function(x) {
-          x.classList.remove(`sel`)
-        }), d.classList.add(`sel`), selSSID = n.ssid, selSec = n.secured, openConnDialog(n.ssid, n.secured)
-      };
-      return d
-    }
-
-    function renderNetsList(nets) {
-      var nl = document.getElementById(`nlist`);
-      var curSSID = document.getElementById(`w-ssid`).textContent || ``;
-      nets.sort(function(a, b) {
-        return b.rssi - a.rssi
-      });
-      var existingMap = {};
-      nl.querySelectorAll(`.li[data-ssid]`).forEach(function(el) {
-        existingMap[el.dataset.ssid] = el
-      });
-      var newSsids = nets.map(function(n) {
-        return n.ssid
-      });
-      Object.keys(existingMap).forEach(function(ssid) {
-        if (newSsids.indexOf(ssid) < 0) {
-          var el = existingMap[ssid];
-          el.style.transition = `opacity .3s,transform .3s`;
-          el.style.opacity = `0`;
-          el.style.transform = `translateX(-16px)`;
-          setTimeout(function() {
-            if (el.parentNode) el.parentNode.removeChild(el)
-          }, 300)
-        }
-      });
-      nets.forEach(function(n, i) {
-        var existing = nl.querySelector(`.li[data-ssid="` + n.ssid + `"]`);
-        if (existing) {
-          var isCur = (n.ssid === curSSID && curSSID !== `-` && curSSID !== ``);
-          var bars = rssi2b(n.rssi);
-          existing.querySelector(`.lic`).innerHTML = wifiSvgForBars(bars);
-          var head = existing.querySelector(`.li-head`);
-          if (head) head.style.color = isCur ? `var(--pri-txt)` : ``;
-          var newParent = nl;
-          var items = newParent.querySelectorAll(`.li[data-ssid]`);
-          if (items[i] && items[i] !== existing) {
-            newParent.insertBefore(existing, items[i])
-          }
-        } else {
-          var d = buildNetItem(n, curSSID);
-          d.style.opacity = `0`;
-          d.style.transform = `translateX(16px)`;
-          d.style.transition = `none`;
-          var items = nl.querySelectorAll(`.li[data-ssid]`);
-          if (items[i]) nl.insertBefore(d, items[i]);
-          else nl.appendChild(d);
-          requestAnimationFrame(function() {
-            d.style.transition = `opacity .3s,transform .3s`;
-            d.style.opacity = `1`;
-            d.style.transform = ``
-          })
-        }
-      })
-    }
-
-    function doScanSilent(attempt) {
-      attempt = attempt || 0;
-      if (!attempt && wifiScanRunning) return;
-      wifiScanRunning = !0;
-      fetch(`/scan`).then(function(r) {
-        return r.json()
-      }).then(function(res) {
-        // Backend now returns {scanning, networks} instead of a bare array,
-        // since the scan itself runs async on-device. While scanning is
-        // still true, poll again shortly instead of reading this as "0
-        // networks" - a scan in progress is not the same as an empty result.
-        if (res.scanning && attempt < 10) {
-          setTimeout(function() { doScanSilent(attempt + 1) }, 800);
-          return
-        }
-        wifiScanRunning = !1;
-        var nets = res.networks || [];
-        var nl = document.getElementById(`nlist`);
-        var hint = nl.querySelector(`.scan-hint`);
-        if (hint) {
-          nl.innerHTML = ``
-        }
-        if (!nets.length) {
-          if (!nl.querySelector(`.li[data-ssid]`)) nl.innerHTML = `<div class="scan-hint">Nicio retea gasita</div>`;
-          return
-        }
-        renderNetsList(nets)
-      }).catch(function() {
-        wifiScanRunning = !1
-      })
-    }
-
-    function doScan(attempt) {
-      attempt = attempt || 0;
-      if (!attempt) {
-        if (wifiScanRunning) return;
-        wifiScanRunning = !0
-      }
-      var nl = document.getElementById(`nlist`);
-      var scanBtn = document.getElementById(`scan-btn`);
-      if (!attempt) {
-        if (scanBtn) {
-          scanBtn.disabled = !0;
-          scanBtn.style.opacity = `.5`;
-          scanBtn.style.pointerEvents = `none`
-        }
-        nl.innerHTML = `<div class="scan-hint"><span class="spin-ring"></span>Se cauta retele…</div>`, selSSID = ``
-      }
-      fetch(`/scan`).then(function(r) {
-        return r.json()
-      }).then(function(res) {
-        if (res.scanning && attempt < 10) {
-          setTimeout(function() { doScan(attempt + 1) }, 800);
-          return
-        }
-        wifiScanRunning = !1;
-        if (scanBtn) {
-          scanBtn.disabled = !1;
-          scanBtn.style.opacity = ``;
-          scanBtn.style.pointerEvents = ``
-        }
-        var nets = res.networks || [];
-        if (!nets.length) {
-          nl.innerHTML = `<div class="scan-hint">Nicio retea gasita</div>`;
-          return
-        };
-        var curSSID = document.getElementById(`w-ssid`).textContent || ``;
-        nets.sort(function(a, b) {
-          return b.rssi - a.rssi
-        });
-        nl.innerHTML = ``;
-        nets.forEach(function(n) {
-          var d = buildNetItem(n, curSSID);
-          d.style.opacity = `0`;
-          d.style.transition = `none`;
-          nl.appendChild(d);
-          requestAnimationFrame(function() {
-            d.style.transition = `opacity .25s`;
-            d.style.opacity = `1`
-          })
-        })
-      }).catch(function() {
-        wifiScanRunning = !1;
-        if (scanBtn) {
-          scanBtn.disabled = !1;
-          scanBtn.style.opacity = ``;
-          scanBtn.style.pointerEvents = ``
-        }
-        nl.innerHTML = `<div class="scan-hint">Eroare la scan</div>`
-      })
-    }
-
-    function openConnDialog(ssid, secured) {
-      document.getElementById(`dlg-ssid-name`).textContent = ssid;
-      var b = document.getElementById(`dlg-pass-body`);
-      b.style.display = secured ? `block` : `none`;
-      if (!secured) document.getElementById(`pass-in`).value = ``;
-      document.getElementById(`md-scrim`).classList.add(`open`);
-      document.getElementById(`conn-dlg`).classList.add(`open`);
-      if (secured) setTimeout(function() {
-        document.getElementById(`pass-in`).focus()
-      }, 250)
-    }
-
-    function closeDialog() {
-      document.getElementById(`md-scrim`).classList.remove(`open`);
-      document.getElementById(`conn-dlg`).classList.remove(`open`)
-    }
-
-    function doConnect() {
-      if (!selSSID) return;
-      var pass = document.getElementById(`pass-in`).value,
-        btn = document.getElementById(`conn-btn`);
-      btn.disabled = !0, btn.textContent = `…`;
-      fetch(`/connect`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `ssid=` + encodeURIComponent(selSSID) + `&pass=` + encodeURIComponent(pass)
-      }).then(function(r) {
-        return r.text()
-      }).then(function() {
-        closeDialog(), showMsg(`Salvat! Ceasul se reconecteaza…`, `ok`), btn.disabled = !1, btn.textContent = `Conecteaza`, document.getElementById(`h-ssid`).textContent = selSSID, document.getElementById(`w-ssid`).textContent = selSSID, document.getElementById(`h-ip`).textContent = `…`, document.getElementById(`w-ip`).textContent = `…`;
-        var att = 0,
-          poll = setInterval(function() {
-            att++, fetch(`/state`).then(function(r) {
-              return r.json()
-            }).then(function(s) {
-              s.ip && s.ip !== `0.0.0.0` && !s.ap && (isApMode = !1, clearInterval(poll), document.getElementById(`h-ip`).textContent = s.ip, document.getElementById(`w-ip`).textContent = s.ip, setChips(selSSID, !1), showMsg(`Conectat! IP: ` + s.ip, `ok`))
-            }).catch(function() {}), att >= 20 && clearInterval(poll)
-          }, 1500)
-      }).catch(function() {
-        showMsg(`Eroare conexiune`, `err`), btn.disabled = !1, btn.textContent = `Conecteaza`
-      })
-    }
-
-    function showMsg(t, c) {
-      showToast(t)
-    }
-
-    function setChips(ssid, isAp) {
-      var b = document.getElementById(`switch-ap-btn`);
-      if (b) b.style.display = isAp ? `none` : ``;
-      var b2 = document.getElementById(`ap-switch-btn`);
-      if (b2) b2.style.display = isAp ? `none` : ``;
-      var b3 = document.getElementById(`switch-wifi-btn`);
-      if (b3) b3.style.display = isAp ? `` : `none`
-    }
-
-    function copyIP() {
-      var ip = document.getElementById(`h-ip`).textContent;
-      ip === `…` || ip === `-` || navigator.clipboard && navigator.clipboard.writeText(`http://` + ip + `/`).then(function() {
-        var b = document.getElementById(`copy-btn`);
-        b.textContent = `Copiat!`, setTimeout(function() {
-          b.textContent = `Copiaza`
-        }, 2e3)
-      })
-    }
-
-    function toggleBuzzer() {
-      bOn = !bOn;
-      var cb = document.getElementById(`btog-cb`);
-      cb.checked = bOn, document.getElementById(`h-bsub`).textContent = bOn ? `Beep la schimbarea tile-ului` : `Silentios`, saveSettings()
-    }
-
-    function onBuzzerVolumeInput(v) {
-      buzzerVolume = parseInt(v);
-      var lbl = document.getElementById(`buzzer-vol-lbl`);
-      if (lbl) lbl.textContent = `Volum ` + v + `%`;
-      var val = document.getElementById(`buzzer-vol-val`);
-      if (val) val.textContent = v;
-      fetch(`/buzzersett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `volume=` + v
-      })
-    }
-
-    function buildBuzzerPresets() {
-      var c = document.getElementById(`buzzer-presets`);
-      if (!c) return;
-      c.innerHTML = ``;
-      BUZZER_PRESETS.forEach(function(p) {
-        var isSel = (p.id === buzzerPreset);
-        var d = document.createElement(`div`);
-        d.className = `li`;
-        d.style.cursor = `pointer`;
-        d.innerHTML = `<div class="li-body"><div class="li-head" style="` + (isSel ? `color:var(--pri)` : ``) + `">` + p.name + `</div></div><div class="li-trail">` + (isSel ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--pri)"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>` : ``) + `</div>`;
-        d.onclick = function() {
-          selectBuzzerPreset(p.id)
-        };
-        c.appendChild(d)
-      })
-    }
-
-    function selectBuzzerPreset(id) {
-      buzzerPreset = id;
-      buildBuzzerPresets();
-      fetch(`/buzzersett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `preset=` + encodeURIComponent(id)
-      })
-    }
-
-    function buildTouchActionCard() {
-      var c = document.getElementById(`touch-action-card`);
-      if (!c) return;
-      c.innerHTML = ``;
-      var touchSvg = `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z"/></svg>`;
-      var gestures = [{
-        key: `tap`,
-        label: `Tap`,
-        desc: `Atingere scurta a senzorului`,
-        val: touchTapAction
-      }, {
-        key: `dbl`,
-        label: `Double Tap`,
-        desc: `Doua atingeri rapide, consecutive`,
-        val: touchDoubleTapAction
-      }];
-      gestures.forEach(function(g, i) {
-        var row = document.createElement(`div`);
-        row.className = `li`;
-        row.style.borderBottom = `none`;
-        var opts = ``;
-        TOUCH_ACTIONS.forEach(function(a) {
-          opts += `<option value="` + a.id + `"` + (a.id === g.val ? ` selected` : ``) + `>` + a.name + `</option>`
-        });
-        row.innerHTML = `<div class="lic lc-grn">` + touchSvg + `</div><div class="li-body"><div class="li-head">` + g.label + `</div><div class="li-sub">` + g.desc + `</div></div><div class="li-trail"><select class="evsnd-select" onchange="setTouchAction(\'` + g.key + `\',this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">` + opts + `</select></div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function setTouchAction(key, val) {
-      var v = parseInt(val);
-      if (key === `tap`) touchTapAction = v;
-      else touchDoubleTapAction = v;
-      fetch(`/touchsett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `tap=` + touchTapAction + `&dbl=` + touchDoubleTapAction
-      })
-    }
-
-    function buildEventSoundCard() {
-      var c = document.getElementById(`event-sound-card`);
-      if (!c) return;
-      c.innerHTML = ``;
-      var evs = [{
-        key: `tile`,
-        label: `Tile Switching`,
-        desc: `Beep la schimbarea tile-ului`,
-        val: evSndTile,
-        enabled: !0,
-        cls: `lc-tea`,
-        svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>`
-      }, {
-        key: `wifi`,
-        label: `WiFi Connection Lost`,
-        desc: `Sunet la pierderea conexiunii WiFi`,
-        val: evSndWifi,
-        enabled: !0,
-        cls: `lc-blu`,
-        svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
-      }, {
-        key: `notif`,
-        label: `New Notification`,
-        desc: `Sunet la notificare noua de la PC`,
-        val: evSndNotif,
-        enabled: notifEn,
-        cls: `lc-pur`,
-        svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`
-      }, {
-        key: `ets2`,
-        label: `ETS2 Speeding`,
-        desc: `Sunet la depasirea limitei de viteza`,
-        val: evSndEts2,
-        enabled: ets2En,
-        cls: `lc-amb`,
-        svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm12 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-1-9.5h2.5l2.07 2.5H17V9z"/></svg>`
-      }, {
-        key: `touch`,
-        label: `Touch Sensor`,
-        desc: `Sunet la atingerea senzorului`,
-        val: evSndTouch,
-        enabled: !0,
-        cls: `lc-grn`,
-        svg: `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M9 11.24V7.5C9 6.12 10.12 5 11.5 5S14 6.12 14 7.5v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63l-4.54-2.26c-.17-.07-.35-.11-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72c-.08-.01-.15-.03-.24-.03-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z"/></svg>`
-      }];
-      evs.forEach(function(ev, i) {
-        var row = document.createElement(`div`);
-        row.className = `li`;
-        row.style.borderBottom = `none`;
-        if (!ev.enabled) {
-          row.style.opacity = `.38`;
-          row.style.pointerEvents = `none`
-        }
-        var opts = ``;
-        EVENT_SOUND_OPTIONS.forEach(function(o) {
-          opts += `<option value="` + o.id + `"` + (o.id === ev.val ? ` selected` : ``) + `>` + o.name + `</option>`
-        });
-        var descTxt = ev.enabled ? ev.desc : `Activeaza mai intai in Tile Manager`;
-        row.innerHTML = `<div class="lic ` + ev.cls + `">` + ev.svg + `</div><div class="li-body"><div class="li-head">` + ev.label + `</div><div class="li-sub">` + descTxt + `</div></div><div class="li-trail"><select class="evsnd-select" ` + (ev.enabled ? `` : `disabled`) + ` onchange="setEventSound(\'` + ev.key + `\',this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">` + opts + `</select></div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function setEventSound(key, val) {
-      if (key === `tile`) evSndTile = val;
-      else if (key === `wifi`) evSndWifi = val;
-      else if (key === `notif`) evSndNotif = val;
-      else if (key === `ets2`) evSndEts2 = val;
-      else if (key === `touch`) evSndTouch = val;
-      fetch(`/eventsoundsett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `event=` + key + `&preset=` + encodeURIComponent(val)
-      })
-    }
-
-    function toggleNpAdaptiveIcon() {
-      npAdaptiveIconV = !npAdaptiveIconV;
-      var cb = document.getElementById(`np-adaptive-icon-cb`);
-      if (cb) cb.checked = npAdaptiveIconV;
-      saveSettings()
-    }
-
-    function toggleHideIcons() {
-      hideTileIcons = !hideTileIcons;
-      var cb = document.getElementById(`hide-icons-cb`);
-      if (cb) cb.checked = hideTileIcons;
-      Object.keys(indivHideIcons).forEach(function(k) {
-        indivHideIcons[k] = hideTileIcons
-      });
-      applyHideIcons();
-      refreshHideIconSwitches();
-      saveSettings()
-    }
-
-    function applyHideIcons() {
-      var cb = document.getElementById(`hide-icons-cb`);
-      if (cb) cb.checked = hideTileIcons
-    }
-
-    function refreshHideIconSwitches() {
-      Object.keys(indivHideIcons).forEach(function(k) {
-        var cb = document.getElementById(`hideicon-cb-` + k);
-        if (cb) cb.checked = indivHideIcons[k]
-      })
-    }
-
-    function setScrollType(v) {
-      scrollTypeV = parseInt(v);
-      var sel = document.getElementById(`scroll-type-sel`);
-      if (sel) sel.value = scrollTypeV;
-      Object.keys(indivScroll).forEach(function(k) {
-        indivScroll[k] = scrollTypeV
-      });
-      refreshScrollTypeSelects();
-      saveSettings()
-    }
-
-    function setFontType(v) {
-      fontTypeV = parseInt(v);
-      var sel = document.getElementById(`font-type-sel`);
-      if (sel) sel.value = fontTypeV;
-      Object.keys(indivFont).forEach(function(k) {
-        indivFont[k] = fontTypeV
-      });
-      refreshFontTypeSelects();
-      saveSettings()
-    }
-
-    function applyFontType() {
-      var sel = document.getElementById(`font-type-sel`);
-      if (sel) sel.value = fontTypeV
-    }
-
-    function refreshFontTypeSelects() {
-      Object.keys(indivFont).forEach(function(k) {
-        var s = document.getElementById(`fonttype-sel-` + k);
-        if (s) s.value = indivFont[k]
-      })
-    }
-
-    function buildFontTypeList() {
-      var c = document.getElementById(`fonttype-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      SCROLL_TILES.forEach(function(t, i) {
-        var row = document.createElement(`div`);
-        row.className = `li static`;
-        row.style.borderBottom = `none`;
-        var opts = ``;
-        FONT_TYPE_OPTIONS.forEach(function(o) {
-          opts += `<option value="` + o.v + `"` + (o.v === indivFont[t.key] ? ` selected` : ``) + `>` + o.n + `</option>`
-        });
-        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div></div><div class="li-trail"><select class="evsnd-select" id="fonttype-sel-` + t.key + `" onchange="setIndividualFontType(\'` + t.key + `\',this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">` + opts + `</select></div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function setIndividualFontType(key, val) {
-      indivFont[key] = parseInt(val);
-      saveSettings()
-    }
-
-    function applyScrollType() {
-      var sel = document.getElementById(`scroll-type-sel`);
-      if (sel) sel.value = scrollTypeV
-    }
-
-    function refreshScrollTypeSelects() {
-      Object.keys(indivScroll).forEach(function(k) {
-        var s = document.getElementById(`scrolltype-sel-` + k);
-        if (s) s.value = indivScroll[k]
-      })
-    }
-
-    function buildScrollTypeList() {
-      var c = document.getElementById(`scrolltype-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      SCROLL_TILES.forEach(function(t, i) {
-        var row = document.createElement(`div`);
-        row.className = `li static`;
-        row.style.borderBottom = `none`;
-        var opts = ``;
-        SCROLL_TYPE_OPTIONS.forEach(function(o) {
-          opts += `<option value="` + o.v + `"` + (o.v === indivScroll[t.key] ? ` selected` : ``) + `>` + o.n + `</option>`
-        });
-        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div></div><div class="li-trail"><select class="evsnd-select" id="scrolltype-sel-` + t.key + `" onchange="setIndividualScrollType(\'` + t.key + `\',this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">` + opts + `</select></div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function setIndividualScrollType(key, val) {
-      indivScroll[key] = parseInt(val);
-      saveSettings()
-    }
-
-    function buildHideIconsList() {
-      var c = document.getElementById(`hideicons-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      var tiles = SCROLL_TILES.filter(function(t) {
-        return t.hasIcon !== !1
-      });
-      tiles.forEach(function(t, i) {
-        var row = document.createElement(`div`);
-        row.className = `li static`;
-        row.style.borderBottom = `none`;
-        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div></div><div class="li-trail"><div class="sw" onclick="setIndividualHideIcon(\'` + t.key + `\')"><input type="checkbox" id="hideicon-cb-` + t.key + `"` + (indivHideIcons[t.key] ? ` checked` : ``) + `><span class="sw-track"></span><span class="sw-thumb"></span></div></div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function setIndividualHideIcon(key) {
-      indivHideIcons[key] = !indivHideIcons[key];
-      var cb = document.getElementById(`hideicon-cb-` + key);
-      if (cb) cb.checked = indivHideIcons[key];
-      saveSettings()
-    }
-
-    // ===================== ICON SETTINGS =====================
-    var ICON_SETTINGS_TILES = [{
-        key: `reminder`,
-        label: `Reminder`,
-        cls: `lc-tea`,
-        svg: ISVG[5]
-      }, {
-        key: `notif`,
-        label: `PC Notifications`,
-        cls: `lc-pur`,
-        svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`
-      }, {
-        key: `nowplaying`,
-        label: `Now Playing`,
-        cls: `lc-amb`,
-        svg: ISVG[3]
-      }, {
-        key: `ip`,
-        label: `Show IP Address`,
-        cls: `lc-blu`,
-        svg: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>`
-      }
-    ];
-    var ICON_SETTINGS_WX = [{
-      key: `sunny`,
-      label: `Senin (zi)`
-    }, {
-      key: `night`,
-      label: `Senin (noapte)`
-    }, {
-      key: `cloud`,
-      label: `Innorat`
-    }, {
-      key: `rain`,
-      label: `Ploaie`
-    }, {
-      key: `storm`,
-      label: `Furtuna`
-    }, {
-      key: `snow`,
-      label: `Ninsoare`
-    }, {
-      key: `wind`,
-      label: `Vant / Ceata`
-    }];
-    var iconPickerScope = null,
-      iconPickerKey = null;
-
-    function getIconCatalogEntry(id) {
-      for (var i = 0; i < ICON_CATALOG.length; i++) {
-        if (ICON_CATALOG[i].id === id) return ICON_CATALOG[i]
-      }
-      return null
-    }
-
-    function renderIconDots(rows, dot, gap) {
-      dot = dot || 4;
-      gap = gap === void 0 ? 1.4 : gap;
-      var step = dot + gap,
-        size = step * 8 - gap,
-        svg = `<svg viewBox="0 0 ` + size + ` ` + size + `" width="` + (dot * 9) + `" height="` + (dot * 9) + `">`;
-      for (var r = 0; r < 8; r++) {
-        for (var c = 0; c < 8; c++) {
-          var on = (rows[r] & (0x80 >> c)) ? 1 : 0;
-          var cx = c * step + dot / 2,
-            cy = r * step + dot / 2;
-          svg += `<circle cx="` + cx + `" cy="` + cy + `" r="` + (dot / 2) + `" fill="` + (on ? `currentColor` : `var(--outline-var)`) + `" opacity="` + (on ? `1` : `0.35`) + `"/>`
-        }
-      }
-      svg += `</svg>`;
-      return svg
-    }
-
-    function defaultIconRowsFor(scope, key) {
-      if (scope === `wx`) {
-        var wxMap = { sunny: 9, night: 15, cloud: 10, rain: 11, storm: 12, snow: 13, wind: 14 };
-        var wxEntry = getIconCatalogEntry(wxMap[key] || 10);
-        return wxEntry ? wxEntry.rows : null
-      }
-      var trendId = function(trend) {
-        return trend > 0 ? 6 : trend < 0 ? 7 : 8
-      };
-      var idMap = {
-        date: 1,
-        temp: 2,
-        reminder: 3,
-        notif: 5,
-        nowplayingMusic: 4,
-        nowplayingVideo: 24,
-        pressure: trendId(pressureTrendV),
-        currency: trendId(currencyTrendV),
-        ip: 16
-      };
-      var entry = getIconCatalogEntry(idMap[key]);
-      return entry ? entry.rows : null
-    }
-
-    function iconPreviewFor(key, isWx) {
-      var selId = isWx ? indivWxIcon[key] : indivIcon[key];
-      if (selId) {
-        var entry = getIconCatalogEntry(selId);
-        if (entry) return `<div style="color:var(--on-surf)">` + renderIconDots(entry.rows, 3, 1) + `</div>`
-      }
-      var defRows = defaultIconRowsFor(isWx ? `wx` : `tile`, key);
-      if (!defRows) return `<span style="font-size:11px;color:var(--on-surf-var)">Auto</span>`;
-      return `<div style="color:var(--on-surf-var);opacity:0.55">` + renderIconDots(defRows, 3, 1) + `</div>`
-    }
-
-    function buildIconSettingsList() {
-      var c = document.getElementById(`iconsettings-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      ICON_SETTINGS_TILES.forEach(function(t) {
-        var isNpRow = t.key === `nowplaying`;
-        var row = document.createElement(`div`);
-        row.className = `li`;
-        row.style.cursor = `pointer`;
-        row.style.borderBottom = `none`;
-        row.onclick = function() {
-          if (isNpRow) openNpIconSettingsDlg();
-          else openIconPicker(`tile`, t.key, t.label)
-        };
-        var npCustom = isNpRow && !!(indivIcon.nowplayingMusic || indivIcon.nowplayingVideo);
-        var subText = isNpRow ? (npCustom ? `Iconita personalizata` : `Automat (implicit)`) : (indivIcon[t.key] ? `Iconita personalizata` : `Automat (implicit)`);
-        var previewHtml = isNpRow ? iconPreviewFor(`nowplayingMusic`, false) : iconPreviewFor(t.key, false);
-        row.innerHTML = `<div class="lic ` + t.cls + `">` + t.svg + `</div><div class="li-body"><div class="li-head">` + t.label + `</div><div class="li-sub" id="iconsettings-sub-` + t.key + `">` + subText + `</div></div><div class="li-trail" id="iconsettings-preview-` + t.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + previewHtml + `</div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function buildIconSettingsWeatherList() {
-      var c = document.getElementById(`iconsettings-weather-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      ICON_SETTINGS_WX.forEach(function(w, i) {
-        var row = document.createElement(`div`);
-        row.className = `li`;
-        row.style.cursor = `pointer`;
-        row.style.borderBottom = `none`;
-        row.onclick = function() {
-          openIconPicker(`wx`, w.key, w.label)
-        };
-        row.innerHTML = `<div class="lic lc-grn">` + ISVG[4] + `</div><div class="li-body"><div class="li-head">` + w.label + `</div><div class="li-sub" id="iconsettings-wxsub-` + w.key + `">` + (indivWxIcon[w.key] ? `Iconita personalizata` : `Automat (implicit)`) + `</div></div><div class="li-trail" id="iconsettings-wxpreview-` + w.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + iconPreviewFor(w.key, true) + `</div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function openIconPicker(scope, key, label) {
-      iconPickerScope = scope;
-      iconPickerKey = key;
-      var titleEl = document.getElementById(`iconpicker-title`);
-      if (titleEl) titleEl.textContent = `Iconita: ` + label;
-      var curSel = scope === `wx` ? indivWxIcon[key] : indivIcon[key];
-      var grid = document.getElementById(`iconpicker-grid`);
-      grid.innerHTML = ``;
-      var autoCell = document.createElement(`div`);
-      autoCell.onclick = function() {
-        selectIconValue(0)
-      };
-      autoCell.style.cssText = `display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 6px;border-radius:12px;cursor:pointer;border:2px solid ` + (curSel === 0 ? `var(--primary)` : `transparent`) + `;background:var(--surf-high);color:var(--on-surf-var)`;
-      var autoRows = defaultIconRowsFor(scope, key);
-      var autoIconHtml = autoRows ? renderIconDots(autoRows, 4, 1.4) : `<div style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-size:11px;text-align:center">Auto</div>`;
-      autoCell.innerHTML = `<div>` + autoIconHtml + `</div><div style="font-size:11px;text-align:center">Implicit</div>`;
-      grid.appendChild(autoCell);
-      ICON_CATALOG.forEach(function(entry) {
-        var cell = document.createElement(`div`);
-        cell.onclick = function() {
-          selectIconValue(entry.id)
-        };
-        cell.style.cssText = `display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 6px;border-radius:12px;cursor:pointer;border:2px solid ` + (curSel === entry.id ? `var(--primary)` : `transparent`) + `;background:var(--surf-high);color:var(--on-surf)`;
-        cell.innerHTML = `<div>` + renderIconDots(entry.rows, 4, 1.4) + `</div><div style="font-size:11px;text-align:center;color:var(--on-surf-var)">` + entry.n + `</div>`;
-        grid.appendChild(cell)
-      });
-      document.getElementById(`iconpicker-scrim`).classList.add(`open`);
-      document.getElementById(`iconpicker-dlg`).classList.add(`open`);
-      var pickerBody = document.querySelector(`#iconpicker-dlg .mdd-body`);
-      if (pickerBody) pickerBody.scrollTop = 0
-    }
-
-    function closeIconPicker() {
-      document.getElementById(`iconpicker-scrim`).classList.remove(`open`);
-      document.getElementById(`iconpicker-dlg`).classList.remove(`open`);
-      iconPickerScope = null;
-      iconPickerKey = null
-    }
-
-    function selectIconValue(id) {
-      if (!iconPickerScope || !iconPickerKey) return;
-      if (iconPickerScope === `wx`) {
-        indivWxIcon[iconPickerKey] = id;
-        var sub = document.getElementById(`iconsettings-wxsub-` + iconPickerKey);
-        if (sub) sub.textContent = id ? `Iconita personalizata` : `Automat (implicit)`;
-        var prev = document.getElementById(`iconsettings-wxpreview-` + iconPickerKey);
-        if (prev) prev.innerHTML = iconPreviewFor(iconPickerKey, true)
-      } else {
-        indivIcon[iconPickerKey] = id;
-        var sub2 = document.getElementById(`iconsettings-sub-` + iconPickerKey);
-        if (sub2) sub2.textContent = id ? `Iconita personalizata` : `Automat (implicit)`;
-        var prev2 = document.getElementById(`iconsettings-preview-` + iconPickerKey);
-        if (prev2) prev2.innerHTML = iconPreviewFor(iconPickerKey, false)
-      }
-      closeIconPicker();
-      if (document.getElementById(`iconsettings-list`)) buildIconSettingsList();
-      saveSettings()
-    }
-
-    function buildGrid() {
-      var g = document.getElementById(`tgrid`);
-      g.innerHTML = ``;
-      items.forEach(function(item, idx) {
-        if (item.id === 3 && npIsPriority()) return;
-        var isNp = item.id === 3,
-          isTemp = item.id === 2,
-          isWx = item.id === 4,
-          isHour = item.id === 0,
-          isDate = item.id === 1,
-          isMemoTile = item.id === 5,
-          isCanvas = item.id === 6,
-          isPressure = item.id === 8,
-          isScreensaver = item.id === 9,
-          isCurrency = item.id === 11,
-          d = document.createElement(`div`);
-        d.className = `tile-item`;
-        var swHtml = `<div class=\"sw\" onclick=\"toggleTile(` + idx + `)\"><input type=\"checkbox\" id=\"tsw` + idx + `\"` + (item.enabled ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>`;
-        var gearSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87a.49.49 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z\"/></svg>`;
-        var npGearHtml = isNp ? `<button class=\"np-gear-btn\" onclick=\"openNpSettingsDlg(event)\" title=\"Setari Now Playing\">` + gearSvg + `</button>` : ``;
-        var npHelpHtml = isNp ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'sender')\" title=\"Ajutor Now Playing\">` + TILE_HELP_SVG + `</button>` : ``;
-        var wxGearHtml = isWx ? `<button class=\"np-gear-btn\" onclick=\"openWxSettingsDlg(event)\" title=\"Setari Meteo\">` + gearSvg + `</button>` : ``;
-        var wxHelpHtml = isWx ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'lang')\" title=\"Ajutor Meteo\">` + TILE_HELP_SVG + `</button>` : ``;
-        var tempGearHtml = isTemp ? `<button class=\"np-gear-btn\" onclick=\"openTempSettingsDlg(event)\" title=\"Setari Temperatura\">` + gearSvg + `</button>` : ``;
-        var hourGearHtml = isHour ? `<button class=\"np-gear-btn\" onclick=\"openHourSettingsDlg(event)\" title=\"Setari Ora\">` + gearSvg + `</button>` : ``;
-        var dateGearHtml = isDate ? `<button class=\"np-gear-btn\" onclick=\"openDateSettingsDlg(event)\" title=\"Setari Data\">` + gearSvg + `</button>` : ``;
-        var dateHelpHtml = isDate ? `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'lang')\" title=\"Ajutor Data\">` + TILE_HELP_SVG + `</button>` : ``;
-        var isMemo = item.id === 5,
-          pencilSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z\"/></svg>`,
-          memoGearHtml = isMemo ? `<button class=\"np-gear-btn\" onclick=\"openMemoSettingsDlg(event)\" title=\"Setari Memento\">` + pencilSvg + `</button>` : ``,
-          canvasGearHtml = isCanvas ? `<button class=\"np-gear-btn\" onclick=\"openCanvasSettingsDlg(event)\" title=\"Setari Canvas\">` + gearSvg + `</button>` : ``;
-        var pressureGearHtml = isPressure ? `<button class=\"np-gear-btn\" onclick=\"openPressureSettingsDlg(event)\" title=\"Setari Presiune\">` + gearSvg + `</button>` : ``;
-        var ssGearHtml = isScreensaver ? `<button class=\"np-gear-btn\" onclick=\"openSsSettingsDlg(event)\" title=\"Setari Screen Saver\">` + gearSvg + `</button>` : ``;
-        var currencyGearHtml = isCurrency ? `<button class=\"np-gear-btn\" onclick=\"openCurrencySettingsDlg(event)\" title=\"Setari Currency Standards\">` + gearSvg + `</button>` : ``;
-        d.innerHTML = `<span class="drag-handle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class="lic ` + ILCLS[item.id] + `">` + ISVG[item.id] + `</div><div class="tile-body"><div class="tile-head">` + NAMES[item.id] + `</div>` + (isNp ? `<div class="tile-sub" id="nptxt-` + idx + `">Astept date de la Octoglow Sender...</div>` : isWx ? `<div class="tile-sub" id="wxtxt-` + idx + `">` + wxPreviewText() + `</div>` : isCanvas ? `<div class="tile-sub">Desen personalizat 8×32</div>` : isMemoTile ? `<div class="tile-sub" id="memotxt-` + idx + `">` + (memoText || `Niciun text configurat`) + `</div>` : isHour ? `<div class="tile-sub" id="hourtxt-` + idx + `">` + hourPreviewText() + `</div>` : isDate ? `<div class="tile-sub" id="datetxt-` + idx + `">` + datePreviewText() + `</div>` : isTemp ? `<div class="tile-sub" id="temptxt-` + idx + `">` + tempPreviewText() + `</div>` : isPressure ? `<div class="tile-sub" id="pressuretxt-` + idx + `">` + pressurePreviewText() + `</div>` : isScreensaver ? `<div class="tile-sub" id="sstxt-` + idx + `">` + ssAnimPreviewText() + `</div>` : isCurrency ? `<div class="tile-sub" id="currencytxt-` + idx + `">` + currencyPreviewText() + `</div>` : ``) + `</div>` + npHelpHtml + wxHelpHtml + dateHelpHtml + tempGearHtml + hourGearHtml + dateGearHtml + npGearHtml + wxGearHtml + memoGearHtml + canvasGearHtml + pressureGearHtml + ssGearHtml + currencyGearHtml + swHtml;
-        var container = document.createElement(`div`);
-        container.style.position = `relative`;
-        container.dataset.idx = String(idx);
-        if (isNp) {
-          container.appendChild(d)
-        } else {
-          container.appendChild(d)
-        }
-        g.appendChild(container);
-        var dragTarget = d;
-        dragTarget.draggable = !0;
-        var rng = d.querySelector(`input[type=range]`);
-        rng && (rng.addEventListener(`mousedown`, function(e) {
-          dragTarget.draggable = !1
-        }), rng.addEventListener(`touchstart`, function(e) {
-          dragTarget.draggable = !1
-        }, {
-          passive: !0
-        }), document.addEventListener(`mouseup`, function() {
-          dragTarget.draggable = !0
-        }, {
-          once: !1,
-          passive: !0
-        }), document.addEventListener(`touchend`, function() {
-          dragTarget.draggable = !0
-        }, {
-          once: !1,
-          passive: !0
-        }));
-        dragTarget.addEventListener(`dragstart`, function(e) {
-          if (!dragTarget.draggable) return e.preventDefault();
-          dragSrc = idx;
-          dragCtx = {
-            list: `circuit`,
-            idx: idx
-          };
-          dragTarget.classList.add(`dragging`);
-          e.dataTransfer.effectAllowed = `move`
-        });
-        dragTarget.addEventListener(`dragend`, function() {
-          document.querySelectorAll(`.tile-item`).forEach(function(el) {
-            el.classList.remove(`dragging`, `drag-over`)
-          });
-          dragTarget.draggable = !0
-        });
-        dragTarget.addEventListener(`dragover`, function(e) {
-          e.preventDefault();
-          dragTarget.classList.add(`drag-over`)
-        });
-        dragTarget.addEventListener(`dragleave`, function(e) {
-          if (!dragTarget.contains(e.relatedTarget)) dragTarget.classList.remove(`drag-over`)
-        });
-        dragTarget.addEventListener(`drop`, function(e) {
-          e.preventDefault();
-          dragTarget.classList.remove(`drag-over`);
-          if (dragCtx && dragCtx.list === `priority`) {
-            var moved = priorityItems[dragCtx.idx];
-            if (moved && moved.id === `nowplaying`) {
-              priorityItems.splice(dragCtx.idx, 1);
-              var npIdx2 = items.findIndex(function(it) {
-                return it.id === 3
-              });
-              if (npIdx2 >= 0) {
-                var npItem = items.splice(npIdx2, 1)[0];
-                var insertAt = idx > npIdx2 ? idx - 1 : idx;
-                items.splice(insertAt, 0, npItem)
-              }
-              dragCtx = null;
-              dragSrc = null;
-              dragSrc2 = null;
-              buildGrid();
-              buildPriorityGrid();
-              saveSettings();
-              savePriorityOrder()
-            } else {
-              dragCtx = null
-            }
-            return
-          }
-          if (dragSrc === null || dragSrc === idx) return;
-          var mv = items.splice(dragSrc, 1)[0];
-          items.splice(idx, 0, mv);
-          dragSrc = null;
-          dragCtx = null;
-          buildGrid();
-          saveSettings()
-        })
-      }), updSub(), applyHideIcons(), applyScrollType()
-    }
-
-    function buildPriorityGrid() {
-      var g = document.getElementById(`pgrid`);
-      g.innerHTML = ``;
-      priorityItems.forEach(function(item, idx) {
-        var isEts2 = item.id === `ets2`,
-          isNowPlaying = item.id === `nowplaying`,
-          isStopwatch = item.id === `stopwatch`,
-          npIdx = isNowPlaying ? items.findIndex(function(it) {
-            return it.id === 3
-          }) : -1,
-          gearSvg = `<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87a.49.49 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z\"/></svg>`,
-          icon = isNowPlaying ? ISVG[3] : isEts2 ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm12 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-1-9.5h2.5l2.07 2.5H17V9z"/></svg>` : isStopwatch ? `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>` : `<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`,
-          cls = isNowPlaying ? `lc-amb` : isEts2 ? `lc-blu` : isStopwatch ? `lc-grn` : `lc-pur`,
-          name = isNowPlaying ? `Now Playing` : isEts2 ? `Euro Truck Simulator 2` : isStopwatch ? `Stopwatch` : `Notificari`,
-          subHtml = isNowPlaying ? `<div class=\"tile-sub\" id=\"nptxt-p` + idx + `\">Astept date de la Octoglow Sender...</div>` : isStopwatch ? `<div class=\"tile-sub\" id=\"sw-sub\">` + (swRunning ? `Ruleaza - ` + (swLastText || `00:00:00:00`) : `Oprit`) + `</div>` : `<div class=\"tile-sub\" id=\"` + (isEts2 ? `ets2-sub` : `notif-sub`) + `\">` + (isEts2 ? `Inactiv` : `Afiseaza notificari primite de Octoglow Sender`) + `</div>`,
-          gearHtml = isNowPlaying ? `<button class=\"np-gear-btn\" onclick=\"openNpSettingsDlg(event)\" title=\"Setari Now Playing\">` + gearSvg + `</button>` : ``,
-          helpHtml = isStopwatch ? `` : `<button class=\"np-gear-btn\" onclick=\"openTileHelpDlg(event,'sender')\" title=\"Ajutor\">` + TILE_HELP_SVG + `</button>`,
-          swHtml = isNowPlaying ? `<div class=\"sw\" onclick=\"toggleTile(` + npIdx + `)\"><input type=\"checkbox\" id=\"npPrioCb` + idx + `\"` + (npIdx >= 0 && items[npIdx].enabled ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>` : isStopwatch ? `<button class=\"np-gear-btn sw-toggle-btn` + (swRunning ? ` playing` : ``) + `\" id=\"sw-toggle-btn\" onclick=\"toggleStopwatch()\" title=\"Start / Stop\">` + (swRunning ? `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M6 19h4V5H6v14zm8-14v14h4V5h-4z\"/></svg>` : `<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M8 5v14l11-7z\"/></svg>`) + `</button>` : `<div class=\"sw\" onclick=\"` + (isEts2 ? `toggleEts2()` : `toggleNotif()`) + `\"><input type=\"checkbox\" id=\"` + (isEts2 ? `ets2-cb` : `notif-cb`) + `\"` + ((isEts2 ? ets2En : notifEn) ? ` checked` : ``) + `><span class=\"sw-track\"></span><span class=\"sw-thumb\"></span></div>`,
-          d = document.createElement(`div`);
-        d.className = `tile-item`;
-        d.innerHTML = `<span class=\"drag-handle\"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><div class=\"lic ` + cls + `\">` + icon + `</div><div class=\"tile-body\"><div class=\"tile-head\">` + name + `</div>` + subHtml + `</div>` + helpHtml + gearHtml + swHtml;
-        g.appendChild(d);
-        d.draggable = !0;
-        d.addEventListener(`dragstart`, function(e) {
-          dragSrc2 = idx;
-          dragCtx = {
-            list: `priority`,
-            idx: idx
-          };
-          d.classList.add(`dragging`);
-          e.dataTransfer.effectAllowed = `move`
-        });
-        d.addEventListener(`dragend`, function() {
-          document.querySelectorAll(`.tile-item`).forEach(function(el) {
-            el.classList.remove(`dragging`, `drag-over`)
-          })
-        });
-        d.addEventListener(`dragover`, function(e) {
-          e.preventDefault();
-          d.classList.add(`drag-over`)
-        });
-        d.addEventListener(`dragleave`, function(e) {
-          if (!d.contains(e.relatedTarget)) d.classList.remove(`drag-over`)
-        });
-        d.addEventListener(`drop`, function(e) {
-          e.preventDefault();
-          d.classList.remove(`drag-over`);
-          if (dragCtx && dragCtx.list === `circuit`) {
-            var srcItem = items[dragCtx.idx];
-            if (srcItem && srcItem.id === 3) {
-              priorityItems.splice(idx, 0, {
-                id: `nowplaying`,
-                enabled: !0
-              });
-              dragCtx = null;
-              dragSrc = null;
-              dragSrc2 = null;
-              buildGrid();
-              buildPriorityGrid();
-              saveSettings();
-              savePriorityOrder()
-            } else {
-              dragCtx = null
-            }
-            return
-          }
-          if (dragSrc2 === null || dragSrc2 === idx) return;
-          var mv = priorityItems.splice(dragSrc2, 1)[0];
-          priorityItems.splice(idx, 0, mv);
-          dragSrc2 = null;
-          dragCtx = null;
-          buildPriorityGrid();
-          savePriorityOrder()
-        })
-      })
-    }
-
-    function saveEts2Order() {
-      if (!stateLoadComplete || !priorityItems.length) return;
-      var ord = priorityItems[0].id === `ets2` ? 1 : 0;
-      fetch(`/ets2order`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `first=` + ord
-      }).then(function(r) {
-        if (!r.ok) throw new Error(`save failed`)
-      }).catch(function() {
-        // Previously fire-and-forget: a rejected save left the UI showing
-        // the user's change while the device kept its old order. Tell the
-        // user and resync from the server instead of drifting silently.
-        showToast(`Nu s-a putut salva ordinea. Reincarca pagina.`);
-        loadHomeState()
-      })
-    }
-
-    function npIsPriority() {
-      return priorityItems.some(function(it) {
-        return it.id === `nowplaying`
-      })
-    }
-
-    function savePriorityOrder() {
-      if (!stateLoadComplete) return;
-      var ord = priorityItems.map(function(it) {
-        return it.id
-      }).join(`,`);
-      fetch(`/priorityorder`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        // npPriority is sent explicitly (rather than letting the backend
-        // infer it from whether "nowplaying" happens to appear in `order`)
-        // so an unrelated reorder can never silently flip Now Playing back
-        // into Circuit Tiles just because this particular save's snapshot
-        // of priorityItems didn't include it.
-        body: `order=` + encodeURIComponent(ord) + `&npPriority=` + (npIsPriority() ? 1 : 0)
-      }).then(function(r) {
-        if (!r.ok) throw new Error(`save failed`)
-      }).catch(function() {
-        showToast(`Nu s-a putut salva ordinea prioritara. Reincarca pagina.`);
-        loadHomeState()
-      })
-    }
-
-    function updDur(idx, v) {
-      items[idx].dur = parseInt(v);
-      var e = document.getElementById(`dv` + idx);
-      e && (e.textContent = v + `s`)
-    }
-
-    function hourPreviewText() {
-      var d = new Date(),
-        h = d.getHours(),
-        m = d.getMinutes(),
-        mm = (m < 10 ? `0` : ``) + m;
-      if (hourFormatV === 1) {
-        var h12 = h % 12;
-        if (h12 === 0) h12 = 12;
-        return h12 + `:` + mm
-      }
-      return (h < 10 ? `0` : ``) + h + `:` + mm
-    }
-
-    function datePreviewTextFor(i) {
-      if (i === 5) return renderCustomDatePattern(customDateFmtV);
-      if (i === 4) {
-        var names = dateLangV === 1 ? [`Dum`, `Lun`, `Mar`, `Mie`, `Joi`, `Vin`, `Sam`] : [`Sun`, `Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat`],
-          dd = new Date(),
-          day = dd.getDate();
-        return names[dd.getDay()] + ` ` + (day < 10 ? `0` : ``) + day
-      }
-      var arr = [`2026.06.18`, `26.06.18`, `18.06.2026`, `18.06`];
-      return arr[i] || arr[2]
-    }
-
-    function datePreviewText() {
-      return datePreviewTextFor(dateFormatV)
-    }
-
-    function buildDateFormatList() {
-      var c = document.getElementById(`date-fmt-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      for (var i = 0; i <= 5; i++) {
-        (function(idx) {
-          var row = document.createElement(`div`);
-          row.className = `sel-row`;
-          row.onclick = function() {
-            if (idx === 5) openCustomDateFmtDlg();
-            else setDateFormat(idx)
-          };
-          var label = idx === 5 ? `Custom (` + customDateFmtV + `)` : datePreviewTextFor(idx);
-          var radio = `<span class="sel-radio` + (dateFormatV === idx ? ` sel-radio-on` : ``) + `"></span>`;
-          row.innerHTML = radio + `<span class="sel-label">` + label + `</span>`;
-          c.appendChild(row)
-        })(i)
-      }
-    }
-
-    var NP_MODE_OPTIONS = [`Artist + Titlu`, `Artist`, `Titlu`];
-
-    function buildNpModeList() {
-      var c = document.getElementById(`np-mode-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      NP_MODE_OPTIONS.forEach(function(name, i) {
-        var row = document.createElement(`div`);
-        row.className = `sel-row`;
-        row.onclick = function() {
-          setNpMode(i)
-        };
-        var radio = `<span class="sel-radio` + (npM === i ? ` sel-radio-on` : ``) + `"></span>`;
-        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
-        c.appendChild(row)
-      })
-    }
-
-    var TEMP_UNIT_OPTIONS = [`°C Celsius`, `°F Fahrenheit`];
-
-    function buildTempUnitList() {
-      var c = document.getElementById(`temp-unit-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      TEMP_UNIT_OPTIONS.forEach(function(name, i) {
-        var row = document.createElement(`div`);
-        row.className = `sel-row`;
-        row.onclick = function() {
-          setTempUnit(i)
-        };
-        var radio = `<span class="sel-radio` + (tempUnitV === i ? ` sel-radio-on` : ``) + `"></span>`;
-        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
-        c.appendChild(row)
-      })
-    }
-
-    function buildWxUnitList() {
-      var c = document.getElementById(`wx-unit-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      TEMP_UNIT_OPTIONS.forEach(function(name, i) {
-        var row = document.createElement(`div`);
-        row.className = `sel-row`;
-        row.onclick = function() {
-          setWxTempUnit(i)
-        };
-        var radio = `<span class="sel-radio` + (tempUnitV === i ? ` sel-radio-on` : ``) + `"></span>`;
-        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
-        c.appendChild(row)
-      })
-    }
-
-    var HOUR_FMT_OPTIONS = [`24h (13:45)`, `12h (1:45)`];
-
-    function buildHourFormatList() {
-      var c = document.getElementById(`hour-fmt-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      HOUR_FMT_OPTIONS.forEach(function(name, i) {
-        var row = document.createElement(`div`);
-        row.className = `sel-row`;
-        row.onclick = function() {
-          setHourFormat(i)
-        };
-        var radio = `<span class="sel-radio` + (hourFormatV === i ? ` sel-radio-on` : ``) + `"></span>`;
-        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
-        c.appendChild(row)
-      })
-    }
-
-    function tempPreviewText() {
-      if (lastTempV < -60 || lastTempV > 100) return `--°` + (tempUnitV === 1 ? `F` : `C`);
-      var d = tempUnitV === 1 ? Math.round(lastTempV * 9 / 5 + 32) : lastTempV;
-      return d + `°` + (tempUnitV === 1 ? `F` : `C`)
-    }
-
-    function wxPreviewText() {
-      if (!wxValidV) return wxCityLabel || `Se incarca...`;
-      var d = tempUnitV === 1 ? Math.round(wxTempV * 9 / 5 + 32) : Math.round(wxTempV);
-      return d + `°` + (tempUnitV === 1 ? `F` : `C`) + `  ` + wxHumidityV + `%  ` + wxDescV
-    }
-
-    function pressureTrendArrow() {
-      return pressureTrendV > 0 ? `↑` : pressureTrendV < 0 ? `↓` : `-`
-    }
-
-    function pressurePreviewText() {
-      return pressureHpaV + ` hPa ` + pressureTrendArrow()
-    }
-
-    function currencyTrendArrow() {
-      return currencyTrendV > 0 ? `↑` : currencyTrendV < 0 ? `↓` : `-`
-    }
-
-    function currencyPreviewText() {
-      if (!currencyValidV) return `Se incarca...`;
-      if (currencyCompareV) {
-        var r = currencyRateV;
-        var rs = Math.abs(r) >= 1 ? r.toFixed(2) : r.toFixed(4);
-        return `1 ` + currencyBaseV + ` = ` + rs + ` ` + currencyQuoteV + `  ` + currencyTrendArrow()
-      }
-      return currencyBaseV + `  ` + currencyTrendArrow()
-    }
-
-    function refreshCurrencyTilePreview() {
-      var el = document.getElementById(`currencytxt-` + items.findIndex(function(i) {
-        return i.id === 11
-      }));
-      if (el) el.textContent = currencyPreviewText()
-    }
-
-    function onCurrencyDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 11
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var vl = document.getElementById(`currency-dur-val`);
-      if (vl) vl.textContent = v + `s`
-    }
-
-    function toggleCurrencyCompare() {
-      var cb = document.getElementById(`currency-compare-cb`);
-      if (!cb) return;
-      cb.checked = !cb.checked;
-      var w = document.getElementById(`currency-quote-wrap`);
-      if (w) w.style.display = cb.checked ? `block` : `none`
-    }
-
-    function openCurrencySettingsDlg(e) {
-      e && e.stopPropagation();
-      var idx = items.findIndex(function(it) {
-        return it.id === 11
-      });
-      if (idx >= 0) {
-        var it = items[idx];
-        var sl = document.getElementById(`currency-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`currency-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      var bsel = document.getElementById(`currency-base-sel`);
-      if (bsel) bsel.value = currencyBaseV;
-      var qsel = document.getElementById(`currency-quote-sel`);
-      if (qsel) qsel.value = currencyQuoteV;
-      var ccb = document.getElementById(`currency-compare-cb`);
-      if (ccb) ccb.checked = currencyCompareV;
-      var w = document.getElementById(`currency-quote-wrap`);
-      if (w) w.style.display = currencyCompareV ? `block` : `none`;
-      document.getElementById(`currency-sett-scrim`).classList.add(`open`);
-      document.getElementById(`currency-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeCurrencySettingsDlg() {
-      document.getElementById(`currency-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`currency-sett-dlg`).classList.remove(`open`)
-    }
-
-    function saveCurrencySettings() {
-      var bsel = document.getElementById(`currency-base-sel`);
-      var qsel = document.getElementById(`currency-quote-sel`);
-      var ccb = document.getElementById(`currency-compare-cb`);
-      currencyBaseV = bsel ? bsel.value : currencyBaseV;
-      currencyCompareV = ccb ? ccb.checked : currencyCompareV;
-      currencyQuoteV = qsel ? qsel.value : currencyQuoteV;
-      currencyValidV = !1;
-      refreshCurrencyTilePreview();
-      saveSettings();
-      var f = new FormData();
-      f.append(`base`, currencyBaseV);
-      f.append(`compare`, currencyCompareV ? 1 : 0);
-      f.append(`quote`, currencyQuoteV);
-      fetch(`/currencysett`, {
-        method: `POST`,
-        body: f
-      }).then(function() {
-        closeCurrencySettingsDlg();
-        setTimeout(function() {
-          fetch(`/state`).then(function(r) {
-            return r.json()
-          }).then(function(s) {
-            if (s.currencyBase !== void 0) {
-              currencyBaseV = s.currencyBase;
-              currencyQuoteV = s.currencyQuote;
-              currencyCompareV = !!s.currencyCompare;
-              currencyValidV = !!s.currencyValid;
-              currencyRateV = s.currencyRate !== void 0 ? s.currencyRate : 0;
-              currencyTrendV = s.currencyTrend !== void 0 ? s.currencyTrend : 0;
-              refreshCurrencyTilePreview()
-            }
-          }).catch(function() {})
-        }, 2500)
-      }).catch(function() {
-        closeCurrencySettingsDlg()
-      })
-    }
-
-    function ssAnimPreviewText() {
-      return SS_ANIM_OPTIONS[ssAnimV] || `Random`
-    }
-
-    function refreshSsTilePreview() {
-      var el = document.getElementById(`sstxt-` + items.findIndex(function(i) {
-        return i.id === 9
-      }));
-      if (el) el.textContent = ssAnimPreviewText()
-    }
-
-    function setSsAnim(v) {
-      ssAnimV = v;
-      buildScreensaverList();
-      refreshSsTilePreview();
-      var f = new FormData();
-      f.append(`anim`, v);
-      fetch(`/screensaversett`, {
-        method: `POST`,
-        body: f
-      })
-    }
-
-    function buildScreensaverList() {
-      var c = document.getElementById(`ss-anim-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      SS_ANIM_OPTIONS.forEach(function(name, i) {
-        var row = document.createElement(`div`);
-        row.className = `sel-row`;
-        row.onclick = function() {
-          setSsAnim(i)
-        };
-        var radio = `<span class="sel-radio` + (ssAnimV === i ? ` sel-radio-on` : ``) + `"></span>`;
-        row.innerHTML = radio + `<span class="sel-label">` + name + `</span>`;
-        c.appendChild(row)
-      })
-    }
-
-    function refreshPressureTilePreview() {
-      document.querySelectorAll(`[id^=pressuretxt-]`).forEach(function(el) {
-        el.textContent = pressurePreviewText()
-      })
-    }
-
-    function refreshHourTilePreview() {
-      document.querySelectorAll(`[id^=hourtxt-]`).forEach(function(el) {
-        el.textContent = hourPreviewText()
-      })
-    }
-
-    function refreshDateTilePreview() {
-      document.querySelectorAll(`[id^=datetxt-]`).forEach(function(el) {
-        el.textContent = datePreviewText()
-      })
-    }
-
-    function refreshTempTilePreview() {
-      document.querySelectorAll(`[id^=temptxt-]`).forEach(function(el) {
-        el.textContent = tempPreviewText()
-      })
-    }
-
-    function refreshWeatherTilePreview() {
-      document.querySelectorAll(`[id^=wxtxt-]`).forEach(function(el) {
-        el.textContent = wxPreviewText()
-      })
-    }
-
-    function onHourDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 0
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var e = document.getElementById(`hour-dur-val`);
-      e && (e.textContent = v + `s`)
-    }
-
-    function onDateDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 1
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var e = document.getElementById(`date-dur-val`);
-      e && (e.textContent = v + `s`)
-    }
-
-    function onTempDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 2
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var e = document.getElementById(`temp-dur-val`);
-      e && (e.textContent = v + `s`)
-    }
-
-    function openPressureSettingsDlg(e) {
-      e && e.stopPropagation();
-      var idx = items.findIndex(function(it) {
-        return it.id === 8
-      });
-      if (idx >= 0) {
-        var it = items[idx];
-        var sl = document.getElementById(`pressure-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`pressure-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      document.getElementById(`pressure-sett-scrim`).classList.add(`open`);
-      document.getElementById(`pressure-sett-dlg`).classList.add(`open`)
-    }
-
-    function closePressureSettingsDlg() {
-      document.getElementById(`pressure-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`pressure-sett-dlg`).classList.remove(`open`)
-    }
-
-    function openSsSettingsDlg(e) {
-      e && e.stopPropagation();
-      var idx = items.findIndex(function(it) {
-        return it.id === 9
-      });
-      if (idx >= 0) {
-        var it = items[idx];
-        var sl = document.getElementById(`ss-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`ss-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      buildScreensaverList();
-      document.getElementById(`ss-sett-scrim`).classList.add(`open`);
-      document.getElementById(`ss-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeSsSettingsDlg() {
-      document.getElementById(`ss-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`ss-sett-dlg`).classList.remove(`open`)
-    }
-
-    function onSsDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 9
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var vl = document.getElementById(`ss-dur-val`);
-      if (vl) vl.textContent = v + `s`
-    }
-
-    function onPressureDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 8
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var vl = document.getElementById(`pressure-dur-val`);
-      if (vl) vl.textContent = v + `s`
-    }
-
-    var toastTimer = null;
-
-    function showToast(msg) {
-      var el = document.getElementById(`toast-el`);
-      var txt = document.getElementById(`toast-txt`);
-      if (!el || !txt) return;
-      if (toastTimer) clearTimeout(toastTimer);
-      txt.textContent = msg;
-      el.classList.add(`show`);
-      toastTimer = setTimeout(function() {
-        el.classList.remove(`show`)
-      }, 2600)
-    }
-
-    function hasCompleteCircuitState(s) {
-      if (!s || !Array.isArray(s.items) || s.items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return !1;
-      var seen = {};
-      return s.items.every(function(it) {
-        return it && Number.isInteger(it.id) && !seen[it.id] && (seen[it.id] = !0) && Number.isInteger(it.dur) && it.dur > 0
-      })
-    }
-
-    function withInitialState(callback) {
-      if (window.octoglowInitialState) {
-        callback(window.octoglowInitialState);
-        return
-      }
-      window.addEventListener(`octoglow-state-ready`, function(e) {
-        callback(e.detail)
-      }, {
-        once: !0
-      })
-    }
-
-    function countEnabledCircuitTiles() {
-      return items.filter(function(it) {
-        return it.enabled && !(it.id === 3 && npIsPriority())
-      }).length
-    }
-
-    function toggleTile(idx) {
-      if (items[idx].enabled && countEnabledCircuitTiles() <= 1 && !(items[idx].id === 3 && npIsPriority())) {
-        showToast(`Trebuie sa existe cel putin un Tile pornit`);
-        return
-      }
-      items[idx].enabled = !items[idx].enabled;
-      var cb = document.getElementById(`tsw` + idx);
-      if (cb) cb.checked = items[idx].enabled;
-      var rng = document.querySelector(`[data-idx="` + idx + `"] input[type=range]`);
-      if (rng) {
-        rng.disabled = !items[idx].enabled
-      }
-      var npEx = document.getElementById(`np-expand`);
-      if (npEx) npEx.className = `np-expand` + (items[idx].enabled ? ` open` : ``);
-      if (items[idx].id === 3 && npIsPriority()) {
-        var pIdx = priorityItems.findIndex(function(it) {
-          return it.id === `nowplaying`
-        });
-        if (pIdx >= 0) {
-          var pcb = document.getElementById(`npPrioCb` + pIdx);
-          if (pcb) pcb.checked = items[idx].enabled
-        }
-      }
-      updSub();
-      saveSettings()
-    }
-
-    function updSub() {
-      var a = items.filter(function(it) {
-        return it.enabled && !(it.id === 3 && npIsPriority())
-      }).map(function(it) {
-        return NAMES[it.id]
-      });
-      document.getElementById(`h-tiles-sub`).textContent = a.join(` ·`) || `Nimic activ`
-    }
-
-    function setNpMode(m) {
-      npM = m, buildNpModeList(), fetch(`/npmode`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `mode=` + m
-      })
-    }
-
-    function saveSettings() {
-      if (!stateLoadComplete || items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return;
-      var p = `buzzer=` + (bOn ? 1 : 0) + `&hideIcons=` + (hideTileIcons ? 1 : 0) + `&hideIconDate=` + (indivHideIcons.date ? 1 : 0) + `&hideIconTemp=` + (indivHideIcons.temp ? 1 : 0) + `&hideIconReminder=` + (indivHideIcons.reminder ? 1 : 0) + `&hideIconWeather=` + (indivHideIcons.weather ? 1 : 0) + `&hideIconNotif=` + (indivHideIcons.notif ? 1 : 0) + `&hideIconNowPlaying=` + (indivHideIcons.nowplaying ? 1 : 0) + `&hideIconPressure=` + (indivHideIcons.pressure ? 1 : 0) + `&hideIconCurrency=` + (indivHideIcons.currency ? 1 : 0) + `&hideIconIp=` + (indivHideIcons.ip ? 1 : 0) + `&npAdaptiveIcon=` + (npAdaptiveIconV ? 1 : 0) + `&scrollType=` + scrollTypeV + `&scrollTypeDate=` + indivScroll.date + `&scrollTypeTemp=` + indivScroll.temp + `&scrollTypeReminder=` + indivScroll.reminder + `&scrollTypeWeather=` + indivScroll.weather + `&scrollTypeNotif=` + indivScroll.notif + `&scrollTypeNowPlaying=` + indivScroll.nowplaying + `&scrollTypePressure=` + indivScroll.pressure + `&scrollTypeStopwatch=` + indivScroll.stopwatch + `&scrollTypeCurrency=` + indivScroll.currency + `&scrollTypeIp=` + (indivScroll.ip || 0) + `&fontType=` + fontTypeV + `&fontTypeDate=` + indivFont.date + `&fontTypeTemp=` + indivFont.temp + `&fontTypeReminder=` + indivFont.reminder + `&fontTypeWeather=` + indivFont.weather + `&fontTypeNotif=` + indivFont.notif + `&fontTypeNowPlaying=` + indivFont.nowplaying + `&fontTypePressure=` + indivFont.pressure + `&fontTypeStopwatch=` + indivFont.stopwatch + `&fontTypeCurrency=` + indivFont.currency + `&fontTypeIp=` + (indivFont.ip || 0) + `&iconSelDate=` + (indivIcon.date || 0) + `&iconSelTemp=` + (indivIcon.temp || 0) + `&iconSelRem=` + (indivIcon.reminder || 0) + `&iconSelNotif=` + (indivIcon.notif || 0) + `&iconSelNpMusic=` + (indivIcon.nowplayingMusic || 0) + `&iconSelNpVideo=` + (indivIcon.nowplayingVideo || 0) + `&iconSelPress=` + (indivIcon.pressure || 0) + `&iconSelCurr=` + (indivIcon.currency || 0) + `&iconSelIp=` + (indivIcon.ip || 0) + `&iconWxSunny=` + (indivWxIcon.sunny || 0) + `&iconWxCloud=` + (indivWxIcon.cloud || 0) + `&iconWxRain=` + (indivWxIcon.rain || 0) + `&iconWxStorm=` + (indivWxIcon.storm || 0) + `&iconWxSnow=` + (indivWxIcon.snow || 0) + `&iconWxWind=` + (indivWxIcon.wind || 0) + `&iconWxNight=` + (indivWxIcon.night || 0);
-      items.forEach(function(it, i) {
-        p += `&id` + i + `=` + it.id + `&en` + i + `=` + (it.enabled ? 1 : 0) + `&dur` + i + `=` + it.dur
-      });
-      fetch(`/settings`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: p
-      }).then(function(r) {
-        if (!r.ok) throw new Error(`save failed`)
-      }).catch(function() {
-        // This POST used to be fire-and-forget. The backend legitimately
-        // rejects (400) an incomplete/invalid tile list rather than persist
-        // it - which is correct - but nothing told the frontend, so the UI
-        // kept showing the just-made change as if it had saved. Tell the
-        // user and pull the real, currently-persisted state back in.
-        showToast(`Nu s-au putut salva setarile tile-urilor. Reincarca pagina.`);
-        loadHomeState()
-      })
-    }
-
-    function openSettingsDlg() {
-      var list = document.getElementById(`sett-items-list`);
-      list.innerHTML = ``;
-      items.forEach(function(item, idx) {
-        var row = document.createElement(`div`);
-        row.style.cssText = `display:flex;justify-content:space-between;align-items:center;padding:10px 0`;
-        var nameEl = document.createElement(`div`);
-        nameEl.innerHTML = `<div style="color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:15px">` + NAMES[item.id] + `</div>`;
-        var sw = document.createElement(`div`);
-        sw.className = `sw`;
-        sw.onclick = function() {
-          toggleTile(idx);
-          buildSettItemsList()
-        };
-        sw.innerHTML = `<input type="checkbox" ` + (item.enabled ? `checked` : ``) + `><span class="sw-track"></span><span class="sw-thumb"></span>`;
-        row.appendChild(nameEl);
-        row.appendChild(sw);
-        list.appendChild(row);
-        if (idx < items.length - 1) {
-          var sep = document.createElement(`div`);
-          sep.style.cssText = `height:1px;background:var(--outline-var)`;
-          list.appendChild(sep)
-        }
-      });
-      document.getElementById(`sett-buz-cb`).checked = bOn;
-      document.getElementById(`sett-scrim`).classList.add(`open`);
-      document.getElementById(`sett-dlg`).classList.add(`open`)
-    }
-
-    function buildSettItemsList() {
-      var list = document.getElementById(`sett-items-list`);
-      if (!list) return;
-      list.innerHTML = ``;
-      items.forEach(function(item, idx) {
-        var row = document.createElement(`div`);
-        row.style.cssText = `display:flex;justify-content:space-between;align-items:center;padding:10px 0`;
-        var nameEl = document.createElement(`div`);
-        nameEl.innerHTML = `<div style="color:var(--on-surf);font-family:Google Sans,sans-serif;font-size:15px">` + NAMES[item.id] + `</div>`;
-        var sw = document.createElement(`div`);
-        sw.className = `sw`;
-        sw.onclick = function() {
-          toggleTile(idx);
-          buildSettItemsList()
-        };
-        sw.innerHTML = `<input type="checkbox" ` + (item.enabled ? `checked` : ``) + `><span class="sw-track"></span><span class="sw-thumb"></span>`;
-        row.appendChild(nameEl);
-        row.appendChild(sw);
-        list.appendChild(row);
-        if (idx < items.length - 1) {
-          var sep = document.createElement(`div`);
-          sep.style.cssText = `height:1px;background:var(--outline-var)`;
-          list.appendChild(sep)
-        }
-      })
-    }
-
-    function closeSettingsDlg() {
-      document.getElementById(`sett-scrim`).classList.remove(`open`);
-      document.getElementById(`sett-dlg`).classList.remove(`open`)
-    }
-
-    function toggleBuzzerSett() {
-      bOn = !bOn;
-      document.getElementById(`sett-buz-cb`).checked = bOn;
-      document.getElementById(`btog-cb`).checked = bOn;
-      document.getElementById(`h-bsub`).textContent = bOn ? `Beep la schimbarea tile-ului` : `Silentios`;
-      saveSettings()
-    }
-
-    function onBrightInput(v) {
-      brightLevel = parseInt(v);
-      var lbl = document.getElementById(`bright-screen-lbl`);
-      if (lbl) lbl.textContent = `Nivel ` + v;
-      document.getElementById(`h-bright-sub`).textContent = `Nivel ` + v;
-      var bv = document.getElementById(`br-val`);
-      if (bv) bv.textContent = v;
-      fetch(`/brightness`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `level=` + v + `&dimAuto=` + (dimAuto ? 1 : 0) + `&dimFrom=` + dimFrom + `&dimTo=` + dimTo + `&dimLevel=` + dimLevel
-      })
-    }
-
-    function onDimLevelInput(v) {
-      dimLevel = parseInt(v);
-      document.getElementById(`dim-level-lbl`).textContent = v;
-      fetch(`/brightness`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `level=` + brightLevel + `&dimAuto=` + (dimAuto ? 1 : 0) + `&dimFrom=` + dimFrom + `&dimTo=` + dimTo + `&dimLevel=` + v
-      })
-    }
-    var dimInputsBound = false;
-
-    function bindDimScheduleInputs() {
-      if (dimInputsBound) return;
-      dimInputsBound = true;
-      var df = document.getElementById(`dim-from`);
-      if (df) df.addEventListener(`change`, function() {
-        dimFrom = this.value;
-        sendBrightSettings()
-      });
-      var dt = document.getElementById(`dim-to`);
-      if (dt) dt.addEventListener(`change`, function() {
-        dimTo = this.value;
-        sendBrightSettings()
-      })
-    }
-
-    function toggleDimAuto() {
-      dimAuto = !dimAuto;
-      document.getElementById(`dim-auto-cb`).checked = dimAuto;
-      document.getElementById(`dim-sched`).classList.toggle(`open`, dimAuto);
-      sendBrightSettings()
-    }
-
-    function sendBrightSettings() {
-      fetch(`/brightness`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `level=` + brightLevel + `&dimAuto=` + (dimAuto ? 1 : 0) + `&dimFrom=` + dimFrom + `&dimTo=` + dimTo + `&dimLevel=` + dimLevel
-      })
-    }
-
-    function openNpSettingsDlg(e) {
-      e && e.stopPropagation();
-      var npIdx = items.findIndex(function(it) {
-        return it.id === 3
-      });
-      if (npIdx < 0) return;
-      buildNpModeList();
-      document.getElementById(`np-sett-scrim`).classList.add(`open`);
-      document.getElementById(`np-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeNpSettingsDlg() {
-      document.getElementById(`np-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`np-sett-dlg`).classList.remove(`open`)
-    }
-
-    var NP_ICON_SETTINGS_ROWS = [{
-      key: `nowplayingMusic`,
-      label: `Muzica`
-    }, {
-      key: `nowplayingVideo`,
-      label: `Video`
-    }];
-
-    function buildNpIconSettingsList() {
-      var c = document.getElementById(`np-icon-sett-list`);
-      if (!c) return;
-      c.innerHTML = ``;
-      NP_ICON_SETTINGS_ROWS.forEach(function(r) {
-        var row = document.createElement(`div`);
-        row.className = `li`;
-        row.style.cursor = `pointer`;
-        row.style.borderBottom = `none`;
-        row.onclick = function() {
-          openIconPicker(`tile`, r.key, r.label)
-        };
-        row.innerHTML = `<div class="li-body"><div class="li-head">` + r.label + `</div><div class="li-sub" id="iconsettings-sub-` + r.key + `">` + (indivIcon[r.key] ? `Iconita personalizata` : `Automat (implicit)`) + `</div></div><div class="li-trail" id="iconsettings-preview-` + r.key + `" style="min-width:38px;display:flex;justify-content:flex-end">` + iconPreviewFor(r.key, false) + `</div>`;
-        c.appendChild(row)
-      })
-    }
-
-    function openNpIconSettingsDlg() {
-      buildNpIconSettingsList();
-      document.getElementById(`np-icon-sett-scrim`).classList.add(`open`);
-      document.getElementById(`np-icon-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeNpIconSettingsDlg() {
-      document.getElementById(`np-icon-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`np-icon-sett-dlg`).classList.remove(`open`)
-    }
-
-    function pollNP() {
-      fetch(`/npstate`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        var all = document.querySelectorAll(`[id^=nptxt-]`);
-        all.forEach(function(el) {
-          el.textContent = s.active ? s.text : `Astept date de la Octoglow Sender…`
-        });
-        s.tempunit !== void 0 && (tempUnitV = s.tempunit, buildTempUnitList(), buildWxUnitList(), refreshTempTilePreview());
-        s.npmode !== void 0 && (npM = s.npmode, buildNpModeList());
-        s.hourformat !== void 0 && (hourFormatV = s.hourformat, buildHourFormatList(), refreshHourTilePreview()), s.dateformat !== void 0 && (dateFormatV = s.dateformat, buildDateFormatList(), refreshDateTilePreview()), s.lastTemp !== void 0 && (lastTempV = s.lastTemp, refreshTempTilePreview()), s.wxValid !== void 0 && (wxValidV = s.wxValid, wxTempV = s.wxTemp, wxHumidityV = s.wxHumidity, wxDescV = s.wxDesc, refreshWeatherTilePreview())
-      }).catch(function() {}), setTimeout(pollNP, 3e3)
-    }
-
-    function openTempSettingsDlg(e) {
-      e && e.stopPropagation();
-      buildTempUnitList();
-      var tIdx = items.findIndex(function(it) {
-        return it.id === 2
-      });
-      if (tIdx >= 0) {
-        var it = items[tIdx];
-        var sl = document.getElementById(`temp-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`temp-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      document.getElementById(`temp-sett-scrim`).classList.add(`open`);
-      document.getElementById(`temp-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeTempSettingsDlg() {
-      document.getElementById(`temp-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`temp-sett-dlg`).classList.remove(`open`)
-    }
-
-    function setTempUnit(u) {
-      tempUnitV = u;
-      buildTempUnitList();
-      buildWxUnitList();
-      refreshTempTilePreview();
-      fetch(`/tempunit`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `unit=` + u
-      })
-    }
-
-    function setWxTempUnit(u) {
-      setTempUnit(u)
-    }
-    var wxSelLat = null,
-      wxSelLon = null,
-      wxSelName = ``,
-      wxSearchTimer = null;
-
-    function toggleWxKeyVis() {
-      var ki = document.getElementById(`wx-key-in`);
-      var icon = document.getElementById(`wx-eye-icon`);
-      var eyeOpen = `<path d=\"M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z\"\/>`;
-      var eyeClosed = `<path d=\"M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z\"\/>`;
-      if (ki.dataset.masked === `1`) {
-        ki.disabled = !0;
-        ki.style.opacity = `0.5`;
-        fetch(`/weatherkey`).then(function(r) {
-          if (!r.ok) throw new Error(r.status);
-          return r.json()
-        }).then(function(d) {
-          ki.value = d.key || ``;
-          ki.dataset.masked = `0`;
-          ki.type = `text`;
-          ki.style.webkitTextSecurity = ``;
-          ki.style.fontFamily = ``;
-          ki.disabled = !1;
-          ki.style.opacity = ``;
-          icon.innerHTML = eyeClosed;
-          ki.focus()
-        }).catch(function() {
-          ki.dataset.masked = `0`;
-          ki.value = ``;
-          ki.type = `password`;
-          ki.style.webkitTextSecurity = ``;
-          ki.style.fontFamily = ``;
-          ki.disabled = !1;
-          ki.style.opacity = ``;
-          icon.innerHTML = eyeOpen
-        });
-        return
-      }
-      var isPass = (ki.type === `password`);
-      ki.type = isPass ? `text` : `password`;
-      ki.style.webkitTextSecurity = ``;
-      ki.style.fontFamily = ``;
-      icon.innerHTML = isPass ? eyeClosed : eyeOpen
-    }
-
-    function onWxKeyInput() {
-      var ki = document.getElementById(`wx-key-in`);
-      if (ki.dataset.masked === `1`) {
-        ki.value = ``;
-        ki.dataset.masked = `0`
-      }
-      var k = ki.value.trim();
-      var hint = document.getElementById(`wx-no-key-hint`);
-      if (hint) hint.style.display = k ? `none` : `block`
-    }
-
-    function onWxSearch() {
-      var ki = document.getElementById(`wx-key-in`);
-      var k = (ki.dataset.masked === `1`) ? `__masked__` : ki.value.trim();
-      var hasKey = wxHasStoredKey || (k.length > 0 && k !== `__masked__`);
-      var q = document.getElementById(`wx-search-in`).value.trim();
-      var sug = document.getElementById(`wx-suggest`);
-      if (!hasKey) {
-        document.getElementById(`wx-no-key-hint`).style.display = `block`;
-        return
-      }
-      document.getElementById(`wx-no-key-hint`).style.display = `none`;
-      if (q.length < 2) {
-        sug.innerHTML = ``;
-        sug.className = `wx-suggest`;
-        return
-      }
-      clearTimeout(wxSearchTimer);
-      wxSearchTimer = setTimeout(function() {
-        var apiK = (k === `__masked__` || k.length === 0) ? `` : k;
-        fetch(`/weathersearch?q=` + encodeURIComponent(q) + `&key=` + encodeURIComponent(apiK)).then(function(r) {
-          if (!r.ok) return r.text().then(function(t) {
-            throw new Error(t || r.status)
-          });
-          return r.json()
-        }).then(function(res) {
-          sug.innerHTML = ``;
-          if (!res || !res.length) {
-            sug.innerHTML = `<div class=\"wx-si\" style=\"cursor:default;color:var(--on-surf-var)\">Nicio localitate gasita</div>`;
-            sug.className = `wx-suggest open`;
-            return
-          }
-          res.forEach(function(loc) {
-            var d = document.createElement(`div`);
-            d.className = `wx-si`;
-            var country = loc.country || ``;
-            var state = loc.state ? loc.state + `, ` : ``;
-            d.innerHTML = `<div class=\"wx-si-main\">` + loc.name + `</div><div class=\"wx-si-sub\">` + state + country + `</div>`;
-            d.onclick = function() {
-              wxSelLat = loc.lat;
-              wxSelLon = loc.lon;
-              wxSelName = loc.name + (loc.state ? `, ` + loc.state : ``) + `, ` + country;
-              document.getElementById(`wx-search-in`).value = loc.name;
-              var badge = document.getElementById(`wx-sel-badge`);
-              badge.style.display = `none`;
-              sug.innerHTML = ``;
-              sug.className = `wx-suggest`;
-              document.getElementById(`wx-save-btn`).disabled = !1
-            };
-            sug.appendChild(d)
-          });
-          sug.className = `wx-suggest open`
-        }).catch(function(err) {
-          sug.innerHTML = `<div class=\"wx-si\" style=\"cursor:default;color:var(--err)\">Eroare: ` + err.message + `</div>`;
-          sug.className = `wx-suggest open`
-        })
-      }, 400)
-    }
-    var wxHasStoredKey = !1;
-    var wxCityLabel = ``;
-    var owmLangCode = `en`;
-    var owmLangs = [{
-      c: `af`,
-      n: `Afrikaans`
-    }, {
-      c: `al`,
-      n: `Albanian`
-    }, {
-      c: `ar`,
-      n: `Arabic`
-    }, {
-      c: `az`,
-      n: `Azerbaijani`
-    }, {
-      c: `bg`,
-      n: `Bulgarian`
-    }, {
-      c: `ca`,
-      n: `Catalan`
-    }, {
-      c: `cz`,
-      n: `Czech`
-    }, {
-      c: `da`,
-      n: `Danish`
-    }, {
-      c: `de`,
-      n: `German`
-    }, {
-      c: `el`,
-      n: `Greek`
-    }, {
-      c: `en`,
-      n: `English`
-    }, {
-      c: `eu`,
-      n: `Basque`
-    }, {
-      c: `fa`,
-      n: `Persian`
-    }, {
-      c: `fi`,
-      n: `Finnish`
-    }, {
-      c: `fr`,
-      n: `French`
-    }, {
-      c: `gl`,
-      n: `Galician`
-    }, {
-      c: `he`,
-      n: `Hebrew`
-    }, {
-      c: `hi`,
-      n: `Hindi`
-    }, {
-      c: `hr`,
-      n: `Croatian`
-    }, {
-      c: `hu`,
-      n: `Hungarian`
-    }, {
-      c: `id`,
-      n: `Indonesian`
-    }, {
-      c: `it`,
-      n: `Italian`
-    }, {
-      c: `ja`,
-      n: `Japanese`
-    }, {
-      c: `kr`,
-      n: `Korean`
-    }, {
-      c: `la`,
-      n: `Latvian`
-    }, {
-      c: `lt`,
-      n: `Lithuanian`
-    }, {
-      c: `mk`,
-      n: `Macedonian`
-    }, {
-      c: `nl`,
-      n: `Dutch`
-    }, {
-      c: `no`,
-      n: `Norwegian`
-    }, {
-      c: `pl`,
-      n: `Polish`
-    }, {
-      c: `pt`,
-      n: `Portuguese`
-    }, {
-      c: `pt_br`,
-      n: `Portuguese Brazil`
-    }, {
-      c: `ro`,
-      n: `Romanian`
-    }, {
-      c: `ru`,
-      n: `Russian`
-    }, {
-      c: `sk`,
-      n: `Slovak`
-    }, {
-      c: `sl`,
-      n: `Slovenian`
-    }, {
-      c: `sp`,
-      n: `Spanish`
-    }, {
-      c: `sr`,
-      n: `Serbian`
-    }, {
-      c: `sv`,
-      n: `Swedish`
-    }, {
-      c: `th`,
-      n: `Thai`
-    }, {
-      c: `tr`,
-      n: `Turkish`
-    }, {
-      c: `ua`,
-      n: `Ukrainian`
-    }, {
-      c: `vi`,
-      n: `Vietnamese`
-    }, {
-      c: `zh_cn`,
-      n: `Chinese Simplified`
-    }, {
-      c: `zh_tw`,
-      n: `Chinese Traditional`
-    }, {
-      c: `zu`,
-      n: `Zulu`
-    }];
-
-    function owmLangLabel(c) {
-      var f = owmLangs.find(function(l) {
-        return l.c === c
-      });
-      return f ? f.n + ` (` + c + `)` : c
-    }
-
-    function openLangPicker() {
-      buildLangList(``);
-      document.getElementById(`lang-search`).value = ``;
-      document.getElementById(`lang-scrim`).classList.add(`open`);
-      document.getElementById(`lang-dlg`).classList.add(`open`);
-      setTimeout(function() {
-        document.getElementById(`lang-search`).focus()
-      }, 220)
-    }
-
-    function closeLangPicker() {
-      document.getElementById(`lang-scrim`).classList.remove(`open`);
-      document.getElementById(`lang-dlg`).classList.remove(`open`)
-    }
-
-    function filterLangs() {
-      var q = document.getElementById(`lang-search`).value.trim().toLowerCase();
-      buildLangList(q)
-    }
-
-    function buildLangList(q) {
-      var list = document.getElementById(`lang-list`);
-      list.innerHTML = ``;
-      var src = q ? owmLangs.filter(function(l) {
-        return l.n.toLowerCase().includes(q) || l.c.toLowerCase().includes(q)
-      }) : owmLangs;
-      src.forEach(function(l) {
-        var isSel = (l.c === owmLangCode);
-        var d = document.createElement(`div`);
-        d.style.cssText = `display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--outline-var);cursor:pointer;transition:background .12s;background:` + (isSel ? `color-mix(in srgb,var(--pri)14%,transparent)` : ``);
-        d.innerHTML = `<div><div style="font-family:Google Sans,sans-serif;font-size:15px;color:` + (isSel ? `var(--pri)` : `var(--on-surf)`) + `">` + l.n + `</div><div style="font-size:12px;color:var(--on-surf-var);margin-top:2px">` + l.c + `</div></div>` + (isSel ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--pri)"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>` : ``);
-        d.onmouseenter = function() {
-          if (!isSel) d.style.background = `color-mix(in srgb,var(--on-surf)6%,transparent)`
-        };
-        d.onmouseleave = function() {
-          if (!isSel) d.style.background = ``
-        };
-        d.onclick = function() {
-          owmLangCode = l.c;
-          fetch(`/wxlang`, {
-            method: `POST`,
-            headers: {
-              "Content-Type": `application/x-www-form-urlencoded`
-            },
-            body: `lang=` + encodeURIComponent(l.c)
-          });
-          var s1 = document.getElementById(`owm-lang-sub`);
-          if (s1) s1.textContent = owmLangLabel(l.c);
-          var s2 = document.getElementById(`h-lang-sub`);
-          if (s2) s2.textContent = owmLangLabel(l.c);
-          closeLangPicker()
-        };
-        list.appendChild(d)
-      })
-    }
-
-    function openWxSettingsDlg(e) {
-      e && e.stopPropagation();
-      wxSelLat = null;
-      wxSelLon = null;
-      wxSelName = ``;
-      var si = document.getElementById(`wx-search-in`);
-      if (si) si.value = ``;
-      var sug = document.getElementById(`wx-suggest`);
-      if (sug) {
-        sug.innerHTML = ``;
-        sug.className = `wx-suggest`
-      }
-      var badge = document.getElementById(`wx-sel-badge`);
-      if (badge) badge.style.display = `none`;
-      var ki = document.getElementById(`wx-key-in`);
-      if (ki) ki.value = ``;
-      wxHasStoredKey = !1;
-      document.getElementById(`wx-save-btn`).disabled = !0;
-      fetch(`/weatherstate`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        var st = document.getElementById(`wx-status`);
-        if (s.valid && st) st.textContent = `Ultima valoare: ` + s.temp.toFixed(1) + `°  ` + s.humidity + `%  ` + s.desc;
-        else if (st) st.textContent = s.hasKey ? `Cheie configurata, se asteapta fetch…` : ``;
-        if (s.hasKey) {
-          wxHasStoredKey = !0;
-          var ki2 = document.getElementById(`wx-key-in`);
-          if (ki2) {
-            ki2.value = `•`.repeat(s.keyLen || 32);
-            ki2.dataset.masked = `1`;
-            ki2.type = `text`;
-            ki2.style.webkitTextSecurity = `disc`;
-            ki2.style.fontFamily = `monospace`;
-            ki2.placeholder = ``
-          }
-          document.getElementById(`wx-no-key-hint`).style.display = `none`
-        }
-        if (s.city) {
-          var si2 = document.getElementById(`wx-search-in`);
-          if (si2) {
-            si2.value = s.city;
-            wxSelLat = s.lat || null;
-            wxSelLon = s.lon || null;
-            wxSelName = s.city
-          }
-          if (s.hasKey) {
-            document.getElementById(`wx-save-btn`).disabled = !1
-          }
-        }
-      }).catch(function() {});
-      buildWxUnitList();
-      document.getElementById(`wx-sett-scrim`).classList.add(`open`);
-      document.getElementById(`wx-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeWxSettingsDlg() {
-      document.getElementById(`wx-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`wx-sett-dlg`).classList.remove(`open`);
-      var sug = document.getElementById(`wx-suggest`);
-      if (sug) {
-        sug.innerHTML = ``;
-        sug.className = `wx-suggest`
-      }
-      setTimeout(function() {
-        var body = document.querySelector(`#wx-sett-dlg .mdd-body`);
-        var act = document.querySelector(`#wx-sett-dlg .mdd-actions`);
-        var spin = document.getElementById(`wx-saving`);
-        if (body) {
-          body.style.display = ``;
-          body.style.opacity = `1`
-        }
-        if (act) {
-          act.style.display = ``;
-          act.style.opacity = `1`
-        }
-        if (spin) {
-          spin.style.display = `none`;
-          spin.style.opacity = `0`
-        }
-      }, 400)
-    }
-
-    function wxShowSpinner(on, cb) {
-      var body = document.querySelector(`#wx-sett-dlg .mdd-body`);
-      var act = document.querySelector(`#wx-sett-dlg .mdd-actions`);
-      var spin = document.getElementById(`wx-saving`);
-      if (on) {
-        if (body) {
-          body.style.opacity = `0`
-        }
-        if (act) {
-          act.style.opacity = `0`
-        }
-        setTimeout(function() {
-          if (body) body.style.display = `none`;
-          if (act) act.style.display = `none`;
-          if (spin) {
-            spin.style.opacity = `0`;
-            spin.style.display = `flex`;
-            requestAnimationFrame(function() {
-              spin.style.opacity = `1`
-            })
-          }
-          if (cb) cb()
-        }, 220)
-      } else {
-        if (spin) {
-          spin.style.opacity = `0`
-        }
-        if (cb) setTimeout(cb, 200)
-      }
-    }
-
-    function saveWxSettings() {
-      var key = document.getElementById(`wx-key-in`).value.trim();
-      if (!wxSelLat && !key) {
-        document.getElementById(`wx-status`).textContent = `Selecteaza o localitate si introdu cheia API`;
-        return
-      }
-      wxShowSpinner(!0);
-      var body = ``;
-      if (key) body += `apikey=` + encodeURIComponent(key);
-      if (wxSelLat !== null) {
-        if (body) body += `&`;
-        body += `lat=` + wxSelLat + `&lon=` + wxSelLon + `&name=` + encodeURIComponent(wxSelName)
-      }
-      fetch(`/weathersett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: body
-      }).then(function(r) {
-        return r.text()
-      }).then(function() {
-        var loc = wxSelName || document.getElementById(`wx-search-in`).value.trim();
-        if (loc) {
-          wxCityLabel = loc;
-          document.querySelectorAll(`[id^=wxtxt-]`).forEach(function(el) {
-            el.textContent = loc
-          })
-        }
-        setTimeout(function() {
-          wxShowSpinner(!1, function() {
-            closeWxSettingsDlg()
-          })
-        }, 1000)
-      }).catch(function() {
-        var body = document.querySelector(`#wx-sett-dlg .mdd-body`);
-        var act = document.querySelector(`#wx-sett-dlg .mdd-actions`);
-        var spin = document.getElementById(`wx-saving`);
-        if (spin) spin.style.display = `none`;
-        if (body) {
-          body.style.display = ``;
-          requestAnimationFrame(function() {
-            body.style.opacity = `1`
-          })
-        }
-        if (act) {
-          act.style.display = ``;
-          requestAnimationFrame(function() {
-            act.style.opacity = `1`
-          })
-        }
-        document.getElementById(`wx-status`).textContent = `Eroare la salvare`
-      })
-    }
-    var hourFormatV = 0;
-
-    function openHourSettingsDlg(e) {
-      e && e.stopPropagation();
-      buildHourFormatList();
-      var hIdx = items.findIndex(function(it) {
-        return it.id === 0
-      });
-      if (hIdx >= 0) {
-        var it = items[hIdx];
-        var sl = document.getElementById(`hour-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`hour-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      document.getElementById(`hour-sett-scrim`).classList.add(`open`);
-      document.getElementById(`hour-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeHourSettingsDlg() {
-      document.getElementById(`hour-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`hour-sett-dlg`).classList.remove(`open`)
-    }
-
-    function setHourFormat(f) {
-      hourFormatV = f;
-      buildHourFormatList();
-      refreshHourTilePreview();
-      fetch(`/hourformat`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `fmt=` + f
-      })
-    }
-    var dateFormatV = 2;
-    var dateLangV = 0;
-
-    function dateLangLabel(v) {
-      return v === 1 ? `Romana (ro)` : `English (en)`
-    }
-
-    function openDateSettingsDlg(e) {
-      e && e.stopPropagation();
-      buildDateFormatList();
-      var dIdx = items.findIndex(function(it) {
-        return it.id === 1
-      });
-      if (dIdx >= 0) {
-        var it = items[dIdx];
-        var sl = document.getElementById(`date-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`date-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      document.getElementById(`date-sett-scrim`).classList.add(`open`);
-      document.getElementById(`date-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeDateSettingsDlg() {
-      document.getElementById(`date-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`date-sett-dlg`).classList.remove(`open`)
-    }
-
-    function setDateFormat(f) {
-      dateFormatV = f;
-      buildDateFormatList();
-      refreshDateTilePreview();
-      fetch(`/dateformat`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `fmt=` + f
-      })
-    }
-
-    var customDateFmtV = `DD/MM/YYYY`;
-
-    function isDateFmtLiteralChar(c) {
-      return c === `/` || c === `.` || c === `(` || c === `)` || c === ` `
-    }
-
-    function dateCustomValidate(pattern) {
-      pattern = (pattern || ``).toUpperCase();
-      if (!pattern.length) return {
-        ok: false,
-        err: `Introdu un format`
-      };
-      if (pattern.length > 20) return {
-        ok: false,
-        err: `Format prea lung`
-      };
-      var i = 0,
-        len = pattern.length,
-        hasContent = false;
-      while (i < len) {
-        var c = pattern[i];
-        if (c !== `Y` && c !== `M` && c !== `D` && c !== `W` && !isDateFmtLiteralChar(c)) return {
-          ok: false,
-          err: `Caracter invalid — foloseste doar Y, M, D, W, / . ( ) sau spatiu`
-        };
-        var j = i;
-        while (j < len && pattern[j] === c) j++;
-        var count = j - i;
-        if (c === `Y`) {
-          hasContent = true;
-          if (count !== 2 && count !== 4) return {
-            ok: false,
-            err: `Y trebuie sa fie YY sau YYYY`
-          }
-        } else if (c === `M`) {
-          hasContent = true;
-          if (count !== 2) return {
-            ok: false,
-            err: `M trebuie sa fie MM`
-          }
-        } else if (c === `D`) {
-          hasContent = true;
-          if (count !== 2) return {
-            ok: false,
-            err: `D trebuie sa fie DD`
-          }
-        } else if (c === `W`) {
-          hasContent = true
-        }
-        i = j
-      }
-      if (!hasContent) return {
-        ok: false,
-        err: `Formatul trebuie sa contina cel putin Y, M, D sau W`
-      };
-      return {
-        ok: true,
-        err: ``
-      }
-    }
-
-    function renderCustomDatePattern(pattern) {
-      pattern = (pattern || ``).toUpperCase();
-      var namesFull = dateLangV === 1 ? [`Duminica`, `Luni`, `Marti`, `Miercuri`, `Joi`, `Vineri`, `Sambata`] : [`Sunday`, `Monday`, `Tuesday`, `Wednesday`, `Thursday`, `Friday`, `Saturday`],
-        dd = new Date(),
-        day = dd.getDate(),
-        month = dd.getMonth() + 1,
-        year = dd.getFullYear(),
-        wday = dd.getDay();
-
-      function pad(n, w) {
-        n = String(n);
-        while (n.length < w) n = `0` + n;
-        return n
-      }
-      var out = ``,
-        i = 0,
-        len = pattern.length;
-      while (i < len) {
-        var c = pattern[i],
-          j = i;
-        while (j < len && pattern[j] === c) j++;
-        var count = j - i;
-        if (c === `Y`) out += count === 2 ? pad(year % 100, 2) : pad(year, 4);
-        else if (c === `M`) out += pad(month, 2);
-        else if (c === `D`) out += pad(day, 2);
-        else if (c === `W`) {
-          var full = namesFull[wday];
-          out += count >= full.length ? full : full.substring(0, count)
-        } else if (isDateFmtLiteralChar(c)) {
-          out += pattern.substring(i, j)
-        }
-        i = j
-      }
-      return out
-    }
-
-    function openCustomDateFmtDlg() {
-      var inp = document.getElementById(`date-custom-in`);
-      if (inp) inp.value = customDateFmtV;
-      var m = document.getElementById(`date-custom-msg`);
-      if (m) {
-        m.style.display = `none`;
-        m.textContent = ``
-      }
-      onCustomDateFmtInput();
-      document.getElementById(`date-custom-scrim`).classList.add(`open`);
-      document.getElementById(`date-custom-dlg`).classList.add(`open`)
-    }
-
-    function closeCustomDateFmtDlg() {
-      document.getElementById(`date-custom-scrim`).classList.remove(`open`);
-      document.getElementById(`date-custom-dlg`).classList.remove(`open`)
-    }
-
-    function onCustomDateFmtInput() {
-      var inp = document.getElementById(`date-custom-in`);
-      var pattern = inp ? inp.value : ``;
-      var prev = document.getElementById(`date-custom-preview`);
-      var m = document.getElementById(`date-custom-msg`);
-      var v = dateCustomValidate(pattern);
-      if (v.ok) {
-        if (prev) prev.textContent = renderCustomDatePattern(pattern);
-        if (m) {
-          m.style.display = `none`;
-          m.textContent = ``
-        }
-      } else {
-        if (prev) prev.textContent = ``;
-        if (m) {
-          m.textContent = v.err;
-          m.className = `msg err`;
-          m.style.display = `block`
-        }
-      }
-    }
-
-    function saveCustomDateFmt() {
-      var inp = document.getElementById(`date-custom-in`);
-      var pattern = (inp ? inp.value : ``).toUpperCase().trim();
-      var v = dateCustomValidate(pattern);
-      var m = document.getElementById(`date-custom-msg`);
-      if (!v.ok) {
-        if (m) {
-          m.textContent = v.err;
-          m.className = `msg err`;
-          m.style.display = `block`
-        }
-        return
-      }
-      customDateFmtV = pattern;
-      dateFormatV = 5;
-      buildDateFormatList();
-      refreshDateTilePreview();
-      fetch(`/datecustomfmt`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `pattern=` + encodeURIComponent(pattern)
-      }).then(function(r) {
-        if (!r.ok) return r.text().then(function(t) {
-          throw new Error(t)
-        });
-        closeCustomDateFmtDlg()
-      }).catch(function(e) {
-        if (m) {
-          m.textContent = e.message || `Eroare la salvare`;
-          m.className = `msg err`;
-          m.style.display = `block`
-        }
-      })
-    }
-
-    function openDateLangPicker(e) {
-      e && e.stopPropagation();
-      buildDateLangList();
-      document.getElementById(`date-lang-scrim`).classList.add(`open`);
-      document.getElementById(`date-lang-dlg`).classList.add(`open`)
-    }
-
-    function closeDateLangPicker() {
-      document.getElementById(`date-lang-scrim`).classList.remove(`open`);
-      document.getElementById(`date-lang-dlg`).classList.remove(`open`)
-    }
-
-    function buildDateLangList() {
-      var list = document.getElementById(`date-lang-list`);
-      list.innerHTML = ``;
-      var opts = [{
-        v: 0,
-        n: `English`,
-        c: `en`
-      }, {
-        v: 1,
-        n: `Romana`,
-        c: `ro`
-      }];
-      opts.forEach(function(o) {
-        var isSel = (o.v === dateLangV);
-        var d = document.createElement(`div`);
-        d.style.cssText = `display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--outline-var);cursor:pointer;transition:background .12s;background:` + (isSel ? `color-mix(in srgb,var(--pri)14%,transparent)` : ``);
-        d.innerHTML = `<div><div style="font-family:Google Sans,sans-serif;font-size:15px;color:` + (isSel ? `var(--pri)` : `var(--on-surf)`) + `">` + o.n + `</div><div style="font-size:12px;color:var(--on-surf-var);margin-top:2px">` + o.c + `</div></div>` + (isSel ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--pri)"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>` : ``);
-        d.onmouseenter = function() {
-          if (!isSel) d.style.background = `color-mix(in srgb,var(--on-surf)6%,transparent)`
-        };
-        d.onmouseleave = function() {
-          if (!isSel) d.style.background = ``
-        };
-        d.onclick = function() {
-          dateLangV = o.v;
-          fetch(`/datelang`, {
-            method: `POST`,
-            headers: {
-              "Content-Type": `application/x-www-form-urlencoded`
-            },
-            body: `lang=` + o.v
-          });
-          var s1 = document.getElementById(`date-lang-sub`);
-          if (s1) s1.textContent = dateLangLabel(o.v);
-          refreshDateTilePreview();
-          closeDateLangPicker()
-        };
-        list.appendChild(d)
-      })
-    }
-    var memoText = ``;
-
-    function openMemoSettingsDlg(e) {
-      e && e.stopPropagation();
-      var inp = document.getElementById(`memo-text-in`);
-      if (inp) {
-        inp.value = memoText;
-        document.getElementById(`memo-char-count`).textContent = memoText.length + ` / 120`
-      }
-      document.getElementById(`memo-sett-scrim`).classList.add(`open`);
-      document.getElementById(`memo-sett-dlg`).classList.add(`open`);
-      setTimeout(function() {
-        if (inp) inp.focus()
-      }, 220)
-    }
-
-    function closeMemoSettingsDlg() {
-      document.getElementById(`memo-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`memo-sett-dlg`).classList.remove(`open`)
-    }
-
-    function onMemoInput() {
-      var inp = document.getElementById(`memo-text-in`);
-      var cnt = document.getElementById(`memo-char-count`);
-      if (cnt) cnt.textContent = inp.value.length + ` / 120`
-    }
-
-    function saveMemoSettings() {
-      var inp = document.getElementById(`memo-text-in`);
-      var txt = inp ? inp.value.trim() : ``;
-      memoText = txt;
-      fetch(`/mementosett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `text=` + encodeURIComponent(txt)
-      }).then(function() {
-        document.querySelectorAll(`[id^=memotxt-]`).forEach(function(el) {
-          el.textContent = txt || `Niciun text configurat`
-        });
-        closeMemoSettingsDlg()
-      }).catch(function() {})
-    }
-    var canvasBitmap = new Array(32).fill(0),
-      canvasBmpHex = ``,
-      cvxPainting = !1,
-      cvxPaintVal = !1,
-      cvxBound = !1;
-
-    function hexToCanvasBitmap(hex) {
-      var arr = new Array(32).fill(0);
-      if (hex && hex.length === 64) {
-        for (var i = 0; i < 32; i++) {
-          arr[i] = parseInt(hex.substr(i * 2, 2), 16) || 0
-        }
-      }
-      return arr
-    }
-
-    function canvasBitmapToHexStr() {
-      var s = ``;
-      for (var i = 0; i < 32; i++) {
-        var h = canvasBitmap[i].toString(16);
-        if (h.length < 2) h = `0` + h;
-        s += h
-      }
-      return s
-    }
-
-    function renderCanvasGrid() {
-      var wrap = document.getElementById(`cvx-grid`);
-      if (!wrap) return;
-      wrap.innerHTML = ``;
-      for (var r = 0; r < 8; r++) {
-        for (var c = 0; c < 32; c++) {
-          var cell = document.createElement(`div`);
-          cell.className = `cvx-px` + (((canvasBitmap[c] >> r) & 1) ? ` on` : ``);
-          cell.dataset.r = r;
-          cell.dataset.c = c;
-          wrap.appendChild(cell)
-        }
-      }
-    }
-
-    function setCanvasCell(el, on) {
-      var r = parseInt(el.dataset.r),
-        c = parseInt(el.dataset.c);
-      if (on) {
-        canvasBitmap[c] |= (1 << r);
-        el.classList.add(`on`)
-      } else {
-        canvasBitmap[c] &= ~(1 << r);
-        el.classList.remove(`on`)
-      }
-    }
-
-    function canvasCellAtPoint(x, y) {
-      var el = document.elementFromPoint(x, y);
-      return (el && el.classList.contains(`cvx-px`)) ? el : null
-    }
-
-    function bindCanvasGridEvents() {
-      if (cvxBound) return;
-      cvxBound = !0;
-      var wrap = document.getElementById(`cvx-grid`);
-      if (!wrap) return;
-      wrap.addEventListener(`pointerdown`, function(e) {
-        var el = canvasCellAtPoint(e.clientX, e.clientY);
-        if (!el) return;
-        cvxPainting = !0;
-        cvxPaintVal = !el.classList.contains(`on`);
-        setCanvasCell(el, cvxPaintVal);
-        e.preventDefault()
-      });
-      wrap.addEventListener(`pointermove`, function(e) {
-        if (!cvxPainting) return;
-        var el = canvasCellAtPoint(e.clientX, e.clientY);
-        if (!el) return;
-        setCanvasCell(el, cvxPaintVal)
-      });
-      window.addEventListener(`pointerup`, function() {
-        cvxPainting = !1
-      });
-      wrap.addEventListener(`contextmenu`, function(e) {
-        e.preventDefault()
-      })
-    }
-
-    function clearCanvasGrid() {
-      for (var i = 0; i < 32; i++) canvasBitmap[i] = 0;
-      renderCanvasGrid()
-    }
-
-    function openCanvasSettingsDlg(e) {
-      e && e.stopPropagation();
-      canvasBitmap = hexToCanvasBitmap(canvasBmpHex);
-      renderCanvasGrid();
-      bindCanvasGridEvents();
-      var idx = items.findIndex(function(it) {
-        return it.id === 6
-      });
-      if (idx >= 0) {
-        var it = items[idx];
-        var sl = document.getElementById(`canvas-dur-slider`);
-        if (sl) {
-          sl.value = it.dur;
-          sl.disabled = !it.enabled
-        }
-        var vl = document.getElementById(`canvas-dur-val`);
-        if (vl) vl.textContent = it.dur + `s`
-      }
-      document.getElementById(`canvas-sett-scrim`).classList.add(`open`);
-      document.getElementById(`canvas-sett-dlg`).classList.add(`open`)
-    }
-
-    function closeCanvasSettingsDlg() {
-      document.getElementById(`canvas-sett-scrim`).classList.remove(`open`);
-      document.getElementById(`canvas-sett-dlg`).classList.remove(`open`)
-    }
-
-    function onCanvasDurInput(v) {
-      var idx = items.findIndex(function(it) {
-        return it.id === 6
-      });
-      if (idx < 0) return;
-      items[idx].dur = parseInt(v);
-      var vl = document.getElementById(`canvas-dur-val`);
-      if (vl) vl.textContent = v + `s`
-    }
-
-    function saveCanvasSettings() {
-      canvasBmpHex = canvasBitmapToHexStr();
-      fetch(`/canvassett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `bmp=` + canvasBmpHex
-      }).then(function() {
-        saveSettings();
-        closeCanvasSettingsDlg()
-      }).catch(function() {})
-    }
-
-    function openSwitchWifiDialog() {
-      var m = document.getElementById(`switch-wifi-msg`);
-      if (m) {
-        m.style.display = `none`;
-        m.textContent = ``
-      }
-      document.getElementById(`switch-wifi-scrim`).classList.add(`open`);
-      document.getElementById(`switch-wifi-dlg`).classList.add(`open`)
-    }
-
-    function closeSwitchWifiDialog() {
-      document.getElementById(`switch-wifi-scrim`).classList.remove(`open`);
-      document.getElementById(`switch-wifi-dlg`).classList.remove(`open`)
-    }
-
-    function doSwitchToWifi() {
-      var btn = document.getElementById(`switch-wifi-confirm-btn`);
-      if (btn) {
-        btn.disabled = !0;
-        btn.textContent = `…`
-      }
-      fetch(`/stopap`, {
-        method: `POST`
-      }).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        if (btn) {
-          btn.disabled = !1;
-          btn.textContent = `Confirma`
-        }
-        if (d && d.ok) {
-          closeSwitchWifiDialog();
-          isApMode = !1;
-          showMsg(`Comutare la WiFi... Ceasul se reconecteaza.`, `ok`)
-        } else {
-          var m = document.getElementById(`switch-wifi-msg`);
-          if (m) {
-            m.textContent = (d && d.err) || `Eroare`;
-            m.className = `msg err`;
-            m.style.display = `block`
-          }
-        }
-      }).catch(function() {
-        if (btn) {
-          btn.disabled = !1;
-          btn.textContent = `Confirma`
-        }
-        var m = document.getElementById(`switch-wifi-msg`);
-        if (m) {
-          m.textContent = `Eroare conexiune`;
-          m.className = `msg err`;
-          m.style.display = `block`
-        }
-      })
-    }
-
-    function openDisconDialog(ssid) {
-      document.getElementById(`discon-scrim`).classList.add(`open`);
-      document.getElementById(`discon-dlg`).classList.add(`open`)
-    }
-
-    function closeDisconDialog() {
-      document.getElementById(`discon-scrim`).classList.remove(`open`);
-      document.getElementById(`discon-dlg`).classList.remove(`open`)
-    }
-
-    function doDisconnect() {
-      var btn = document.querySelector(`#discon-dlg button[onclick=\"doDisconnect()\"]`);
-      if (btn) btn.disabled = !0;
-      fetch(`/startap`, {
-        method: `POST`
-      }).then(function() {
-        isApMode = !0;
-        closeDisconDialog();
-        var apSsid = apSsidCache || `AP`;
-        showMsg(`Mod AP pornit! Conecteaza-te la reteaua ` + apSsid + `.`, `ok`);
-        document.getElementById(`w-ssid`).textContent = ``;
-        document.getElementById(`h-ssid`).textContent = `Mod AP`;
-        document.getElementById(`h-ip`).textContent = `192.168.4.1`;
-        document.getElementById(`home-sub`).textContent = `Mod AP - 192.168.4.1`;
-        document.getElementById(`h-ap-sub`).textContent = `Activ - ` + apSsid;
-        setChips(apSsid, !0);
-        if (btn) btn.disabled = !1
-      }).catch(function() {
-        if (btn) btn.disabled = !1;
-        showMsg(`Eroare la deconectare`, `err`)
-      })
-    }
-
-    function onApPassInput() {
-      var pi = document.getElementById(`ap-pass-in`);
-      if (pi.dataset.masked === `1`) {
-        pi.value = ``;
-        pi.dataset.masked = `0`;
-        pi.type = `password`;
-        pi.style.webkitTextSecurity = ``;
-        pi.style.fontFamily = ``
-      }
-    }
-
-    function toggleApPassVis() {
-      var pi = document.getElementById(`ap-pass-in`);
-      var icon = document.getElementById(`ap-pass-eye-icon`);
-      var eyeOpen = `<path d=\"M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z\"/>`;
-      var eyeClosed = `<path d=\"M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z\"/>`;
-      if (pi.dataset.masked === `1`) {
-        pi.disabled = !0;
-        pi.style.opacity = `0.5`;
-        fetch(`/appass`).then(function(r) {
-          if (!r.ok) throw new Error(r.status);
-          return r.json()
-        }).then(function(d) {
-          pi.value = d.pass || ``;
-          pi.dataset.masked = `0`;
-          pi.type = `text`;
-          pi.style.webkitTextSecurity = ``;
-          pi.style.fontFamily = ``;
-          pi.disabled = !1;
-          pi.style.opacity = ``;
-          if (icon) icon.innerHTML = eyeClosed;
-          pi.focus()
-        }).catch(function() {
-          pi.dataset.masked = `0`;
-          pi.value = ``;
-          pi.type = `password`;
-          pi.style.webkitTextSecurity = ``;
-          pi.style.fontFamily = ``;
-          pi.disabled = !1;
-          pi.style.opacity = ``;
-          if (icon) icon.innerHTML = eyeOpen
-        });
-        return
-      }
-      var isPass = (pi.type === `password`);
-      pi.type = isPass ? `text` : `password`;
-      pi.style.webkitTextSecurity = ``;
-      pi.style.fontFamily = ``;
-      if (icon) icon.innerHTML = isPass ? eyeClosed : eyeOpen
-    }
-
-    function loadApSettings() {
-      var badge = document.getElementById(`ap-mode-text`);
-      var desc = document.getElementById(`ap-mode-desc`);
-      var badgeWrap = document.getElementById(`ap-mode-badge`);
-      fetch(`/apstate`).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        var si = document.getElementById(`ap-ssid-in`);
-        if (si) si.value = d.ssid || ``;
-        if (d.ssid) apSsidCache = d.ssid;
-        var pi = document.getElementById(`ap-pass-in`);
-        if (pi) {
-          if (d.hasPass) {
-            pi.value = `•`.repeat(d.passLen || 8);
-            pi.dataset.masked = `1`;
-            pi.type = `text`;
-            pi.style.webkitTextSecurity = `disc`;
-            pi.style.fontFamily = `monospace`;
-            pi.placeholder = ``
-          } else {
-            pi.value = ``;
-            pi.dataset.masked = `0`;
-            pi.type = `password`;
-            pi.style.webkitTextSecurity = ``;
-            pi.style.fontFamily = ``;
-            pi.placeholder = `Parola retea (optional)`
-          }
-        }
-        var isAp = (d.mode === `ap`);
-        if (badge) badge.textContent = isAp ? `AP Mode` : `WiFi Mode`;
-        if (badgeWrap) {
-          badgeWrap.style.background = isAp ? `var(--pri-con)` : `var(--surf-var)`;
-          badgeWrap.style.color = isAp ? `var(--pri)` : `var(--on-surf-var)`
-        }
-        if (desc) desc.textContent = isAp ? `Ceasul emite propria retea WiFi. Conecteaza-te la ea pentru a-l accesa.` : `Ceasul este conectat la un router (mod WiFi). Setarile de mai jos se aplica data viitoare cand pornesti modul AP.`;
-        var apSwBtn = document.getElementById(`ap-switch-btn`);
-        if (apSwBtn) apSwBtn.style.display = isAp ? `none` : ``
-      }).catch(function() {
-        if (badge) badge.textContent = `Necunoscut`
-      })
-    }
-
-    function saveApSettings() {
-      var ssid = document.getElementById(`ap-ssid-in`).value.trim();
-      var passEl = document.getElementById(`ap-pass-in`);
-      var pass = (passEl.dataset.masked === `1`) ? `` : passEl.value;
-      var btn = document.getElementById(`ap-save-btn`);
-      var msg = document.getElementById(`ap-msg`);
-      msg.style.display = `none`;
-      if (!ssid) {
-        msg.textContent = `Introdu un SSID`;
-        msg.className = `msg err`;
-        msg.style.display = `block`;
-        return
-      }
-      if (pass.length > 0 && pass.length < 8) {
-        msg.textContent = `Parola trebuie sa aiba minim 8 caractere`;
-        msg.className = `msg err`;
-        msg.style.display = `block`;
-        return
-      }
-      btn.disabled = !0;
-      btn.textContent = `…`;
-      var body = `ssid=` + encodeURIComponent(ssid);
-      if (pass.length > 0) body += `&pass=` + encodeURIComponent(pass);
-      fetch(`/apsett`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: body
-      }).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        btn.disabled = !1;
-        btn.textContent = `Salveaza`;
-        if (d.ok) {
-          msg.textContent = `Setari AP salvate!`;
-          msg.className = `msg ok`;
-          msg.style.display = `block`;
-          var hs = document.getElementById(`h-ap-sub`);
-          if (hs) hs.textContent = isApMode ? `Activ - ` + ssid : `SSID: ` + ssid;
-          loadApSettings()
-        } else {
-          msg.textContent = (d && d.err) || `Eroare`;
-          msg.className = `msg err`;
-          msg.style.display = `block`
-        }
-      }).catch(function() {
-        btn.disabled = !1;
-        btn.textContent = `Salveaza`;
-        msg.textContent = `Eroare conexiune`;
-        msg.className = `msg err`;
-        msg.style.display = `block`
-      })
-    }
-
-    function doLogout() {
-      fetch(`/logout`, {
-        method: `POST`
-      }).then(function() {
-        window.location.href = `/`
-      }).catch(function() {
-        window.location.href = `/`
-      })
-    }
-
-    function openOorDialog() {
-      document.getElementById(`oor-scrim`).classList.add(`open`);
-      document.getElementById(`oor-dlg`).classList.add(`open`)
-    }
-
-    function closeOorDialog() {
-      document.getElementById(`oor-scrim`).classList.remove(`open`);
-      document.getElementById(`oor-dlg`).classList.remove(`open`)
-    }
-
-    // "Loading: User Settings" popup - shown while the initial /state
-    // payload (and any retries) fill the client-side buffer, so the user
-    // doesn't interact with a half-populated UI before it's ready.
-    function openUsLoadDialog() {
-      document.getElementById(`us-load-scrim`).classList.add(`open`);
-      document.getElementById(`us-load-dlg`).classList.add(`open`)
-    }
-
-    function closeUsLoadDialog() {
-      document.getElementById(`us-load-scrim`).classList.remove(`open`);
-      document.getElementById(`us-load-dlg`).classList.remove(`open`)
-    }
-
-    function setUsLoadStatus(txt, isError) {
-      var el = document.getElementById(`us-load-status`);
-      if (el) {
-        el.textContent = txt;
-        el.style.color = isError ? `var(--err)` : ``
-      }
-    }
-
-    var heartbeatTimer = null;
-
-    function heartbeatTick() {
-      var ctrl = (typeof AbortController !== `undefined`) ? new AbortController() : null;
-      var timeout = ctrl ? setTimeout(function() {
-        ctrl.abort()
-      }, 8000) : null;
-      fetch(`/whoami`, {
-        cache: `no-store`,
-        signal: ctrl ? ctrl.signal : undefined
-      }).then(function(r) {
-        if (timeout) clearTimeout(timeout);
-        if (r.status === 401) {
-          window.location.href = `/`;
-          return
-        }
-        closeOorDialog()
-      }).catch(function() {
-        if (timeout) clearTimeout(timeout);
-        openOorDialog()
-      })
-    }
-
-    function startHeartbeat() {
-      stopHeartbeat();
-      heartbeatTimer = setInterval(heartbeatTick, 15000)
-    }
-
-    function stopHeartbeat() {
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = null
-    }
-    var WAVE_SVG = `<svg class="wave-hand" xmlns="http://www.w3.org/2000/svg" height="22px" viewBox="0 -960 960 960" width="22px" fill="currentColor"><path d="M880-759q0-51-35-86t-86-35v-60q75 0 128 53t53 128h-60ZM240-40q-83 0-141.5-58.5T40-240h60q0 58 41 99t99 41v60Zm162 0q-30 0-56-13.5T303-92L48-465l24-23q19-19 45-22t47 12l116 81v-383q0-17 11.5-28.5T320-840q17 0 28.5 11.5T360-800v537L212-367l157 229q5 8 14 13t19 5h278q33 0 56.5-23.5T760-200v-560q0-17 11.5-28.5T800-800q17 0 28.5 11.5T840-760v560q0 66-47 113T680-40H402Zm38-440v-400q0-17 11.5-28.5T480-920q17 0 28.5 11.5T520-880v400h-80Zm160 0v-360q0-17 11.5-28.5T640-880q17 0 28.5 11.5T680-840v360h-80ZM486-300Z"/></svg>`;
-    var LOGOUT_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M17 7l-1.41 1.41L17.17 10H8v2h9.17l-1.58 1.59L17 15l4-4zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>`;
-
-    function setupGreeting() {
-      var wrap = document.getElementById(`greet-wrap`);
-      var wave = document.getElementById(`greet-wave`);
-      var lo = document.getElementById(`greet-logout`);
-      if (!wrap || !wave || !lo) return;
-      wrap.addEventListener(`mouseenter`, function() {
-        wave.classList.add(`hidden-icon`);
-        lo.classList.remove(`hidden-icon`)
-      });
-      wrap.addEventListener(`mouseleave`, function() {
-        wave.classList.remove(`hidden-icon`);
-        lo.classList.add(`hidden-icon`)
-      });
-      wrap.addEventListener(`click`, function(e) {
-        if (!lo.classList.contains(`hidden-icon`)) {
-          e.stopPropagation();
-          doLogout()
-        }
-      })
-    }
-
-    function openUserAccountDlg() {
-      var ui = document.getElementById(`ua-user-in`);
-      fetch(`/whoami`).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        if (ui) ui.value = d && d.user ? d.user : ``
-      }).catch(function() {});
-      var np = document.getElementById(`ua-newpass-in`);
-      if (np) np.value = ``;
-      var cp = document.getElementById(`ua-curpass-in`);
-      if (cp) cp.value = ``;
-      var cpWrap = document.getElementById(`ua-curpass-wrap`);
-      if (cpWrap) cpWrap.style.display = isApMode ? `none` : `block`;
-      var m = document.getElementById(`ua-msg`);
-      if (m) {
-        m.style.display = `none`;
-        m.textContent = ``
-      }
-      document.getElementById(`useracct-scrim`).classList.add(`open`);
-      document.getElementById(`useracct-dlg`).classList.add(`open`)
-    }
-
-    function closeUserAccountDlg() {
-      document.getElementById(`useracct-scrim`).classList.remove(`open`);
-      document.getElementById(`useracct-dlg`).classList.remove(`open`)
-    }
-
-    function showUaMsg(t, c) {
-      var m = document.getElementById(`ua-msg`);
-      if (!m) return;
-      m.textContent = t;
-      m.className = `msg ` + c;
-      m.style.display = `block`
-    }
-
-    function saveUserAccount() {
-      var u = document.getElementById(`ua-user-in`).value.trim();
-      var np = document.getElementById(`ua-newpass-in`).value;
-      var cp = isApMode ? `` : document.getElementById(`ua-curpass-in`).value;
-      var btn = document.getElementById(`ua-save-btn`);
-      btn.disabled = !0;
-      btn.textContent = `…`;
-      fetch(`/updateaccount`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `user=` + encodeURIComponent(u) + `&newpass=` + encodeURIComponent(np) + `&curpass=` + encodeURIComponent(cp)
-      }).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        btn.disabled = !1;
-        btn.textContent = `Salveaza`;
-        if (d.ok) {
-          showUaMsg(`Cont actualizat cu succes`, `ok`);
-          setTimeout(function() {
-            closeUserAccountDlg()
-          }, 900)
-        } else {
-          showUaMsg((d && d.err) || `Eroare`, `err`)
-        }
-      }).catch(function() {
-        btn.disabled = !1;
-        btn.textContent = `Salveaza`;
-        showUaMsg(`Eroare conexiune`, `err`)
-      })
-    }
-    bindDimScheduleInputs();
-    window.onload = function() {
-      loadDarkMode();
-      loadAccentColor();
-      startHeartbeat();
-      fetch(`/whoami`).then(function(r) {
-        if (r.status === 401) {
-          window.location.href = `/`;
-          return
-        }
-        return r.json()
-      }).then(function(d) {
-        if (!d) return;
-        var t = document.getElementById(`home-title`);
-        if (t) {
-          t.innerHTML = `<span class="greet-wrap" id="greet-wrap" title="Logout"><span class="greet-icon" id="greet-wave">` + WAVE_SVG + `</span><span class="greet-icon hidden-icon" id="greet-logout">` + LOGOUT_SVG + `</span></span> Welcome, ` + d.user + `!`;
-          setupGreeting()
-        }
-      });
-      // Top bar elevation on scroll
-      function loadHomeState() {
-      openUsLoadDialog();
-      setUsLoadStatus(stateLoadAttempt === 0 ? `Se incarca setarile utilizatorului de pe dispozitiv…` : `Reincercare ` + (stateLoadAttempt + 1) + ` din 5 - se incarca setarile utilizatorului…`);
-      fetch(`/state`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        bOn = s.buzzer;
-        document.getElementById(`btog-cb`).checked = bOn;
-        document.getElementById(`h-bsub`).textContent = bOn ? `Beep la schimbarea tile-ului` : `Silentios`;
-        if (s.bright !== undefined) {
-          brightLevel = s.bright;
-          document.getElementById(`h-bright-sub`).textContent = `Nivel ` + brightLevel
-        }
-        if (s.buzzerVolume !== undefined) {
-          buzzerVolume = s.buzzerVolume
-        }
-        if (s.buzzerPreset) {
-          buzzerPreset = s.buzzerPreset
-        }
-        if (s.dimAuto !== undefined) {
-          dimAuto = s.dimAuto;
-          dimFrom = s.dimFrom || dimFrom;
-          dimTo = s.dimTo || dimTo;
-          dimLevel = s.dimLevel !== undefined ? s.dimLevel : dimLevel
-        }
-        var ssid = s.ssid || `-`,
-          ip = s.ip || `-`;
-        document.getElementById(`h-ssid`).textContent = ssid, document.getElementById(`h-ip`).textContent = ip, document.getElementById(`w-ssid`).textContent = ssid, document.getElementById(`w-ip`).textContent = ip, document.getElementById(`home-sub`).textContent = ssid === `-` ? `Neconectat` : s.ap ? `Mod AP - ` + ip : ssid + ` - ` + ip, isApMode = !!s.ap;
-        setChips(ssid, !!s.ap);
-        var _hap = document.getElementById(`h-ap-sub`);
-        if (s.apSsid) apSsidCache = s.apSsid;
-        if (_hap && s.apSsid) {
-          _hap.textContent = s.ap ? `Activ - ` + s.apSsid : `SSID: ` + s.apSsid
-        };
-        if (!hasCompleteCircuitState(s)) {
-          var itemsLen = s && Array.isArray(s.items) ? s.items.length : `n/a`;
-          throw new Error(`Stare Tile Manager incompleta (items.length=` + itemsLen + `, expected=` + EXPECTED_CIRCUIT_TILE_COUNT + `)`)
-        }
-        items = s.items;
-        if (s.lastTemp !== void 0) {
-          lastTempV = s.lastTemp
-        }
-        if (s.wxCity) {
-          wxCityLabel = s.wxCity + (s.wxHasKey ? ` - API OK` : `  (fara cheie API)`);
-        }
-        if (s.canvasBmp) {
-          canvasBmpHex = s.canvasBmp;
-        }
-        if (s.accentColor && /^#[0-9a-fA-F]{6}$/.test(s.accentColor) && s.accentColor.toLowerCase() !== accentCurrentHex.toLowerCase()) {
-          applyAccentColor(s.accentColor, !1)
-        }
-        buildGrid();
-        if (s.tempunit !== void 0) {
-          tempUnitV = s.tempunit;
-          buildTempUnitList();
-          buildWxUnitList()
-        }
-        if (s.hourformat !== void 0) {
-          hourFormatV = s.hourformat;
-          buildHourFormatList()
-        };
-        if (s.datelang !== void 0) {
-          dateLangV = s.datelang;
-          var _dls = document.getElementById(`date-lang-sub`);
-          if (_dls) _dls.textContent = dateLangLabel(s.datelang)
-        };
-        if (s.customdatefmt) {
-          customDateFmtV = s.customdatefmt
-        };
-        if (s.dateformat !== void 0) {
-          dateFormatV = s.dateformat;
-          buildDateFormatList()
-        };
-        if (s.wxLang) {
-          owmLangCode = s.wxLang;
-          var _ls1 = document.getElementById(`owm-lang-sub`);
-          if (_ls1) _ls1.textContent = owmLangLabel(s.wxLang);
-          var _ls2 = document.getElementById(`h-lang-sub`);
-          if (_ls2) _ls2.textContent = owmLangLabel(s.wxLang)
-        };
-        if (s.hideIcons !== void 0) {
-          hideTileIcons = s.hideIcons;
-          applyHideIcons()
-        }
-        if (s.hideIconDate !== void 0) {
-          indivHideIcons.date = s.hideIconDate;
-          indivHideIcons.temp = s.hideIconTemp;
-          indivHideIcons.reminder = s.hideIconReminder;
-          indivHideIcons.weather = s.hideIconWeather;
-          indivHideIcons.notif = s.hideIconNotif;
-          indivHideIcons.nowplaying = s.hideIconNowPlaying;
-          indivHideIcons.pressure = s.hideIconPressure;
-          indivHideIcons.currency = s.hideIconCurrency !== void 0 ? s.hideIconCurrency : !1;
-          indivHideIcons.ip = s.hideIconIp !== void 0 ? s.hideIconIp : !1;
-          refreshHideIconSwitches()
-        }
-        if (s.npAdaptiveIcon !== void 0) {
-          npAdaptiveIconV = s.npAdaptiveIcon;
-          var _npaCb = document.getElementById(`np-adaptive-icon-cb`);
-          if (_npaCb) _npaCb.checked = npAdaptiveIconV
-        }
-        if (s.scrollType !== void 0) {
-          scrollTypeV = s.scrollType;
-          applyScrollType()
-        }
-        if (s.scrollTypeDate !== void 0) {
-          indivScroll.date = s.scrollTypeDate;
-          indivScroll.temp = s.scrollTypeTemp;
-          indivScroll.reminder = s.scrollTypeReminder;
-          indivScroll.weather = s.scrollTypeWeather;
-          indivScroll.notif = s.scrollTypeNotif;
-          indivScroll.nowplaying = s.scrollTypeNowPlaying;
-          indivScroll.pressure = s.scrollTypePressure;
-          indivScroll.stopwatch = s.scrollTypeStopwatch !== void 0 ? s.scrollTypeStopwatch : 0;
-          indivScroll.currency = s.scrollTypeCurrency !== void 0 ? s.scrollTypeCurrency : 0;
-          indivScroll.ip = s.scrollTypeIp !== void 0 ? s.scrollTypeIp : 0;
-          refreshScrollTypeSelects()
-        }
-        if (s.fontType !== void 0) {
-          fontTypeV = s.fontType;
-          applyFontType()
-        }
-        if (s.fontTypeDate !== void 0) {
-          indivFont.date = s.fontTypeDate;
-          indivFont.temp = s.fontTypeTemp;
-          indivFont.reminder = s.fontTypeReminder;
-          indivFont.weather = s.fontTypeWeather;
-          indivFont.notif = s.fontTypeNotif;
-          indivFont.nowplaying = s.fontTypeNowPlaying;
-          indivFont.pressure = s.fontTypePressure;
-          indivFont.stopwatch = s.fontTypeStopwatch !== void 0 ? s.fontTypeStopwatch : 0;
-          indivFont.currency = s.fontTypeCurrency !== void 0 ? s.fontTypeCurrency : 0;
-          indivFont.ip = s.fontTypeIp !== void 0 ? s.fontTypeIp : 0;
-          refreshFontTypeSelects()
-        }
-        if (s.iconSelDate !== void 0) {
-          indivIcon.date = s.iconSelDate || 0;
-          indivIcon.temp = s.iconSelTemp || 0;
-          indivIcon.reminder = s.iconSelReminder || 0;
-          indivIcon.notif = s.iconSelNotif || 0;
-          indivIcon.nowplayingMusic = s.iconSelNpMusic || 0;
-          indivIcon.nowplayingVideo = s.iconSelNpVideo || 0;
-          indivIcon.pressure = s.iconSelPressure || 0;
-          indivIcon.currency = s.iconSelCurrency || 0;
-          indivIcon.ip = s.iconSelIp || 0;
-          indivWxIcon.sunny = s.iconWxSunny || 0;
-          indivWxIcon.cloud = s.iconWxCloud || 0;
-          indivWxIcon.rain = s.iconWxRain || 0;
-          indivWxIcon.storm = s.iconWxStorm || 0;
-          indivWxIcon.snow = s.iconWxSnow || 0;
-          indivWxIcon.wind = s.iconWxWind || 0;
-          indivWxIcon.night = s.iconWxNight || 0;
-          if (document.getElementById(`iconsettings-list`)) buildIconSettingsList();
-          if (document.getElementById(`iconsettings-weather-list`)) buildIconSettingsWeatherList();
-          if (document.getElementById(`np-icon-sett-list`)) buildNpIconSettingsList()
-        }
-        if (s.notifEnabled !== void 0) {
-          notifEn = s.notifEnabled;
-          var nc = document.getElementById(`notif-cb`);
-          if (nc) nc.checked = notifEn
-        }
-        if (s.pressureHpa !== void 0) {
-          pressureHpaV = s.pressureHpa;
-          pressureTrendV = s.pressureTrend !== void 0 ? s.pressureTrend : 0;
-          refreshPressureTilePreview()
-        }
-        if (s.currencyBase !== void 0) {
-          currencyBaseV = s.currencyBase;
-          currencyQuoteV = s.currencyQuote;
-          currencyCompareV = !!s.currencyCompare;
-          currencyValidV = !!s.currencyValid;
-          currencyRateV = s.currencyRate !== void 0 ? s.currencyRate : 0;
-          currencyTrendV = s.currencyTrend !== void 0 ? s.currencyTrend : 0;
-          refreshCurrencyTilePreview()
-        }
-        if (s.ssAnim !== void 0) {
-          ssAnimV = s.ssAnim;
-          refreshSsTilePreview()
-        }
-        if (s.ets2Enabled !== void 0) {
-          ets2En = s.ets2Enabled;
-          var ec = document.getElementById(`ets2-cb`);
-          if (ec) ec.checked = ets2En
-        }
-        if (s.priorityOrder) {
-          var _po = s.priorityOrder.split(`,`);
-          priorityItems = _po.filter(function(id) {
-            return id !== `nowplaying` || !!s.nowPlayingIsPriority
-          }).map(function(id) {
-            return {
-              id: id,
-              enabled: !0
-            }
-          })
-        } else if (s.ets2OrderFirst !== void 0 && s.ets2OrderFirst) {
-          priorityItems = [{
-            id: `ets2`,
-            enabled: !0
-          }, {
-            id: `notif`,
-            enabled: !0
-          }, {
-            id: `stopwatch`,
-            enabled: !0
-          }]
-        }
-        if (s.mementoText !== void 0) {
-          memoText = s.mementoText
-        }
-        if (s.evSndTile) evSndTile = s.evSndTile;
-        if (s.evSndWifi) evSndWifi = s.evSndWifi;
-        if (s.evSndNotif) evSndNotif = s.evSndNotif;
-        if (s.evSndEts2) evSndEts2 = s.evSndEts2;
-        if (s.evSndTouch) evSndTouch = s.evSndTouch;
-        if (s.touchTapAction !== void 0) touchTapAction = s.touchTapAction;
-        if (s.touchDoubleTapAction !== void 0) touchDoubleTapAction = s.touchDoubleTapAction;
-        // Rebuild only after both the circuit and priority state are known.
-        // The previous early build could briefly retain the default priority
-        // list while the circuit list came from the server.
-        buildGrid();
-        buildPriorityGrid();
-        stateLoadComplete = !0;
-        window.octoglowInitialState = s;
-        window.dispatchEvent(new CustomEvent(`octoglow-state-ready`, {
-          detail: s
-        }));
-        setUsLoadStatus(`Setari incarcate.`);
-        closeUsLoadDialog();
-        document.body.classList.remove(`boot-hide`)
-      }).catch(function(err) {
-        // Previously silent about *why* a load failed - network error, JSON
-        // parse failure, and the hasCompleteCircuitState throw all looked
-        // identical from here, which is a big part of why this was hard to
-        // pin down. Logging the real cause costs nothing and doesn't change
-        // the retry/toast behavior the user sees.
-        console.error(`[octoglow] /state load attempt`, stateLoadAttempt + 1, `failed:`, err && err.message ? err.message : err);
-        if (stateLoadAttempt < 4) {
-          setUsLoadStatus(`Eroare la incarcare (` + (err && err.message ? err.message : `necunoscuta`) + `). Se reincearca…`, !0);
-          stateLoadAttempt++;
-          setTimeout(loadHomeState, 500 * stateLoadAttempt);
-          return
-        }
-        setUsLoadStatus(`Nu s-au putut incarca setarile dupa 5 incercari. Reincarca pagina manual.`, !0);
-        var usAct = document.getElementById(`us-load-actions`);
-        if (usAct) usAct.style.display = ``;
-        showToast(`Nu s-au putut incarca tile-urile. Reincarca pagina.`)
-      })
-      }
-      var stateLoadAttempt = 0;
-      loadHomeState();
-      pollNP(), pollEts2(), pollSwState(), setInterval(refreshHourTilePreview, 1e3), window.addEventListener(`scroll`, function() {
-        document.querySelectorAll(`.top-bar`).forEach(function(b) {
-          b.classList.toggle(`raised`, window.scrollY > 4)
-        })
-      }, {
-        passive: !0
-      })
-    };
-
-    function toggleNotif() {
-      notifEn = !notifEn;
-      var nc = document.getElementById(`notif-cb`);
-      if (nc) nc.checked = notifEn;
-      fetch(`/notiftoggle`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `enabled=` + (notifEn ? 1 : 0)
-      })
-    }
-
-    function toggleEts2() {
-      ets2En = !ets2En;
-      var ec = document.getElementById(`ets2-cb`);
-      if (ec) ec.checked = ets2En;
-      fetch(`/ets2toggle`, {
-        method: `POST`,
-        headers: {
-          "Content-Type": `application/x-www-form-urlencoded`
-        },
-        body: `enabled=` + (ets2En ? 1 : 0)
-      })
-    }
-
-    function pollEts2() {
-      fetch(`/ets2state`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        var sub = document.getElementById(`ets2-sub`);
-        if (!sub) return;
-        if (!s.enabled) {
-          sub.textContent = `Dezactivat`
-        } else if (s.active) {
-          sub.textContent = `Activ - ` + s.speed + ` km/h`
-        } else {
-          sub.textContent = `Inactiv`
-        }
-      }).catch(function() {}), setTimeout(pollEts2, 3e3)
-    }
-
-    function setSwToggleBtnIcon() {
-      var b = document.getElementById(`sw-toggle-btn`);
-      if (!b) return;
-      b.classList.toggle(`playing`, swRunning);
-      b.innerHTML = swRunning ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>` : `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`
-    }
-
-    function setSwSubText() {
-      var sub = document.getElementById(`sw-sub`);
-      if (!sub) return;
-      sub.textContent = swRunning ? `Ruleaza - ` + swLastText : `Oprit`
-    }
-
-    function toggleStopwatch() {
-      if (swRunning) {
-        fetch(`/swstop`, {
-          method: `POST`
-        }).then(function(r) {
-          return r.json()
-        }).then(function(s) {
-          swRunning = !1;
-          swLastText = s.text || swLastText;
-          setSwToggleBtnIcon();
-          setSwSubText();
-          openSwResultDlg(s.text)
-        }).catch(function() {
-          swRunning = !1;
-          setSwToggleBtnIcon();
-          setSwSubText()
-        })
-      } else {
-        fetch(`/swstart`, {
-          method: `POST`
-        }).then(function() {
-          swRunning = !0;
-          swElapsedMs = 0;
-          swLastText = `00:00:00:00`;
-          setSwToggleBtnIcon();
-          setSwSubText()
-        })
-      }
-    }
-
-    function pollSwState() {
-      fetch(`/swstate`).then(function(r) {
-        return r.json()
-      }).then(function(s) {
-        swRunning = !!s.running;
-        swLastText = s.text || swLastText;
-        setSwToggleBtnIcon();
-        setSwSubText()
-      }).catch(function() {}), setTimeout(pollSwState, swRunning ? 1e3 : 4e3)
-    }
-
-    function openSwResultDlg(txt) {
-      var el = document.getElementById(`sw-result-time`);
-      if (el) el.textContent = txt;
-      document.getElementById(`sw-result-scrim`).classList.add(`open`);
-      document.getElementById(`sw-result-dlg`).classList.add(`open`)
-    }
-
-    function closeSwResultDlg() {
-      document.getElementById(`sw-result-scrim`).classList.remove(`open`);
-      document.getElementById(`sw-result-dlg`).classList.remove(`open`)
-    }
-  </script>
-  <script>
-    (function() {
-      var TIMER_SVG = '<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>';
-      var GEAR_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87a.49.49 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>';
-      var PLAY_SVG = '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
-      var PAUSE_SVG = '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
-      var STOP_SVG = '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h12v12H6z"/></svg>';
-      SCROLL_TILES.push({
-        key: "timer",
-        label: "Timer",
-        cls: "lc-pur",
-        svg: TIMER_SVG,
-        hasIcon: false
-      });
-      indivScroll.timer = 0;
-      var timerDurationSec = 300,
-        timerPresetV = 0,
-        timerRunningV = false,
-        timerFinishedV = false,
-        timerRemSecV = 300;
-      var evSndTimer = "calm";
-
-      function fmtTimerSec(sec) {
-        sec = Math.max(0, sec | 0);
-        var h = Math.floor(sec / 3600),
-          m = Math.floor(sec % 3600 / 60),
-          s = sec % 60;
-
-        function p(n) {
-          return (n < 10 ? "0" : "") + n;
-        }
-        return h > 0 ? p(h) + ":" + p(m) + ":" + p(s) : p(m) + ":" + p(s);
-      }
-
-      function timerPreviewText() {
-        if (timerFinishedV) return "Suna! Apasa pentru a opri";
-        return timerRunningV ? "Ruleaza - " + fmtTimerSec(timerRemSecV) : "Oprit - " + fmtTimerSec(timerDurationSec);
-      }
-
-      function updateAllTimerSubtitles() {
-        document.querySelectorAll("[id^=timertxt-]").forEach(function(el) {
-          el.textContent = timerPreviewText();
-        });
-      }
-
-      function refreshTimerPlayButtons() {
-        document.querySelectorAll(".timer-toggle-btn").forEach(function(b) {
-          b.classList.toggle("playing", timerRunningV || timerFinishedV);
-          b.innerHTML = timerFinishedV ? STOP_SVG : timerRunningV ? PAUSE_SVG : PLAY_SVG;
-          b.title = timerFinishedV ? "Opreste alarma" : "Play / Pause";
-        });
-      }
-
-      function patchTimerPriorityRow(row, idx) {
-        var lic = row.querySelector(".lic");
-        if (lic) {
-          lic.className = "lic lc-pur";
-          lic.innerHTML = TIMER_SVG;
-        }
-        var head = row.querySelector(".tile-head");
-        if (head) head.textContent = "Timer";
-        var body = row.querySelector(".tile-body");
-        var subEl = row.querySelector(".tile-sub");
-        if (!subEl && body) {
-          subEl = document.createElement("div");
-          subEl.className = "tile-sub";
-          body.appendChild(subEl);
-        }
-        if (subEl) {
-          subEl.id = "timertxt-p" + idx;
-          subEl.textContent = timerPreviewText();
-        }
-        if (body) {
-          var n = body.nextSibling;
-          while (n) {
-            var nx = n.nextSibling;
-            row.removeChild(n);
-            n = nx;
-          }
-        }
-        var playBtn = document.createElement("button");
-        playBtn.className = "np-gear-btn timer-toggle-btn" + (timerRunningV || timerFinishedV ? " playing" : "");
-        playBtn.title = timerFinishedV ? "Opreste alarma" : "Play / Pause";
-        playBtn.innerHTML = timerFinishedV ? STOP_SVG : timerRunningV ? PAUSE_SVG : PLAY_SVG;
-        playBtn.onclick = function(e) {
-          e.stopPropagation();
-          toggleTimerRun();
-        };
-        var gearBtn = document.createElement("button");
-        gearBtn.className = "np-gear-btn";
-        gearBtn.title = "Setari Timer";
-        gearBtn.innerHTML = GEAR_SVG;
-        gearBtn.onclick = function(e) {
-          e.stopPropagation();
-          openTimerSettingsDlg();
-        };
-        row.appendChild(playBtn);
-        row.appendChild(gearBtn);
-      }
-      var _origBuildPriorityGrid = buildPriorityGrid;
-      buildPriorityGrid = function() {
-        _origBuildPriorityGrid();
-        var g = document.getElementById("pgrid");
-        if (!g) return;
-        priorityItems.forEach(function(item, idx) {
-          if (item.id !== "timer") return;
-          var row = g.children[idx];
-          if (row) patchTimerPriorityRow(row, idx);
-        });
-      };
-      saveSettings = function() {
-        var p = "buzzer=" + (bOn ? 1 : 0) + "&hideIcons=" + (hideTileIcons ? 1 : 0) + "&hideIconDate=" + (indivHideIcons.date ? 1 : 0) + "&hideIconTemp=" + (indivHideIcons.temp ? 1 : 0) + "&hideIconReminder=" + (indivHideIcons.reminder ? 1 : 0) + "&hideIconWeather=" + (indivHideIcons.weather ? 1 : 0) + "&hideIconNotif=" + (indivHideIcons.notif ? 1 : 0) + "&hideIconNowPlaying=" + (indivHideIcons.nowplaying ? 1 : 0) + "&hideIconPressure=" + (indivHideIcons.pressure ? 1 : 0) + "&hideIconCurrency=" + (indivHideIcons.currency ? 1 : 0) + "&hideIconIp=" + (indivHideIcons.ip ? 1 : 0) + "&npAdaptiveIcon=" + (npAdaptiveIconV ? 1 : 0) + "&scrollType=" + scrollTypeV + "&scrollTypeDate=" + indivScroll.date + "&scrollTypeTemp=" + indivScroll.temp + "&scrollTypeReminder=" + indivScroll.reminder + "&scrollTypeWeather=" + indivScroll.weather + "&scrollTypeNotif=" + indivScroll.notif + "&scrollTypeNowPlaying=" + indivScroll.nowplaying + "&scrollTypePressure=" + indivScroll.pressure + "&scrollTypeStopwatch=" + indivScroll.stopwatch + "&scrollTypeTimer=" + (indivScroll.timer || 0) + "&scrollTypeCurrency=" + (indivScroll.currency || 0) + "&scrollTypeIp=" + (indivScroll.ip || 0) + "&fontType=" + fontTypeV + "&fontTypeDate=" + indivFont.date + "&fontTypeTemp=" + indivFont.temp + "&fontTypeReminder=" + indivFont.reminder + "&fontTypeWeather=" + indivFont.weather + "&fontTypeNotif=" + indivFont.notif + "&fontTypeNowPlaying=" + indivFont.nowplaying + "&fontTypePressure=" + indivFont.pressure + "&fontTypeStopwatch=" + indivFont.stopwatch + "&fontTypeTimer=" + (indivFont.timer || 0) + "&fontTypeCurrency=" + (indivFont.currency || 0) + "&fontTypeIp=" + (indivFont.ip || 0) + "&iconSelDate=" + (indivIcon.date || 0) + "&iconSelTemp=" + (indivIcon.temp || 0) + "&iconSelRem=" + (indivIcon.reminder || 0) + "&iconSelNotif=" + (indivIcon.notif || 0) + "&iconSelNpMusic=" + (indivIcon.nowplayingMusic || 0) + "&iconSelNpVideo=" + (indivIcon.nowplayingVideo || 0) + "&iconSelPress="+ (indivIcon.pressure || 0) + "&iconSelCurr=" + (indivIcon.currency || 0) + "&iconSelIp=" + (indivIcon.ip || 0) + "&iconWxSunny=" + (indivWxIcon.sunny || 0) + "&iconWxCloud=" + (indivWxIcon.cloud || 0) + "&iconWxRain=" + (indivWxIcon.rain || 0) + "&iconWxStorm=" + (indivWxIcon.storm || 0) + "&iconWxSnow=" + (indivWxIcon.snow || 0) + "&iconWxWind=" + (indivWxIcon.wind || 0) + "&iconWxNight=" + (indivWxIcon.night || 0);
-        items.forEach(function(it, i) {
-          p += "&id" + i + "=" + it.id + "&en" + i + "=" + (it.enabled ? 1 : 0) + "&dur" + i + "=" + it.dur;
-        });
-        fetch("/settings", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-          },
-          body: p
-        });
-      };
-      var _origBuildEventSoundCard = buildEventSoundCard;
-      buildEventSoundCard = function() {
-        _origBuildEventSoundCard();
-        var c = document.getElementById("event-sound-card");
-        if (!c) return;
-        var opts = "";
-        EVENT_SOUND_OPTIONS.forEach(function(o) {
-          opts += '<option value="' + o.id + '"' + (o.id === evSndTimer ? " selected" : "") + ">" + o.name + "</option>";
-        });
-        var row = document.createElement("div");
-        row.className = "li";
-        row.style.borderBottom = "none";
-        row.innerHTML = '<div class="lic lc-pur">' + TIMER_SVG + '</div><div class="li-body"><div class="li-head">Timer</div><div class="li-sub">Sunet redat cand countdown-ul ajunge la 0</div></div><div class="li-trail"><select class="evsnd-select" onchange="setTimerEventSound(this.value)" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">' + opts + "</select></div>";
-        c.appendChild(row);
-      };
-      window.setTimerEventSound = function(v) {
-        evSndTimer = v;
-        fetch("/eventsoundsett", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-          },
-          body: "event=timer&preset=" + encodeURIComponent(v)
-        });
-      };
-      window.toggleTimerRun = function() {
-        if (timerFinishedV) {
-          fetch("/timerpause", {
-            method: "POST"
-          }).then(function() {
-            timerFinishedV = false;
-            timerRunningV = false;
-            refreshTimerPlayButtons();
-            pollTimerState();
-          });
-        } else if (timerRunningV) {
-          fetch("/timerpause", {
-            method: "POST"
-          }).then(function() {
-            timerRunningV = false;
-            refreshTimerPlayButtons();
-            pollTimerState();
-          });
-        } else {
-          fetch("/timerstart", {
-            method: "POST"
-          }).then(function() {
-            timerRunningV = true;
-            refreshTimerPlayButtons();
-            pollTimerState();
-          });
-        }
-      };
-
-      function pollTimerState() {
-        fetch("/timerstate").then(function(r) {
-          return r.json();
-        }).then(function(s) {
-          timerRunningV = !!s.running;
-          timerFinishedV = !!s.finished;
-          timerRemSecV = s.remainingSec;
-          timerDurationSec = s.durationSec;
-          updateAllTimerSubtitles();
-          refreshTimerPlayButtons();
-          var pv = document.getElementById("timer-picker-preview");
-          if (pv) pv.textContent = timerRunningV || timerFinishedV ? fmtTimerSec(timerRemSecV) : fmtTimerSec(timerDurationSec);
-        }).catch(function() {});
-        setTimeout(pollTimerState, timerRunningV || timerFinishedV ? 1e3 : 4e3);
-      }
-      var PRESETS = [{
-        id: 0,
-        label: "5 Minutes",
-        sec: 300
-      }, {
-        id: 1,
-        label: "10 Minutes",
-        sec: 600
-      }, {
-        id: 2,
-        label: "25 Minutes",
-        sec: 1500
-      }, {
-        id: 3,
-        label: "1 Hour",
-        sec: 3600
-      }, {
-        id: 4,
-        label: "Custom",
-        sec: -1
-      }];
-
-      function ensureTimerDialog() {
-        if (document.getElementById("timer-sett-dlg")) return;
-        var scrim = document.createElement("div");
-        scrim.className = "md-scrim";
-        scrim.id = "timer-sett-scrim";
-        scrim.onclick = closeTimerSettingsDlg;
-        var dlg = document.createElement("div");
-        dlg.className = "md-dialog";
-        dlg.id = "timer-sett-dlg";
-        dlg.innerHTML = '<div class="mdd-head"><div class="mdd-icon">' + TIMER_SVG + '</div><div class="mdd-title">Timer</div></div>' + '<div class="mdd-body">' + '<div id="timer-picker-preview" style="text-align:center;font-family:Google Sans,sans-serif;font-size:32px;color:var(--pri);padding:8px 0 16px;letter-spacing:1px">05:00</div>' + '<div id="timer-running-hint" style="display:none;color:var(--on-surf-var);font-size:12px;text-align:center;padding-bottom:12px">Opreste countdown-ul pentru a schimba durata</div>' + '<div style="color:var(--on-surf-var);font-size:12px;letter-spacing:1.5px;text-transform:uppercase;padding:4px 0 8px;font-weight:500">Preseturi</div>' + '<div class="card" id="timer-preset-list"></div>' + '<div id="timer-custom-wrap" style="display:none;gap:8px;padding-top:12px;justify-content:center">' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Ore</label><input class="mdd-input" type="number" min="0" max="99" id="timer-h-in" value="0" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Minute</label><input class="mdd-input" type="number" min="0" max="59" id="timer-m-in" value="5" oninput="onTimerCustomInput()"></div>' + '<div class="mdd-tf-wrap" style="flex:1;margin-bottom:0"><label class="mdd-label">Secunde</label><input class="mdd-input" type="number" min="0" max="59" id="timer-s-in" value="0" oninput="onTimerCustomInput()"></div>' + "</div>" + "</div>" + '<div class="mdd-actions"><button class="mbtn mbtn-fill" onclick="closeTimerSettingsDlg()">Gata</button></div>';
-        document.body.appendChild(scrim);
-        document.body.appendChild(dlg);
-      }
-
-      function buildTimerPresetList() {
-        var c = document.getElementById("timer-preset-list");
-        if (!c) return;
-        c.innerHTML = "";
-        PRESETS.forEach(function(p) {
-          var isSel = p.id === timerPresetV;
-          var d = document.createElement("div");
-          d.className = "sel-row";
-          d.onclick = function() {
-            selectTimerPreset(p.id);
-          };
-          var radio = '<span class="sel-radio' + (isSel ? ' sel-radio-on' : '') + '"></span>';
-          d.innerHTML = radio + '<span class="sel-label">' + p.label + '</span>';
-          c.appendChild(d);
-        });
-      }
-      window.selectTimerPreset = function(id) {
-        timerPresetV = id;
-        buildTimerPresetList();
-        var customWrap = document.getElementById("timer-custom-wrap");
-        var preset = PRESETS[id];
-        if (id === 4) {
-          if (customWrap) customWrap.style.display = "flex";
-          var h = parseInt(document.getElementById("timer-h-in").value, 10) || 0;
-          var m = parseInt(document.getElementById("timer-m-in").value, 10) || 0;
-          var s = parseInt(document.getElementById("timer-s-in").value, 10) || 0;
-          timerDurationSec = h * 3600 + m * 60 + s;
-        } else {
-          if (customWrap) customWrap.style.display = "none";
-          timerDurationSec = preset.sec;
-        }
-        var pv = document.getElementById("timer-picker-preview");
-        if (pv) pv.textContent = fmtTimerSec(timerDurationSec);
-        saveTimerSett();
-      };
-      window.onTimerCustomInput = function() {
-        var h = parseInt(document.getElementById("timer-h-in").value, 10) || 0;
-        var m = Math.min(59, parseInt(document.getElementById("timer-m-in").value, 10) || 0);
-        var s = Math.min(59, parseInt(document.getElementById("timer-s-in").value, 10) || 0);
-        timerDurationSec = h * 3600 + m * 60 + s;
-        var pv = document.getElementById("timer-picker-preview");
-        if (pv) pv.textContent = fmtTimerSec(timerDurationSec);
-        saveTimerSett();
-      };
-
-      function saveTimerSett() {
-        if (timerRunningV || timerFinishedV) return;
-        fetch("/timersett", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-          },
-          body: "durationSec=" + timerDurationSec + "&preset=" + timerPresetV
-        }).then(function() {
-          updateAllTimerSubtitles();
-        });
-      }
-      window.openTimerSettingsDlg = function(e) {
-        if (e && e.stopPropagation) e.stopPropagation();
-        ensureTimerDialog();
-        buildTimerPresetList();
-        var customWrap = document.getElementById("timer-custom-wrap");
-        var locked = timerRunningV || timerFinishedV;
-        if (timerPresetV === 4) {
-          customWrap.style.display = "flex";
-          var rem = timerDurationSec;
-          document.getElementById("timer-h-in").value = Math.floor(rem / 3600);
-          document.getElementById("timer-m-in").value = Math.floor(rem % 3600 / 60);
-          document.getElementById("timer-s-in").value = rem % 60;
-        } else {
-          customWrap.style.display = "none";
-        }
-        document.getElementById("timer-picker-preview").textContent = locked ? fmtTimerSec(timerRemSecV) : fmtTimerSec(timerDurationSec);
-        var hint = document.getElementById("timer-running-hint");
-        var list = document.getElementById("timer-preset-list");
-        if (hint) hint.style.display = locked ? "block" : "none";
-        if (list) list.style.opacity = locked ? ".4" : "1";
-        if (list) list.style.pointerEvents = locked ? "none" : "auto";
-        if (customWrap) customWrap.style.pointerEvents = locked ? "none" : "auto";
-        if (customWrap) customWrap.style.opacity = locked ? ".4" : "1";
-        document.getElementById("timer-sett-scrim").classList.add("open");
-        document.getElementById("timer-sett-dlg").classList.add("open");
-      };
-      window.closeTimerSettingsDlg = function() {
-        var scrim = document.getElementById("timer-sett-scrim"),
-          dlg = document.getElementById("timer-sett-dlg");
-        if (scrim) scrim.classList.remove("open");
-        if (dlg) dlg.classList.remove("open");
-      };
-
-      function initTimerFeature() {
-        withInitialState(function(s) {
-          if (s.timerDurationSec !== undefined) timerDurationSec = s.timerDurationSec;
-          if (s.timerPreset !== undefined) timerPresetV = s.timerPreset;
-          if (s.scrollTypeTimer !== undefined) indivScroll.timer = s.scrollTypeTimer;
-          if (s.evSndTimer) evSndTimer = s.evSndTimer;
-          buildPriorityGrid();
-          pollTimerState();
-        })
-      }
-      if (document.readyState === "complete") initTimerFeature();
-      else window.addEventListener("load", initTimerFeature);
-      var TRANSITION_OPTIONS = [{
-        v: 0,
-        n: "Nothing"
-      }, {
-        v: 1,
-        n: "Scroll Left"
-      }, {
-        v: 2,
-        n: "Scroll Right"
-      }, {
-        v: 3,
-        n: "Scroll Up"
-      }, {
-        v: 4,
-        n: "Scroll Down"
-      }, {
-        v: 5,
-        n: "Morph"
-      }, {
-        v: 6,
-        n: "Fade In & Out"
-      }, {
-        v: 7,
-        n: "Expand Left"
-      }, {
-        v: 8,
-        n: "Expand Right"
-      }, {
-        v: 9,
-        n: "Expand Centre"
-      }];
-      var TRANS_SVG = '<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>';
-      var ETS2_SVG = '<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm12 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-1-9.5h2.5l2.07 2.5H17V9z"/></svg>';
-      var STOPWATCH_SVG = '<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0012 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a8.994 8.994 0 007.03-14.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>';
-      var NOTIF_SVG = '<svg viewbox="0 0 24 24" fill=currentColor height=20 width=20><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>';
-      var tileTransitionGlobal = 0;
-      var indivTransCircuit = {
-        0: 0,
-        1: 0,
-        2: 0,
-        3: 0,
-        4: 0,
-        5: 0,
-        6: 0,
-        8: 0,
-        9: 0,
-        11: 0
-      };
-      var indivTransPriority = {
-        notif: 0,
-        ets2: 0,
-        stopwatch: 0,
-        timer: 0,
-        nowplaying: 0,
-        ip: 0
-      };
-      var transC2P = 0,
-        transP2C = 0;
-
-      function transSelectHtml(idAttr, curVal, onchangeCall) {
-        var opts = "";
-        TRANSITION_OPTIONS.forEach(function(o) {
-          opts += '<option value="' + o.v + '"' + (o.v === curVal ? " selected" : "") + ">" + o.n + "</option>";
-        });
-        return '<select class="evsnd-select" id="' + idAttr + '" onchange="' + onchangeCall + '" style="background:var(--surf-high);color:var(--on-surf);border:1px solid var(--outline-var);border-radius:8px;padding:6px 10px;font-family:Google Sans,sans-serif;font-size:13px;max-width:150px">' + opts + "</select>";
-      }
-
-      function transRowHtml(cls, svg, label, selectHtml) {
-        return '<div class="lic ' + cls + '">' + svg + '</div><div class="li-body"><div class="li-head">' + label + '</div></div><div class="li-trail">' + selectHtml + "</div>";
-      }
-      window.setTileTransitionGlobal = function(v) {
-        tileTransitionGlobal = parseInt(v);
-        var sel = document.getElementById("tile-transition-sel");
-        if (sel) sel.value = tileTransitionGlobal;
-        Object.keys(indivTransCircuit).forEach(function(k) {
-          indivTransCircuit[k] = tileTransitionGlobal;
-        });
-        Object.keys(indivTransPriority).forEach(function(k) {
-          indivTransPriority[k] = tileTransitionGlobal;
-        });
-        transC2P = tileTransitionGlobal;
-        transP2C = tileTransitionGlobal;
-        refreshTransitionSelects();
-        saveTransitionSettings();
-      };
-
-      function applyTileTransitionGlobal() {
-        var sel = document.getElementById("tile-transition-sel");
-        if (sel) sel.value = tileTransitionGlobal;
-      }
-
-      function refreshTransitionSelects() {
-        Object.keys(indivTransCircuit).forEach(function(k) {
-          var s = document.getElementById("transc-" + k);
-          if (s) s.value = indivTransCircuit[k];
-        });
-        Object.keys(indivTransPriority).forEach(function(k) {
-          var s = document.getElementById("transp-" + k);
-          if (s) s.value = indivTransPriority[k];
-        });
-        var c2p = document.getElementById("trans-c2p");
-        if (c2p) c2p.value = transC2P;
-        var p2c = document.getElementById("trans-p2c");
-        if (p2c) p2c.value = transP2C;
-      }
-      window.setIndividualCircuitTransition = function(key, val) {
-        indivTransCircuit[key] = parseInt(val);
-        saveTransitionSettings();
-      };
-      window.setIndividualPriorityTransition = function(key, val) {
-        indivTransPriority[key] = parseInt(val);
-        saveTransitionSettings();
-      };
-      window.setSpecialTransition = function(key, val) {
-        if (key === "c2p") transC2P = parseInt(val);
-        else transP2C = parseInt(val);
-        saveTransitionSettings();
-      };
-
-      function buildTransitionCircuitList() {
-        var c = document.getElementById("transition-circuit-list");
-        if (!c) return;
-        c.innerHTML = "";
-        items.forEach(function(item) {
-          if (item.id === 3 && npIsPriority()) return;
-          if (indivTransCircuit[item.id] === undefined) indivTransCircuit[item.id] = tileTransitionGlobal;
-          var row = document.createElement("div");
-          row.className = "li static";
-          row.style.borderBottom = "none";
-          var sel = transSelectHtml("transc-" + item.id, indivTransCircuit[item.id], "setIndividualCircuitTransition(" + item.id + ",this.value)");
-          row.innerHTML = transRowHtml(ILCLS[item.id], ISVG[item.id], NAMES[item.id], sel);
-          c.appendChild(row);
-        });
-      }
-
-      function priorityTransMeta(item) {
-        if (item.id === "nowplaying") return {
-          cls: "lc-amb",
-          svg: ISVG[3],
-          name: "Now Playing"
-        };
-        if (item.id === "ets2") return {
-          cls: "lc-blu",
-          svg: ETS2_SVG,
-          name: "Euro Truck Simulator 2"
-        };
-        if (item.id === "stopwatch") return {
-          cls: "lc-grn",
-          svg: STOPWATCH_SVG,
-          name: "Stopwatch"
-        };
-        if (item.id === "timer") return {
-          cls: "lc-pur",
-          svg: STOPWATCH_SVG,
-          name: "Timer"
-        };
-        return {
-          cls: "lc-pur",
-          svg: NOTIF_SVG,
-          name: "Notificari PC"
-        };
-      }
-
-      function buildTransitionPriorityList() {
-        var c = document.getElementById("transition-priority-list");
-        if (!c) return;
-        c.innerHTML = "";
-        priorityItems.forEach(function(item) {
-          var key = item.id;
-          if (indivTransPriority[key] === undefined) indivTransPriority[key] = tileTransitionGlobal;
-          var meta = priorityTransMeta(item);
-          var row = document.createElement("div");
-          row.className = "li static";
-          row.style.borderBottom = "none";
-          var sel = transSelectHtml("transp-" + key, indivTransPriority[key], "setIndividualPriorityTransition('" + key + "',this.value)");
-          row.innerHTML = transRowHtml(meta.cls, meta.svg, meta.name, sel);
-          c.appendChild(row);
-        });
-        // Show IP Address is treated as a priority tile for transitions,
-        // but it is a one-shot touch action, not part of the reorderable list.
-        if (indivTransPriority.ip === undefined) indivTransPriority.ip = tileTransitionGlobal;
-        var ipRow = document.createElement("div");
-        ipRow.className = "li static";
-        ipRow.style.borderBottom = "none";
-        var ipSel = transSelectHtml("transp-ip", indivTransPriority.ip, "setIndividualPriorityTransition('ip',this.value)");
-        ipRow.innerHTML = transRowHtml("lc-blu", '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4 2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>', "Show IP Address", ipSel);
-        c.appendChild(ipRow);
-      }
-
-      function buildTransitionSpecialList() {
-        var c = document.getElementById("transition-special-list");
-        if (!c) return;
-        c.innerHTML = "";
-        var specials = [{
-          key: "c2p",
-          val: transC2P,
-          label: "Tranzition from Circuit Tile to Priority Tile"
-        }, {
-          key: "p2c",
-          val: transP2C,
-          label: "Tranzition from Priority Tile to Circuit Tile"
-        }];
-        specials.forEach(function(s) {
-          var row = document.createElement("div");
-          row.className = "li static";
-          row.style.borderBottom = "none";
-          var sel = transSelectHtml("trans-" + s.key, s.val, "setSpecialTransition('" + s.key + "',this.value)");
-          row.innerHTML = transRowHtml("lc-tea", TRANS_SVG, s.label, sel);
-          c.appendChild(row);
-        });
-      }
-
-      function buildTileTransitionScreen() {
-        buildTransitionCircuitList();
-        // buildTransitionPriorityList(); // Priority Tiles category removed from Tile Transition UI (kept for later restore)
-        buildTransitionSpecialList();
-      }
-      var _origGo2 = go;
-      go = function(id) {
-        if (id === "s-tiletransition") buildTileTransitionScreen();
-        _origGo2(id);
-        if (id === "s-tiles") applyTileTransitionGlobal();
-      };
-
-      function saveTransitionSettings() {
-        var p = "tileTransGlobal=" + tileTransitionGlobal + "&tileTransHour=" + (indivTransCircuit[0] || 0) + "&tileTransDate=" + (indivTransCircuit[1] || 0) + "&tileTransTemp=" + (indivTransCircuit[2] || 0) + "&tileTransNp=" + (indivTransCircuit[3] !== undefined ? indivTransCircuit[3] : indivTransPriority.nowplaying || 0) + "&tileTransWx=" + (indivTransCircuit[4] || 0) + "&tileTransRem=" + (indivTransCircuit[5] || 0) + "&tileTransCanvas=" + (indivTransCircuit[6] || 0) + "&tileTransPress=" + (indivTransCircuit[8] || 0) + "&tileTransSs=" + (indivTransCircuit[9] || 0) + "&tileTransCurr=" + (indivTransCircuit[11] || 0) + "&tileTransNotif=" + (indivTransPriority.notif || 0) + "&tileTransEts2=" + (indivTransPriority.ets2 || 0) + "&tileTransSw=" + (indivTransPriority.stopwatch || 0) + "&tileTransTmr=" + (indivTransPriority.timer || 0) + "&tileTransIp=" + (indivTransPriority.ip || 0) + "&tileTransC2P=" + transC2P + "&tileTransP2C=" + transP2C;
-        fetch("/settings", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-          },
-          body: p
-        });
-      }
-      var _origSaveSettings2 = saveSettings;
-      saveSettings = function() {
-        if (!stateLoadComplete || !Array.isArray(items) || items.length !== EXPECTED_CIRCUIT_TILE_COUNT) return;
-        _origSaveSettings2();
-        saveTransitionSettings();
-      };
+// The dashboard and the login shell now live in portal.html / auth.html next to
+// this sketch and are compiled in gzipped, which is why they are not inline any
+// more: as raw text they were 418 KB, about a quarter of the whole binary.
+// After editing either .html, regenerate the header:  python build_web.py
+#include "web_assets.h"
+
+// Both pages are stored gzipped, so they go out with Content-Encoding: gzip
+// and the browser inflates them. Every browser sends Accept-Encoding: gzip,
+// and nothing else on the device fetches these two pages - Octoglow Connect
+// only talks to the JSON endpoints.
+// NetworkClient::write() loops on select() until the whole buffer is out, so
+// pushing the page blocks loop() - and therefore the matrix animation - for as
+// long as the transfer takes. The pages only change when the firmware does, so
+// they carry an ETag: on every open after the first the browser revalidates and
+// gets a 304 with no body, and nothing stalls.
+static void sendGzipHtml(const uint8_t* body, uint32_t len, const char* etag) {
+  uint32_t _t0 = micros();
+  server.client().setNoDelay(true);
+  String tag = String("\"") + etag + "-" + String(len) + "\"";
+
+  if (server.hasHeader("If-None-Match") && server.header("If-None-Match") == tag) {
+    hwPage304++;
+    server.sendHeader("ETag", tag);
+    server.sendHeader("Cache-Control", "no-cache");
+    server.send(304, "text/html", "");
+    { uint32_t d = micros() - _t0; if (d > hwPageUs) hwPageUs = d; }
+    return;
+  }
+
+  hwPageFull++;
+  server.sendHeader("Content-Encoding", "gzip");
+  server.sendHeader("ETag", tag);
+  // no-cache means "revalidate every time", not "do not store" - the browser
+  // keeps the body and we answer the revalidation with 304.
+  server.sendHeader("Cache-Control", "no-cache");
+  server.setContentLength(len);
+  server.send(200, "text/html", "");
+  server.sendContent_P((PGM_P)body, len);
+  { uint32_t d = micros() - _t0; if (d > hwPageUs) hwPageUs = d; }
+}
 
-      function initTileTransitionFeature() {
-        withInitialState(function(s) {
-          if (s.tileTransGlobal !== undefined) tileTransitionGlobal = s.tileTransGlobal;
-          if (s.tileTransHour !== undefined) indivTransCircuit[0] = s.tileTransHour;
-          if (s.tileTransDate !== undefined) indivTransCircuit[1] = s.tileTransDate;
-          if (s.tileTransTemp !== undefined) indivTransCircuit[2] = s.tileTransTemp;
-          if (s.tileTransNp !== undefined) {
-            indivTransCircuit[3] = s.tileTransNp;
-            indivTransPriority.nowplaying = s.tileTransNp;
-          }
-          if (s.tileTransWx !== undefined) indivTransCircuit[4] = s.tileTransWx;
-          if (s.tileTransRem !== undefined) indivTransCircuit[5] = s.tileTransRem;
-          if (s.tileTransCanvas !== undefined) indivTransCircuit[6] = s.tileTransCanvas;
-          if (s.tileTransPress !== undefined) indivTransCircuit[8] = s.tileTransPress;
-          if (s.tileTransSs !== undefined) indivTransCircuit[9] = s.tileTransSs;
-          if (s.tileTransCurr !== undefined) indivTransCircuit[11] = s.tileTransCurr;
-          if (s.tileTransNotif !== undefined) indivTransPriority.notif = s.tileTransNotif;
-          if (s.tileTransEts2 !== undefined) indivTransPriority.ets2 = s.tileTransEts2;
-          if (s.tileTransSw !== undefined) indivTransPriority.stopwatch = s.tileTransSw;
-          if (s.tileTransTmr !== undefined) indivTransPriority.timer = s.tileTransTmr;
-          if (s.tileTransIp !== undefined) indivTransPriority.ip = s.tileTransIp;
-          if (s.tileTransC2P !== undefined) transC2P = s.tileTransC2P;
-          if (s.tileTransP2C !== undefined) transP2C = s.tileTransP2C;
-          applyTileTransitionGlobal();
-        })
-      }
-      if (document.readyState === "complete") initTileTransitionFeature();
-      else window.addEventListener("load", initTileTransitionFeature);
-    })();
-  </script>
-)PORTALHTML";
 
 // SERVER HANDLERS
 // AUTH HANDLERS
@@ -13170,6 +7279,7 @@ void handleSwUpdateUploadDone() {
     server.send(200, "application/json", body);
   } else {
     server.send(200, "application/json", "{\"ok\":true}");
+    saveSettingsFlush();
     delay(500);
     ESP.restart();
   }
@@ -13191,524 +7301,35 @@ void handleDashboard() {
     server.send(401, "text/plain", "Neautentificat");
     return;
   }
-  server.setContentLength(strlen_P(PORTAL_HTML));
-  server.send(200, "text/html", "");
-  server.sendContent_P(PORTAL_HTML);
+
+  // Announced on the matrix every time a browser opens the dashboard - one
+  // request per page load, so a phone connecting shows it again. Deliberately
+  // not gated on notifEnabled: that switch is labelled "PC Notifications" and
+  // covers what Octoglow Connect sends, which this is not. Skipped while
+  // something more important is on screen.
+  if (webAccessEnabled && !provisionMode &&
+      !higherPriorityTileActive(PRIORITY_ID_WEB)) {
+    strncpy(notifBuf, "Web Interface accesed", sizeof(notifBuf) - 1);
+    notifBuf[sizeof(notifBuf) - 1] = '\0';
+    notifIconOverride  = keyIcon;
+    webAccessAlertActive = true;
+    notifActive = true;
+    beginC2PCapture();
+    notifInit();
+    finishC2PTransition(tileTransWeb, tileTransSpd[TRSPD_WEB]);
+    nbPlayPreset(eventSoundWeb, BZ_CAT_NOTIF);
+  }
+  sendGzipHtml(PORTAL_HTML_GZ, PORTAL_HTML_GZ_LEN, PORTAL_HTML_GZ_SRC_SHA);
 }
 
-static const char AUTH_SHELL[] PROGMEM = R"AUTHHTML(
-<!doctype html>
-<html lang=ro>
-<meta charset=UTF-8>
-<meta content="width=device-width,initial-scale=1,viewport-fit=cover" name=viewport>
-<title>Octoglow</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Ccircle cx='128' cy='128' r='128' fill='%23EADDFF' opacity='.137'/%3E%3Ccircle cx='128' cy='128' r='107.52' fill='%23EADDFF' opacity='.255'/%3E%3Ccircle cx='128' cy='128' r='92.16' fill='%23EADDFF' opacity='.392'/%3E%3Ccircle cx='128' cy='25.6' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='230.4' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='230.4' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='25.6' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='128' r='71.68' fill='%236750A4'/%3E%3Ccircle cx='99.328' cy='99.328' r='23.04' fill='%23FFFFFF'/%3E%3C/svg%3E">
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500&family=Roboto:wght@400;500&display=swap" rel=stylesheet>
-<style>
-  :root {
-    --pri: #d0bcff;
-    --on-pri: #381e72;
-    --pri-con: #4f378b;
-    --on-pri-con: #eaddff;
-    --sec: #ccc2dc;
-    --sec-con: #4a4458;
-    --on-sec-con: #e8def8;
-    --bg: #1c1b1f;
-    --on-bg: #e6e1e5;
-    --surf: #1c1b1f;
-    --on-surf: #e6e1e5;
-    --surf-var: #49454f;
-    --on-surf-var: #cac4d0;
-    --surf-high: #2b2930;
-    --outline: #938f99;
-    --err: #f2b8b5;
-    --err-con: #8c1d18;
-    --grn: #6dd7a1;
-    --grn-con: #003824
-  }
 
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    -webkit-tap-highlight-color: transparent;
-    -webkit-touch-callout: none
-  }
-
-  html {
-    -webkit-tap-highlight-color: transparent
-  }
-
-  body {
-    background: var(--bg);
-    color: var(--on-bg);
-    font-family: Roboto, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    -webkit-tap-highlight-color: transparent;
-    padding: 24px
-  }
-
-  .auth-card {
-    background: var(--surf-high);
-    border-radius: 28px;
-    padding: 40px 28px 32px;
-    width: 100%;
-    max-width: 460px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0
-  }
-
-  .auth-title {
-    font-family: Google Sans, sans-serif;
-    font-size: 24px;
-    color: var(--on-surf);
-    font-weight: 500;
-    margin-bottom: 4px;
-    padding-bottom: 12px;
-    text-align: center;
-    line-height: 1.3
-  }
-
-  .wave-hand {
-    display: inline-block;
-    vertical-align: -4px;
-    margin-left: 6px;
-    transform-origin: 50% 82%;
-    animation: wave-once 1.4s ease-in-out infinite
-  }
-
-  @keyframes wave-once {
-    0% {
-      transform: rotate(0deg)
-    }
-
-    10% {
-      transform: rotate(14deg)
-    }
-
-    20% {
-      transform: rotate(-8deg)
-    }
-
-    30% {
-      transform: rotate(14deg)
-    }
-
-    40% {
-      transform: rotate(-4deg)
-    }
-
-    50% {
-      transform: rotate(10deg)
-    }
-
-    60%,
-    100% {
-      transform: rotate(0deg)
-    }
-  }
-
-  .tf {
-    background: var(--surf-var);
-    border-bottom: 2px solid var(--outline);
-    border-radius: 4px 4px 0 0;
-    padding: 0 16px;
-    margin-bottom: 12px;
-    width: 100%
-  }
-
-  .tf:focus-within {
-    border-bottom-color: var(--pri)
-  }
-
-  .tf label {
-    display: block;
-    font-size: 11px;
-    letter-spacing: .4px;
-    font-weight: 500;
-    color: var(--on-surf-var);
-    padding-top: 8px
-  }
-
-  .tf:focus-within label {
-    color: var(--pri)
-  }
-
-  .tf input {
-    width: 100%;
-    background: 0 0;
-    border: none;
-    outline: none;
-    color: var(--on-surf);
-    font-family: Roboto, sans-serif;
-    font-size: 16px;
-    padding: 6px 0 10px
-  }
-
-  .mbtn {
-    cursor: pointer;
-    border: none;
-    border-radius: 100px;
-    width: 100%;
-    height: 44px;
-    font-family: Google Sans, sans-serif;
-    font-size: 15px;
-    font-weight: 500;
-    letter-spacing: .1px;
-    background: var(--pri);
-    color: var(--on-pri);
-    margin-top: 8px;
-    transition: opacity .15s, transform .1s
-  }
-
-  .mbtn:active {
-    transform: scale(.97)
-  }
-
-  .mbtn:disabled {
-    opacity: .38;
-    pointer-events: none
-  }
-
-  .auth-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 12px;
-    width: 100%
-  }
-
-  .auth-main {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex: 1 1 220px;
-    min-width: 220px
-  }
-
-  .auth-avatar {
-    width: 56px;
-    height: 56px;
-    border-radius: 50%;
-    background: var(--pri-con);
-    color: var(--pri);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    font-family: Google Sans, sans-serif;
-    font-size: 19px;
-    font-weight: 500;
-    text-transform: uppercase
-  }
-
-  .auth-fields {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column
-  }
-
-  .auth-arrow-btn {
-    cursor: pointer;
-    border: none;
-    border-radius: 50%;
-    width: 44px;
-    height: 44px;
-    flex-shrink: 0;
-    background: var(--pri);
-    color: var(--on-pri);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: opacity .15s, transform .1s
-  }
-
-  .auth-arrow-btn:active {
-    transform: scale(.97)
-  }
-
-  .auth-arrow-btn:disabled {
-    opacity: .38;
-    pointer-events: none
-  }
-
-  .btn-spin {
-    width: 18px;
-    height: 18px;
-    border: 2.5px solid color-mix(in srgb, var(--on-pri) 30%, transparent);
-    border-top-color: var(--on-pri);
-    border-radius: 50%;
-    display: inline-block;
-    animation: btn-spin-rot .7s linear infinite
-  }
-
-  @keyframes btn-spin-rot {
-    to {
-      transform: rotate(360deg)
-    }
-  }
-
-  .toast-wrap {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 24px;
-    display: flex;
-    justify-content: center;
-    z-index: 500;
-    pointer-events: none
-  }
-
-  .toast {
-    background: var(--surf-high);
-    color: var(--on-surf);
-    font-family: "Google Sans", sans-serif;
-    font-size: 13px;
-    font-weight: 500;
-    padding: 10px 20px 10px 14px;
-    border-radius: 100px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
-    max-width: 90vw;
-    text-align: center;
-    opacity: 0;
-    transform: translateY(12px);
-    transition: opacity .2s ease, transform .2s ease;
-    display: flex;
-    align-items: center;
-    gap: 10px
-  }
-
-  .toast.show {
-    opacity: 1;
-    transform: translateY(0)
-  }
-
-  .toast-icon {
-    flex-shrink: 0;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: var(--err);
-    color: var(--err-con);
-    display: flex;
-    align-items: center;
-    justify-content: center
-  }
-
-  .toast-icon svg {
-    width: 14px;
-    height: 14px
-  }
-
-  @keyframes fade-in {
-    from {
-      opacity: 0;
-      transform: translateY(8px)
-    }
-
-    to {
-      opacity: 1;
-      transform: none
-    }
-  }
-
-  .auth-card {
-    animation: .3s cubic-bezier(.2, 0, 0, 1) fade-in
-  }
-
-  @media (max-width: 480px) {
-    body {
-      padding: 16px
-    }
-
-    .auth-card {
-      padding: 32px 20px 24px;
-      border-radius: 24px
-    }
-
-    .auth-title {
-      font-size: 20px;
-      padding-bottom: 0
-    }
-
-    .auth-row {
-      flex-direction: column;
-      align-items: stretch;
-      gap: 2px
-    }
-
-    .auth-main {
-      width: 100%;
-      min-width: 0
-    }
-
-    .auth-fields {
-      width: 100%
-    }
-
-    .auth-arrow-btn {
-      align-self: flex-end
-    }
-  }
-</style>
-
-<body>
-  <div class=auth-card id=auth-card>
-    <div class=auth-title id=auth-title>Octoglow</div>
-    <div id=auth-form style="width:100%;display:none">
-      <div class=auth-row>
-        <div class=auth-main>
-          <div class=auth-avatar id=auth-avatar><svg viewBox="0 0 24 24" fill=currentColor width=28 height=28>
-              <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z" />
-            </svg></div>
-          <div class=auth-fields>
-            <div class=tf id=tf-user><label>Utilizator</label><input id=inp-user type=text autocomplete=username placeholder="ex: admin" maxlength=32 oninput=updateAvatarInitials()></div>
-            <div class=tf><label>Parola</label><input id=inp-pass type=password autocomplete=current-password placeholder="Parola" maxlength=64></div>
-          </div>
-        </div>
-        <button class=auth-arrow-btn id=auth-btn onclick=doAuth()><svg viewBox="0 0 24 24" fill=currentColor width=20 height=20>
-            <path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11H4z" />
-          </svg></button>
-      </div>
-    </div>
-  </div>
-  <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewBox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
-  <script>
-    var isSetup = false;
-
-    var AVATAR_ICON_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>';
-
-    function roUpper(ch) {
-      var map = {
-        'ă': 'Ă',
-        'â': 'Â',
-        'î': 'Î',
-        'ș': 'Ș',
-        'ş': 'Ș',
-        'ț': 'Ț',
-        'ţ': 'Ț'
-      };
-      return map[ch] || ch.toUpperCase()
-    }
-
-    function getInitials(name) {
-      var parts = (name || '').trim().split(/\s+/).filter(Boolean);
-      if (parts.length === 0) return '';
-      if (parts.length === 1) return roUpper(parts[0].charAt(0));
-      return roUpper(parts[0].charAt(0)) + roUpper(parts[1].charAt(0))
-    }
-
-    function updateAvatarInitials() {
-      var el = document.getElementById('auth-avatar');
-      var inp = document.getElementById('inp-user');
-      if (!el || !inp) return;
-      var initials = getInitials(inp.value);
-      el.innerHTML = initials ? initials : AVATAR_ICON_SVG
-    }
-
-    function init() {
-      fetch('/whoami').then(function(r) {
-        if (r.ok) {
-          window.location.replace('/dashboard');
-          return null
-        }
-        return fetch('/authstate').then(function(r2) {
-          return r2.json()
-        })
-      }).then(function(d) {
-        if (!d) return;
-        isSetup = !d.configured;
-        var form = document.getElementById('auth-form');
-        var title = document.getElementById('auth-title');
-        if (isSetup) {
-          title.textContent = 'Welcome, Setup an Account';
-          document.getElementById('tf-user').style.display = ''
-        } else {
-          title.innerHTML = 'Welcome back to Octoglow! <svg class="wave-hand" xmlns="http://www.w3.org/2000/svg" height="22px" viewBox="0 -960 960 960" width="22px" fill="currentColor"><path d="M880-759q0-51-35-86t-86-35v-60q75 0 128 53t53 128h-60ZM240-40q-83 0-141.5-58.5T40-240h60q0 58 41 99t99 41v60Zm162 0q-30 0-56-13.5T303-92L48-465l24-23q19-19 45-22t47 12l116 81v-383q0-17 11.5-28.5T320-840q17 0 28.5 11.5T360-800v537L212-367l157 229q5 8 14 13t19 5h278q33 0 56.5-23.5T760-200v-560q0-17 11.5-28.5T800-800q17 0 28.5 11.5T840-760v560q0 66-47 113T680-40H402Zm38-440v-400q0-17 11.5-28.5T480-920q17 0 28.5 11.5T520-880v400h-80Zm160 0v-360q0-17 11.5-28.5T640-880q17 0 28.5 11.5T680-840v360h-80ZM486-300Z"/></svg>';
-          document.getElementById('tf-user').style.display = ''
-        }
-        form.style.display = '';
-        updateAvatarInitials();
-        document.getElementById('inp-user').focus()
-      }).catch(function() {
-        showErr('Eroare conexiune. Reincearca.')
-      })
-    }
-
-    function doAuth() {
-      var u = document.getElementById('inp-user').value.trim();
-      var p = document.getElementById('inp-pass').value;
-      var btn = document.getElementById('auth-btn');
-      if (isSetup && u.length < 1) {
-        showErr('Introdu un username.');
-        return
-      }
-      if (p.length < 4) {
-        showErr('Parola trebuie sa aiba cel putin 4 caractere.');
-        return
-      }
-      var origLabel = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = '<span class="btn-spin"></span>';
-      var url = isSetup ? '/authsetup' : '/login';
-      var body = 'user=' + encodeURIComponent(u) + '&pass=' + encodeURIComponent(p);
-      fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: body
-      }).then(function(r) {
-        return r.json()
-      }).then(function(d) {
-        if (d.ok) {
-          window.location.href = '/dashboard'
-        } else {
-          showErr(d.err || 'Eroare');
-          btn.disabled = false;
-          btn.innerHTML = origLabel
-        }
-      }).catch(function() {
-        showErr('Eroare conexiune.');
-        btn.disabled = false;
-        btn.innerHTML = origLabel
-      })
-    }
-
-    var toastTimer = null;
-
-    function showErr(msg) {
-      var el = document.getElementById('toast-el');
-      var txt = document.getElementById('toast-txt');
-      if (!el || !txt) return;
-      if (toastTimer) clearTimeout(toastTimer);
-      txt.textContent = msg;
-      el.classList.add('show');
-      toastTimer = setTimeout(function() {
-        el.classList.remove('show')
-      }, 2600)
-    }
-    var authUser = '';
-    init()
-  </script>
-)AUTHHTML";
 
 void handleRoot() {
   if (provisionMode) {
-    server.setContentLength(strlen_P(PORTAL_HTML));
-    server.send(200, "text/html", "");
-    server.sendContent_P(PORTAL_HTML);
+    sendGzipHtml(PORTAL_HTML_GZ, PORTAL_HTML_GZ_LEN, PORTAL_HTML_GZ_SRC_SHA);
     return;
   }
-  server.setContentLength(strlen_P(AUTH_SHELL));
-  server.send(200, "text/html", "");
-  server.sendContent_P(AUTH_SHELL);
+  sendGzipHtml(AUTH_SHELL_GZ, AUTH_SHELL_GZ_LEN, AUTH_SHELL_GZ_SRC_SHA);
 }
 void handleScan() {
   if (!checkAuth()) return;
@@ -13721,6 +7342,7 @@ void handleConnect() {
   String newPass = server.hasArg("pass") ? server.arg("pass") : "";
   prefs.begin("wifi", false);
   prefs.putString("ssid", newSSID);
+  gWifiSsidCached = newSSID;
   prefs.putString("pass", newPass);
   prefs.end();
 
@@ -13751,6 +7373,8 @@ void handleSettings() {
       hideIconNowPlaying = hideTileIcons;
       hideIconPressure   = hideTileIcons;
       hideIconCurrency   = hideTileIcons;
+      hideIconYoutube    = hideTileIcons;
+      hideIconWebAccess  = hideTileIcons;
     }
   }
 
@@ -13762,9 +7386,12 @@ void handleSettings() {
   if (server.hasArg("hideIconNowPlaying")) { bool v = (server.arg("hideIconNowPlaying") == "1"); if (v != hideIconNowPlaying) hideIconTouched = true; hideIconNowPlaying = v; }
   if (server.hasArg("hideIconPressure"))   { bool v = (server.arg("hideIconPressure")   == "1"); if (v != hideIconPressure)   hideIconTouched = true; hideIconPressure   = v; }
   if (server.hasArg("hideIconCurrency"))   { bool v = (server.arg("hideIconCurrency")   == "1"); if (v != hideIconCurrency)   hideIconTouched = true; hideIconCurrency   = v; }
+  if (server.hasArg("hideIconYoutube"))    { bool v = (server.arg("hideIconYoutube")    == "1"); if (v != hideIconYoutube)    hideIconTouched = true; hideIconYoutube    = v; }
+  if (server.hasArg("hideIconWebAccess"))  { bool v = (server.arg("hideIconWebAccess")  == "1"); if (v != hideIconWebAccess)  hideIconTouched = true; hideIconWebAccess  = v; }
   if (server.hasArg("hideIconIp"))         { bool v = (server.arg("hideIconIp")         == "1"); if (v != hideIconIp)         hideIconTouched = true; hideIconIp         = v; }
   if (server.hasArg("npAdaptiveIcon"))     { npAdaptiveIcon = (server.arg("npAdaptiveIcon") == "1"); }
   bool iconSelTouched = false;
+  if (server.hasArg("iconSelYt"))    { int v = server.arg("iconSelYt").toInt();    if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelYoutube)   iconSelTouched = true; iconSelYoutube   = (uint8_t)v; } }
   if (server.hasArg("iconSelDate"))  { int v = server.arg("iconSelDate").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelDate)       iconSelTouched = true; iconSelDate       = (uint8_t)v; } }
   if (server.hasArg("iconSelTemp"))  { int v = server.arg("iconSelTemp").toInt();  if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelTemp)       iconSelTouched = true; iconSelTemp       = (uint8_t)v; } }
   if (server.hasArg("iconSelRem"))   { int v = server.arg("iconSelRem").toInt();   if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) { if ((uint8_t)v != iconSelReminder)   iconSelTouched = true; iconSelReminder   = (uint8_t)v; } }
@@ -13798,6 +7425,8 @@ void handleSettings() {
       scrollTypePressure   = (uint8_t)st;
       scrollTypeStopwatch  = (uint8_t)st;
       scrollTypeCurrency   = (uint8_t)st;
+      scrollTypeYoutube    = (uint8_t)st;
+      scrollTypeWebAccess  = (uint8_t)st;
     }
   }
 
@@ -13837,6 +7466,56 @@ void handleSettings() {
     int st = server.arg("scrollTypeCurrency").toInt();
     if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeCurrency) scrollTypeTouched = true; scrollTypeCurrency = (uint8_t)st; }
   }
+  if (server.hasArg("showgrayed")) showGrayedContent = (server.arg("showgrayed") == "1");
+  if (server.hasArg("autosleep")) {
+    autoSleepOn = (server.arg("autosleep") == "1");
+    // Switching the timer on restarts the countdown rather than measuring from
+    // whenever the clock was last touched, which could be hours ago.
+    lastActivityMs = millis();
+  }
+  if (server.hasArg("autosleepsec")) {
+    long v = server.arg("autosleepsec").toInt();
+    // One minute to twenty-four hours. Anything shorter would put the panel out
+    // while you were still looking at it.
+    if (v >= 60 && v <= 86400) { autoSleepSec = (uint32_t)v; lastActivityMs = millis(); }
+  }
+  if (server.hasArg("livehl"))     liveTileHighlight = (server.arg("livehl") == "1");
+  if (server.hasArg("uidark"))     webUiDark         = (server.arg("uidark") == "1");
+  if (server.hasArg("uilang")) {
+    String l = server.arg("uilang");
+    // Only the two the interface actually ships; anything else is ignored
+    // rather than stored and handed back as a language nobody can read.
+    if (l == "en" || l == "ro") strcpy(webUiLang, l.c_str());
+  }
+  if (server.hasArg("startmode")) {
+    int m = server.arg("startmode").toInt();
+    // Takes effect at the next power-up; nothing switches under the user here.
+    if (m >= START_MODE_WIFI && m <= START_MODE_AP) defaultStartMode = (uint8_t)m;
+  }
+  // Moving the global slider re-applies it to every tile, the same way the
+  // global scroll type does.
+  if (server.hasArg("scrollSpeed")) {
+    int v = server.arg("scrollSpeed").toInt();
+    if (v >= SCROLL_SPEED_MIN && v <= SCROLL_SPEED_MAX) {
+      scrollSpeed = (uint8_t)v;
+      for (int i = 0; i < SCROLL_SPEED_COUNT; i++) scrollSpeedTile[i] = (uint8_t)v;
+    }
+  }
+  for (int i = 0; i < SCROLL_SPEED_COUNT; i++) {
+    String a = String("scrollSpeed") + SPD_KEYS[i];
+    if (server.hasArg(a)) {
+      int v = server.arg(a).toInt();
+      if (v >= SCROLL_SPEED_MIN && v <= SCROLL_SPEED_MAX) scrollSpeedTile[i] = (uint8_t)v;
+    }
+  }
+  if (server.hasArg("scrollTypeYoutube")) {
+    int st = server.arg("scrollTypeYoutube").toInt();
+    if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeYoutube) scrollTypeTouched = true; scrollTypeYoutube = (uint8_t)st; }
+  }
+  if (server.hasArg("scrollTypeWebAccess")) {
+    int st = server.arg("scrollTypeWebAccess").toInt();
+    if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeWebAccess) scrollTypeTouched = true; scrollTypeWebAccess = (uint8_t)st; }
+  }
   if (server.hasArg("scrollTypeIp")) {
     int st = server.arg("scrollTypeIp").toInt();
     if (st >= 0 && st <= 3) { if ((uint8_t)st != scrollTypeIp) scrollTypeTouched = true; scrollTypeIp = (uint8_t)st; }
@@ -13845,7 +7524,7 @@ void handleSettings() {
   bool fontTypeTouched = false;
   if (server.hasArg("fontType")) {
     int ft = server.arg("fontType").toInt();
-    if (ft >= 0 && ft <= 1 && (uint8_t)ft != fontType) {
+    if (ft >= 0 && ft < FONT_MODE_COUNT && (uint8_t)ft != fontType) {
       fontTypeTouched = true;
       fontType = (uint8_t)ft;
 
@@ -13858,53 +7537,63 @@ void handleSettings() {
       fontTypePressure   = (uint8_t)ft;
       fontTypeStopwatch  = (uint8_t)ft;
       fontTypeCurrency   = (uint8_t)ft;
+      fontTypeYoutube    = (uint8_t)ft;
+      fontTypeWebAccess  = (uint8_t)ft;
       fontTypeTimer      = (uint8_t)ft;
       fontTypeIp         = (uint8_t)ft;
     }
   }
   if (server.hasArg("fontTypeDate")) {
     int ft = server.arg("fontTypeDate").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeDate) fontTypeTouched = true; fontTypeDate = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeDate) fontTypeTouched = true; fontTypeDate = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeTemp")) {
     int ft = server.arg("fontTypeTemp").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeTemp) fontTypeTouched = true; fontTypeTemp = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeTemp) fontTypeTouched = true; fontTypeTemp = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeReminder")) {
     int ft = server.arg("fontTypeReminder").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeReminder) fontTypeTouched = true; fontTypeReminder = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeReminder) fontTypeTouched = true; fontTypeReminder = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeWeather")) {
     int ft = server.arg("fontTypeWeather").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeWeather) fontTypeTouched = true; fontTypeWeather = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeWeather) fontTypeTouched = true; fontTypeWeather = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeNotif")) {
     int ft = server.arg("fontTypeNotif").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeNotif) fontTypeTouched = true; fontTypeNotif = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeNotif) fontTypeTouched = true; fontTypeNotif = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeNowPlaying")) {
     int ft = server.arg("fontTypeNowPlaying").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeNowPlaying) fontTypeTouched = true; fontTypeNowPlaying = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeNowPlaying) fontTypeTouched = true; fontTypeNowPlaying = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypePressure")) {
     int ft = server.arg("fontTypePressure").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypePressure) fontTypeTouched = true; fontTypePressure = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypePressure) fontTypeTouched = true; fontTypePressure = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeStopwatch")) {
     int ft = server.arg("fontTypeStopwatch").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeStopwatch) fontTypeTouched = true; fontTypeStopwatch = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeStopwatch) fontTypeTouched = true; fontTypeStopwatch = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeCurrency")) {
     int ft = server.arg("fontTypeCurrency").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeCurrency) fontTypeTouched = true; fontTypeCurrency = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeCurrency) fontTypeTouched = true; fontTypeCurrency = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeYoutube")) {
+    int ft = server.arg("fontTypeYoutube").toInt();
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeYoutube) fontTypeTouched = true; fontTypeYoutube = (uint8_t)ft; }
+  }
+  if (server.hasArg("fontTypeWebAccess")) {
+    int ft = server.arg("fontTypeWebAccess").toInt();
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeWebAccess) fontTypeTouched = true; fontTypeWebAccess = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeTimer")) {
     int ft = server.arg("fontTypeTimer").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeTimer) fontTypeTouched = true; fontTypeTimer = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeTimer) fontTypeTouched = true; fontTypeTimer = (uint8_t)ft; }
   }
   if (server.hasArg("fontTypeIp")) {
     int ft = server.arg("fontTypeIp").toInt();
-    if (ft >= 0 && ft <= 1) { if ((uint8_t)ft != fontTypeIp) fontTypeTouched = true; fontTypeIp = (uint8_t)ft; }
+    if (ft >= 0 && ft < FONT_MODE_COUNT) { if ((uint8_t)ft != fontTypeIp) fontTypeTouched = true; fontTypeIp = (uint8_t)ft; }
   }
   if (fontTypeTouched) {
 
@@ -13920,9 +7609,10 @@ void handleSettings() {
       else if (cur.id == ITEM_WEATHER)    weatherInit();
       else if (cur.id == ITEM_MEMENTO)    mementoInit();
       else if (cur.id == ITEM_DATE)       dateInit();
-      else if (cur.id == ITEM_TEMP && lastTemp != -999) tempInit(lastTemp);
+      else if (cur.id == ITEM_TEMP)       tempInit(lastTemp);
       else if (cur.id == ITEM_PRESSURE)   pressureInit((int)round(lastPressureHpa));
       else if (cur.id == ITEM_CURRENCY)   currencyInit();
+      else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
     }
   }
 
@@ -13940,9 +7630,10 @@ void handleSettings() {
       else if (cur.id == ITEM_WEATHER)    weatherInit();
       else if (cur.id == ITEM_MEMENTO)    mementoInit();
       else if (cur.id == ITEM_DATE)       dateInit();
-      else if (cur.id == ITEM_TEMP && lastTemp != -999) tempInit(lastTemp);
+      else if (cur.id == ITEM_TEMP)       tempInit(lastTemp);
       else if (cur.id == ITEM_PRESSURE)   pressureInit((int)round(lastPressureHpa));
       else if (cur.id == ITEM_CURRENCY)   currencyInit();
+      else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
     }
   }
 
@@ -13960,13 +7651,33 @@ void handleSettings() {
   if (server.hasArg("tileTransPress"))  { int t = server.arg("tileTransPress").toInt();  if (t >= 0 && t <= 9) tileTransPress  = (uint8_t)t; }
   if (server.hasArg("tileTransSs"))     { int t = server.arg("tileTransSs").toInt();     if (t >= 0 && t <= 9) tileTransSs     = (uint8_t)t; }
   if (server.hasArg("tileTransCurr"))   { int t = server.arg("tileTransCurr").toInt();   if (t >= 0 && t <= 9) tileTransCurr   = (uint8_t)t; }
+  if (server.hasArg("tileTransYt"))     { int t = server.arg("tileTransYt").toInt();     if (t >= 0 && t <= 9) tileTransYt     = (uint8_t)t; }
+  if (server.hasArg("tileTransHw"))     { int t = server.arg("tileTransHw").toInt();     if (t >= 0 && t <= 9) tileTransHw     = (uint8_t)t; }
+  if (server.hasArg("tileTransWeb"))    { int t = server.arg("tileTransWeb").toInt();    if (t >= 0 && t <= 9) tileTransWeb    = (uint8_t)t; }
   if (server.hasArg("tileTransNotif"))  { int t = server.arg("tileTransNotif").toInt();  if (t >= 0 && t <= 9) tileTransNotif  = (uint8_t)t; }
   if (server.hasArg("tileTransEts2"))   { int t = server.arg("tileTransEts2").toInt();   if (t >= 0 && t <= 9) tileTransEts2   = (uint8_t)t; }
   if (server.hasArg("tileTransSw"))     { int t = server.arg("tileTransSw").toInt();     if (t >= 0 && t <= 9) tileTransSw     = (uint8_t)t; }
   if (server.hasArg("tileTransTmr"))    { int t = server.arg("tileTransTmr").toInt();    if (t >= 0 && t <= 9) tileTransTmr    = (uint8_t)t; }
+  if (server.hasArg("tileTransAlarm"))  { int t = server.arg("tileTransAlarm").toInt();  if (t >= 0 && t <= 9) tileTransAlarm  = (uint8_t)t; }
   if (server.hasArg("tileTransIp"))     { int t = server.arg("tileTransIp").toInt();     if (t >= 0 && t <= 9) tileTransIp     = (uint8_t)t; }
   if (server.hasArg("tileTransC2P"))    { int t = server.arg("tileTransC2P").toInt();    if (t >= 0 && t <= 9) tileTransC2P    = (uint8_t)t; }
   if (server.hasArg("tileTransP2C"))    { int t = server.arg("tileTransP2C").toInt();    if (t >= 0 && t <= 9) tileTransP2C    = (uint8_t)t; }
+  // Moving the global speed slider re-applies it to every transition, the way
+  // the global scroll speed does.
+  if (server.hasArg("tileTransSpd")) {
+    int v = server.arg("tileTransSpd").toInt();
+    if (v >= TRSPD_MIN && v <= TRSPD_MAX) {
+      tileTransSpeed = (uint8_t)v;
+      for (int i = 0; i < TRSPD_COUNT; i++) tileTransSpd[i] = (uint8_t)v;
+    }
+  }
+  for (int i = 0; i < TRSPD_COUNT; i++) {
+    String a = String("tileTransSpd") + TRSPD_KEYS[i];
+    if (server.hasArg(a)) {
+      int v = server.arg(a).toInt();
+      if (v >= TRSPD_MIN && v <= TRSPD_MAX) tileTransSpd[i] = (uint8_t)v;
+    }
+  }
 
   // Settings-only requests (for example transition settings) contain no tile
   // payload. If a tile payload is present, it must contain the entire valid
@@ -13998,7 +7709,7 @@ void handleSettings() {
   }
 
   repairItemIds();
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
@@ -14029,20 +7740,36 @@ void handleBrightness() {
   }
 
   applyBrightness();
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
 void handleBuzzerSett() {
   if (!checkAuth()) return;
+  // The main slider moves every category with it; the Volume page then sets
+  // them apart.
   if (server.hasArg("volume")) {
     buzzerVolume = (uint8_t)constrain(server.arg("volume").toInt(), 0, 100);
+    buzzVolNotif = buzzVolAuto = buzzVolAlarm = buzzVolTouch = buzzerVolume;
+  }
+  if (server.hasArg("volnotif")) buzzVolNotif = (uint8_t)constrain(server.arg("volnotif").toInt(), 0, 100);
+  if (server.hasArg("volauto"))  buzzVolAuto  = (uint8_t)constrain(server.arg("volauto").toInt(), 0, 100);
+  if (server.hasArg("volalarm")) buzzVolAlarm = (uint8_t)constrain(server.arg("volalarm").toInt(), 0, 100);
+  if (server.hasArg("voltouch")) buzzVolTouch = (uint8_t)constrain(server.arg("voltouch").toInt(), 0, 100);
+  // A volume nobody can hear is a volume nobody can set: every slider asks for
+  // a chime at its new level as soon as it is let go.
+  String pv = server.arg("preview");
+  if (pv.length() && buzzerOn && !alarmRinging) {
+    nbStop();
+    nbEnqCat = pv == "notif" ? BZ_CAT_NOTIF : pv == "auto"  ? BZ_CAT_AUTO  :
+               pv == "alarm" ? BZ_CAT_ALARM : pv == "touch" ? BZ_CAT_TOUCH : BZ_CAT_NONE;
+    nbEnqueueEnv(1568, 450, BZ_ENV_BELL);
   }
   if (server.hasArg("preset")) {
     String p = server.arg("preset");
     p.toCharArray(buzzerPreset, sizeof(buzzerPreset));
   }
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
@@ -14060,6 +7787,7 @@ void handleEventSoundSett() {
   if (ev == "tile")       { target = eventSoundTile;  targetSize = sizeof(eventSoundTile);  prefKey = "evSndTile"; }
   else if (ev == "wifi")  { target = eventSoundWifi;  targetSize = sizeof(eventSoundWifi);  prefKey = "evSndWifi"; }
   else if (ev == "notif") { target = eventSoundNotif; targetSize = sizeof(eventSoundNotif); prefKey = "evSndNotif"; }
+  else if (ev == "web")   { target = eventSoundWeb;   targetSize = sizeof(eventSoundWeb);   prefKey = "evSndWeb"; }
   else if (ev == "ets2")  { target = eventSoundEts2;  targetSize = sizeof(eventSoundEts2);  prefKey = "evSndEts2"; }
   else if (ev == "touch") { target = eventSoundTouch; targetSize = sizeof(eventSoundTouch); prefKey = "evSndTouch"; }
   else if (ev == "timer") { target = eventSoundTimer; targetSize = sizeof(eventSoundTimer); prefKey = "evSndTimer"; }
@@ -14071,6 +7799,11 @@ void handleEventSoundSett() {
   prefs.begin("settings", false);
   prefs.putString(prefKey, p);
   prefs.end();
+  // Picking a sound plays it, at the volume of the category it will play in.
+  if (server.arg("preview") == "1" && buzzerOn && !alarmRinging) {
+    uint8_t cat = (ev == "notif" || ev == "web") ? BZ_CAT_NOTIF : ev == "touch" ? BZ_CAT_TOUCH : BZ_CAT_AUTO;
+    nbPlayPreset(target, cat);
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -14082,7 +7815,7 @@ void handleTouchSett() {
   if (server.hasArg("dbl")) {
     touchDoubleTapAction = (uint8_t)constrain(server.arg("dbl").toInt(), 0, 8);
   }
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
@@ -14095,22 +7828,76 @@ bool isValidHexColor(const String& s) {
   return true;
 }
 
+// Four comma-separated slots, each empty or #rrggbb. An empty string is all four
+// left to the theme.
+bool isValidUiColors(const String& s) {
+  if (s.length() == 0) return true;
+  if (s.length() >= sizeof(webUiColors)) return false;
+  int parts = 0, start = 0;
+  for (int i = 0; i <= (int)s.length(); i++) {
+    if (i == (int)s.length() || s.charAt(i) == ',') {
+      String p = s.substring(start, i);
+      if (p.length() && !isValidHexColor(p)) return false;
+      parts++;
+      start = i + 1;
+    }
+  }
+  return parts == 4;
+}
+
 void handleAccentSett() {
   if (!checkAuth()) return;
-  if (!server.hasArg("hex")) {
-    server.send(400, "text/plain", "Lipseste hex");
+  bool hasHex   = server.hasArg("hex");
+  bool hasShape = server.hasArg("shape");
+  bool hasColors = server.hasArg("colors");
+  if (!hasHex && !hasShape && !hasColors) {
+    server.send(400, "text/plain", "Lipseste hex, shape sau colors");
     return;
   }
-  String hex = server.arg("hex");
-  hex.trim();
-  hex.toLowerCase();
-  if (!isValidHexColor(hex)) {
-    server.send(400, "text/plain", "Culoare invalida");
-    return;
+  String hex;
+  if (hasHex) {
+    hex = server.arg("hex");
+    hex.trim();
+    hex.toLowerCase();
+    if (!isValidHexColor(hex)) {
+      server.send(400, "text/plain", "Culoare invalida");
+      return;
+    }
   }
-  hex.toCharArray(accentColor, sizeof(accentColor));
+  String colors;
+  if (hasColors) {
+    colors = server.arg("colors");
+    colors.trim();
+    colors.toLowerCase();
+    if (!isValidUiColors(colors)) {
+      server.send(400, "text/plain", "Culori invalide");
+      return;
+    }
+  }
+  uint8_t shape = webUiShape;
+  if (hasShape) {
+    long s = server.arg("shape").toInt();
+    if (s < 0 || s > 3) {
+      server.send(400, "text/plain", "Forma invalida");
+      return;
+    }
+    shape = (uint8_t)s;
+  }
+  // Nimic nu se scrie pana cand tot ce a venit nu e valid, ca o forma gresita
+  // sa nu lase in urma o culoare deja salvata.
   prefs.begin("settings", false);
-  prefs.putString("accentColor", accentColor);
+  if (hasHex) {
+    hex.toCharArray(accentColor, sizeof(accentColor));
+    prefs.putString("accentColor", accentColor);
+  }
+  if (hasShape) {
+    webUiShape = shape;
+    prefs.putUChar("uiShape", webUiShape);
+  }
+  if (hasColors) {
+    colors.toCharArray(webUiColors, sizeof(webUiColors));
+    prefs.putString("uiColors", webUiColors);
+  }
   prefs.end();
   server.send(200, "text/plain", "OK");
 }
@@ -14146,27 +7933,302 @@ String jsonEscape(const String& in) {
   return out;
 }
 
-void handleState() {
+// Streams a response out in small chunks instead of building the whole body in
+// one String.
+//
+// /state is by far the largest response in the portal (~2.8KB typical). It used
+// to be assembled into a single String that reserve()d 6KB up front and was then
+// handed to server.send() in one piece. Two things made that fail intermittently
+// on a device that has been running for a while:
+//
+//   * A ~6KB *contiguous* allocation is not always available. The heap gets
+//     fragmented over time, and the weather/currency fetch tasks allocate on
+//     core 0 while a request is being served on core 1, so whether the block is
+//     available at the moment the portal loads is essentially luck.
+//   * When an Arduino String cannot grow, concat() returns false and leaves the
+//     String *unchanged*. Both String::reserve() and String::operator+= discard
+//     that result, so a failed allocation did not raise anything - it silently
+//     dropped fields and produced truncated, invalid JSON. The portal's
+//     `r.json()` then threw, all 5 retries hit the same fragmented heap, and the
+//     user got "nothing loads at all" with no indication why.
+//
+// Writing through a small rolling buffer keeps the peak allocation at ~1KB
+// (which the heap can virtually always satisfy), and a failed append is retried
+// after flushing instead of being silently discarded.
+struct ChunkedResponse {
+  static const size_t FLUSH_AT = 4096;
+  String buf;
+  bool   truncated = false;
+
+  void begin(const char* contentType) {
+    // Nagle holds a small segment back waiting for an ACK, which is exactly the
+    // wrong behaviour for a handful of chunk headers: it turned a few hundred
+    // microseconds of work into tens of milliseconds of loop() being blocked.
+    server.client().setNoDelay(true);
+    buf.reserve(FLUSH_AT + 128);
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN); // -> HTTP chunked transfer
+    server.send(200, contentType, "");
+  }
+  ChunkedResponse& operator+=(const char* s)   { append(s);         return *this; }
+  ChunkedResponse& operator+=(const String& s) { append(s.c_str()); return *this; }
+  void append(const char* s) {
+    if (!buf.concat(s)) {
+      flush();                          // free what we are holding, then retry
+      if (!buf.concat(s)) truncated = true;
+    }
+    if (buf.length() >= FLUSH_AT) flush();
+  }
+  void flush() {
+    if (buf.length()) {
+      server.sendContent(buf);
+      buf = "";                         // keeps the reserved capacity
+    }
+  }
+  void end() { flush(); server.sendContent(""); }
+};
+
+// Which tiles the Tile Manager is currently showing. Its own endpoint rather
+// than a pair of fields on /settings, because /settings only accepts a tile
+// payload that is complete and valid - and adding a tile back is precisely the
+// moment the two would have to be sent together and agree.
+void handleTileHidden() {
   if (!checkAuth()) return;
-  prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", "");
-  prefs.end();
+  if (server.hasArg("circuit")) {
+    long v = server.arg("circuit").toInt();
+    if (v < 0 || v > 0xFFFF) { server.send(400, "text/plain", "Masca invalida"); return; }
+    tileHiddenMask = (uint16_t)v;
+  }
+  if (server.hasArg("prio")) {
+    long v = server.arg("prio").toInt();
+    if (v < 0 || v > 0xFF) { server.send(400, "text/plain", "Masca invalida"); return; }
+    prioHiddenMask = (uint8_t)v;
+  }
+  applyTileHiddenMask();
+  saveSettingsDeferred();
+  server.send(200, "text/plain", "OK");
+}
+
+// Polled once a second for as long as the Tile Manager is open, so it stays
+// deliberately tiny - /state carries every setting on the device and is far too
+// heavy to ask for at that rate.
+void handleLiveTile() {
+  if (!checkAuth()) return;
+  String j = "{\"tile\":";
+  j += String((int)gLiveTileId);
+  j += ",\"prio\":\"";
+  j += gLivePrio;
+  j += "\"}";
+  server.send(200, "application/json", j);
+}
+
+// SCREEN MIRROR
+//
+// What the matrix is lighting right now, for Octoglow Connect or anything else
+// that wants to draw a copy. The server cannot push, so this is polled, and it is
+// built to cost next to nothing: 32 column reads from the MD_MAX72XX buffer the
+// panel is fed from, a reply under 100 bytes, no heap work beyond sending it.
+//
+//   GET /getscreen              {"on":true,"b":8,"px":"<64 hex digits>"}
+//   GET /getscreen?format=grid  8 lines of 32 '0'/'1', top row first
+//
+// px is two hex digits per column, leftmost column first; within a column bit 0
+// is the top row. b is the brightness level the panel runs at (1-16). When the
+// panel is dark - sleep, screen switched off, level 0 - "on" is false and every
+// pixel reads 0, because nothing is lit.
+//
+// A request is answered between two passes of loop(), so a frame caught halfway
+// through a transition is never seen, only whole frames. The server closes every
+// connection after answering, so each poll is a fresh TCP connection: one at a
+// time, 50-100 ms apart, is the pace to use.
+void handleGetScreen() {
+  if (!checkAuth()) return;
+  bool lit = mxPanelLevel > 0;
+  uint8_t cols[32];
+  // mx column 31 is the leftmost one on the panel.
+  for (int x = 0; x < 32; x++) cols[x] = lit ? mx.getColumn(31 - x) : 0;
+  server.sendHeader("Cache-Control", "no-store");
+  if (server.arg("format") == "grid") {
+    char g[8 * 33 + 1];
+    char* p = g;
+    for (int y = 0; y < 8; y++) {
+      for (int x = 0; x < 32; x++) *p++ = ((cols[x] >> y) & 1) ? '1' : '0';
+      *p++ = '\n';
+    }
+    *p = '\0';
+    server.send(200, "text/plain", g);
+    return;
+  }
+  static const char HEXD[] = "0123456789abcdef";
+  char j[100];
+  int n = snprintf(j, sizeof(j), "{\"on\":%s,\"b\":%u,\"px\":\"", lit ? "true" : "false", (unsigned)mxPanelLevel);
+  for (int x = 0; x < 32; x++) {
+    j[n++] = HEXD[cols[x] >> 4];
+    j[n++] = HEXD[cols[x] & 0x0F];
+  }
+  j[n++] = '"';
+  j[n++] = '}';
+  j[n] = '\0';
+  server.send(200, "application/json", j);
+}
+
+// SCREEN STREAM
+//
+// /getscreen answers when asked; this sends. Polling costs a fresh TCP connection
+// per frame, and with WiFi modem sleep on every one of them waits for the next
+// beacon, so a polled copy stutters. A client that wants a live copy - Octoglow
+// Connect - asks /screensub for the key over its logged-in session, then sends
+// that key to UDP port SCREEN_UDP_PORT about once a second from the socket it
+// wants the frames on. Each such packet renews the subscription; with none for
+// SCREEN_SUB_TIMEOUT_MS the stream stops. The client speaking first is also what
+// gets the frames through a desktop firewall: they arrive as replies.
+//
+// While subscribed, a frame that differs from the last one sent goes out as one
+// 40-byte datagram - at most one per SCREEN_MIN_GAP_MS - and the frame is sent
+// again every SCREEN_KEEPALIVE_MS, so a lost packet heals and a still clock can be
+// told from a gone one. screenStreamTick() runs from mxCommit() as well as from
+// loop(), so the frames of a blocking transition go out too. Modem sleep is off
+// for as long as someone is subscribed and back on once they leave.
+//
+// Datagram: "OGF1", sequence (uint16, big endian), flags (bit 0: panel lit),
+// brightness level, then 32 columns laid out like /getscreen's px - leftmost
+// first, bit 0 the top row, all zero while the panel is dark.
+#define SCREEN_UDP_PORT        4211
+#define SCREEN_SUB_TIMEOUT_MS  4000UL
+#define SCREEN_MIN_GAP_MS      25UL
+#define SCREEN_CHECK_MS        20UL
+#define SCREEN_KEEPALIVE_MS    500UL
+
+static WiFiUDP       screenUdp;
+static bool          screenUdpOpen     = false;
+static uint32_t      screenKey         = 0;
+static bool          screenSubActive   = false;
+static IPAddress     screenSubIp;
+static uint16_t      screenSubPort     = 0;
+static unsigned long screenSubHeardMs  = 0;
+static unsigned long screenLastSendMs  = 0;
+static unsigned long screenLastCheckMs = 0;
+static unsigned long screenLastReadMs  = 0;
+static bool          screenSendNow     = false;
+static uint16_t      screenSeq         = 0;
+static uint8_t       screenLastSent[34];
+static bool          screenInTick      = false;
+
+// Subscription packets are "OGSK" and the key, big endian - exactly 8 bytes.
+// A handful per call at most, so a flood cannot hold loop() here.
+static void screenReadSubscriptions(unsigned long now) {
+  for (int i = 0; i < 8; i++) {
+    int len = screenUdp.parsePacket();
+    if (len <= 0) break;
+    uint8_t buf[8];
+    if (len != 8 || screenUdp.read(buf, sizeof(buf)) != 8) continue;
+    if (memcmp(buf, "OGSK", 4) != 0 || screenKey == 0) continue;
+    uint32_t k = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+                 ((uint32_t)buf[6] << 8)  |  (uint32_t)buf[7];
+    if (k != screenKey) continue;
+    IPAddress ip   = screenUdp.remoteIP();
+    uint16_t  port = screenUdp.remotePort();
+    if (!screenSubActive || !(ip == screenSubIp) || port != screenSubPort) {
+      screenSubIp   = ip;
+      screenSubPort = port;
+      screenSendNow = true;
+      if (!screenSubActive) {
+        screenSubActive = true;
+        WiFi.setSleep(false);
+      }
+    }
+    screenSubHeardMs = now;
+  }
+}
+
+void screenStreamTick() {
+  if (!screenUdpOpen || screenInTick) return;
+  screenInTick = true;
+  unsigned long now = millis();
+
+  if (now - screenLastReadMs >= 50) {
+    screenLastReadMs = now;
+    screenReadSubscriptions(now);
+  }
+  if (screenSubActive && now - screenSubHeardMs > SCREEN_SUB_TIMEOUT_MS) {
+    screenSubActive = false;
+    WiFi.setSleep(true);
+  }
+
+  // gSuppressHwFlash means the buffer holds a frame the panel is not showing.
+  if (screenSubActive && !gSuppressHwFlash &&
+      (screenSendNow || (now - screenLastCheckMs >= SCREEN_CHECK_MS &&
+                         now - screenLastSendMs >= SCREEN_MIN_GAP_MS))) {
+    screenLastCheckMs = now;
+    uint8_t frame[34];
+    bool lit = mxPanelLevel > 0;
+    for (int x = 0; x < 32; x++) frame[x] = lit ? mx.getColumn(31 - x) : 0;
+    frame[32] = lit ? 1 : 0;
+    frame[33] = mxPanelLevel;
+    if (screenSendNow || now - screenLastSendMs >= SCREEN_KEEPALIVE_MS ||
+        memcmp(frame, screenLastSent, sizeof(frame)) != 0) {
+      uint8_t pkt[40];
+      memcpy(pkt, "OGF1", 4);
+      pkt[4] = (uint8_t)(screenSeq >> 8);
+      pkt[5] = (uint8_t)screenSeq;
+      pkt[6] = frame[32];
+      pkt[7] = frame[33];
+      memcpy(pkt + 8, frame, 32);
+      screenSeq++;
+      if (screenUdp.beginPacket(screenSubIp, screenSubPort)) {
+        screenUdp.write(pkt, sizeof(pkt));
+        screenUdp.endPacket();
+      }
+      memcpy(screenLastSent, frame, sizeof(frame));
+      screenLastSendMs = now;
+      screenSendNow    = false;
+    }
+  }
+  screenInTick = false;
+}
+
+// Hands a logged-in client the key for the stream, opening the UDP socket the
+// first time anyone asks. The key lasts until the clock restarts.
+void handleScreenSub() {
+  if (!checkAuth()) return;
+  if (!screenUdpOpen) screenUdpOpen = screenUdp.begin(SCREEN_UDP_PORT);
+  if (!screenUdpOpen) {
+    server.send(503, "text/plain", "UDP indisponibil");
+    return;
+  }
+  while (screenKey == 0) screenKey = esp_random();
+  char j[72];
+  snprintf(j, sizeof(j), "{\"port\":%u,\"key\":\"%08lx\",\"timeoutMs\":%lu}",
+           (unsigned)SCREEN_UDP_PORT, (unsigned long)screenKey, (unsigned long)SCREEN_SUB_TIMEOUT_MS);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+void handleState() {
+  uint32_t _st0 = micros();
+  if (!checkAuth()) return;
+  String ssid = gWifiSsidCached;
 
   String localIP = provisionMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 
-  // /state is the largest response in the portal. Each field is appended
-  // individually (rather than one long chained `+` expression) so every += only
-  // needs one small temporary String for its right-hand side. The previous single
-  // chained expression created a cascade of growing temporary String allocations
-  // while being evaluated (one per `+`), which is what was actually fragmenting
-  // the heap and occasionally truncating this response - reserve() alone only
-  // protects the final `json` buffer, not those intermediate temporaries.
-  String json;
-  json.reserve(6144); // ~2.1x the measured typical payload (~2.8KB); headroom for long SSID/city/memento/canvas values
-  json = "{\"buzzer\":";
+  // Each field is appended individually (rather than one long chained `+`
+  // expression) so every += only needs one small temporary String for its
+  // right-hand side. The previous single chained expression created a cascade of
+  // growing temporary String allocations while being evaluated (one per `+`),
+  // which fragmented the heap further.
+  ChunkedResponse json;
+  json.begin("application/json");
+  json += "{\"buzzer\":";
   json += String(buzzerOn ? "true" : "false");
   json += ",\"buzzerVolume\":";
   json += String(buzzerVolume);
+  json += ",\"buzzerVolNotif\":";
+  json += String(buzzVolNotif);
+  json += ",\"buzzerVolAuto\":";
+  json += String(buzzVolAuto);
+  json += ",\"buzzerVolAlarm\":";
+  json += String(buzzVolAlarm);
+  json += ",\"buzzerVolTouch\":";
+  json += String(buzzVolTouch);
   json += ",\"buzzerPreset\":\"";
   json += String(buzzerPreset);
   json += "\"";
@@ -14188,6 +8250,8 @@ void handleState() {
   json += String(millis() / 1000);
   json += ",\"lastTemp\":";
   json += String(lastTemp);
+  json += ",\"bmpOk\":";
+  json += (bmpOk ? "true" : "false");
   json += ",\"items\":[";
   for (int i = 0; i < NUM_ITEMS; i++) {
     if (i > 0) json += ",";
@@ -14219,6 +8283,22 @@ void handleState() {
   json += String(tempUnit);
   json += ",\"hourformat\":";
   json += String(hourFormat);
+  json += ",\"hourLeadingZero\":";
+  json += String(hourLeadingZero ? "true" : "false");
+  json += ",\"hwFormat\":";
+  json += String(hwFormat);
+  json += ",\"hwLeadZero\":";
+  json += String(hwLeadZero ? "true" : "false");
+  json += ",\"hwBarMode\":";
+  json += String(hwBarMode);
+  json += ",\"hwBarPos\":";
+  json += String(hwBarPos);
+  json += ",\"hwSwap\":";
+  json += String(hwSwap ? "true" : "false");
+  json += ",\"netTimeSync\":";
+  json += String(netTimeSync ? "true" : "false");
+  json += ",\"defaultStartMode\":";
+  json += String(defaultStartMode);
   json += ",\"dateformat\":";
   json += String(dateFormat);
   json += ",\"datelang\":";
@@ -14229,11 +8309,44 @@ void handleState() {
   json += ",\"wxCity\":\"";
   json += jsonEscape(String(weatherCity));
   json += "\"";
+  json += ",\"wxPreset\":";
+  json += String(wxPreset);
   json += ",\"wxLang\":\"";
   json += jsonEscape(String(weatherLang));
   json += "\"";
   json += ",\"wxHasKey\":";
   json += String(strlen(weatherApiKey) > 0 ? "true" : "false");
+  // Social tiles. The API key is never sent back to the browser - only whether
+  // one is stored - the same way the weather key is handled.
+  for (int i = 0; i < SOCIAL_COUNT; i++) {
+    json += ",\"soc";
+    json += String(i);
+    json += "Handle\":\"";
+    json += jsonEscape(String(social[i].handle));
+    json += "\"";
+    json += ",\"soc";
+    json += String(i);
+    json += "ShowName\":";
+    json += (social[i].showName ? "true" : "false");
+    json += ",\"soc";
+    json += String(i);
+    json += "HasKey\":";
+    json += String(social[i].apiKey[0] ? "true" : "false");
+    json += ",\"soc";
+    json += String(i);
+    json += "KeyLen\":";
+    json += String(strlen(social[i].apiKey));
+    json += ",\"soc";
+    json += String(i);
+    json += "Count\":";
+    json += String(social[i].count);
+    json += ",\"soc";
+    json += String(i);
+    json += "Valid\":";
+    json += String(social[i].valid ? "true" : "false");
+  }
+  json += ",\"iconSelYoutube\":";
+  json += String(iconSelYoutube);
   json += ",\"currencyBase\":\"";
   json += String(currencyBase);
   json += "\"";
@@ -14242,6 +8355,27 @@ void handleState() {
   json += "\"";
   json += ",\"currencyCompare\":";
   json += String(currencyCompareEnabled ? "true" : "false");
+  json += ",\"liveHl\":";
+  json += String(liveTileHighlight ? "true" : "false");
+  json += ",\"uiDark\":";
+  json += String(webUiDark ? "true" : "false");
+  json += ",\"uiLang\":\"";
+  json += String(webUiLang);
+  json += "\"";
+  json += ",\"showGrayed\":";
+  json += String(showGrayedContent ? "true" : "false");
+  json += ",\"autoSleep\":";
+  json += String(autoSleepOn ? "true" : "false");
+  json += ",\"autoSleepSec\":";
+  json += String(autoSleepSec);
+  json += ",\"sleeping\":";
+  json += String(sleepActive ? "true" : "false");
+  json += ",\"tileHidden\":";
+  json += String(tileHiddenMask);
+  json += ",\"prioHidden\":";
+  json += String(prioHiddenMask);
+  json += ",\"webEnabled\":";
+  json += String(webAccessEnabled ? "true" : "false");
   json += ",\"notifEnabled\":";
   json += String(notifEnabled ? "true" : "false");
   json += ",\"ets2Enabled\":";
@@ -14271,6 +8405,10 @@ void handleState() {
   json += String(hideIconPressure ? "true" : "false");
   json += ",\"hideIconCurrency\":";
   json += String(hideIconCurrency ? "true" : "false");
+  json += ",\"hideIconYoutube\":";
+  json += String(hideIconYoutube ? "true" : "false");
+  json += ",\"hideIconWebAccess\":";
+  json += String(hideIconWebAccess ? "true" : "false");
   json += ",\"hideIconIp\":";
   json += String(hideIconIp ? "true" : "false");
   json += ",\"npAdaptiveIcon\":";
@@ -14327,8 +8465,20 @@ void handleState() {
   json += String(scrollTypeStopwatch);
   json += ",\"scrollTypeCurrency\":";
   json += String(scrollTypeCurrency);
+  json += ",\"scrollTypeYoutube\":";
+  json += String(scrollTypeYoutube);
+  json += ",\"scrollTypeWebAccess\":";
+  json += String(scrollTypeWebAccess);
   json += ",\"scrollTypeTimer\":";
   json += String(scrollTypeTimer);
+  json += ",\"scrollSpeed\":";
+  json += String(scrollSpeed);
+  for (int i = 0; i < SCROLL_SPEED_COUNT; i++) {
+    json += ",\"scrollSpeed";
+    json += SPD_KEYS[i];
+    json += "\":";
+    json += String(scrollSpeedTile[i]);
+  }
   json += ",\"scrollTypeIp\":";
   json += String(scrollTypeIp);
   json += ",\"fontType\":";
@@ -14351,6 +8501,10 @@ void handleState() {
   json += String(fontTypeStopwatch);
   json += ",\"fontTypeCurrency\":";
   json += String(fontTypeCurrency);
+  json += ",\"fontTypeYoutube\":";
+  json += String(fontTypeYoutube);
+  json += ",\"fontTypeWebAccess\":";
+  json += String(fontTypeWebAccess);
   json += ",\"fontTypeTimer\":";
   json += String(fontTypeTimer);
   json += ",\"fontTypeIp\":";
@@ -14377,6 +8531,12 @@ void handleState() {
   json += String(tileTransSs);
   json += ",\"tileTransCurr\":";
   json += String(tileTransCurr);
+  json += ",\"tileTransYt\":";
+  json += String(tileTransYt);
+  json += ",\"tileTransHw\":";
+  json += String(tileTransHw);
+  json += ",\"tileTransWeb\":";
+  json += String(tileTransWeb);
   json += ",\"tileTransNotif\":";
   json += String(tileTransNotif);
   json += ",\"tileTransEts2\":";
@@ -14385,16 +8545,44 @@ void handleState() {
   json += String(tileTransSw);
   json += ",\"tileTransTmr\":";
   json += String(tileTransTmr);
+  json += ",\"tileTransAlarm\":";
+  json += String(tileTransAlarm);
   json += ",\"tileTransIp\":";
   json += String(tileTransIp);
   json += ",\"tileTransC2P\":";
   json += String(tileTransC2P);
   json += ",\"tileTransP2C\":";
   json += String(tileTransP2C);
+  json += ",\"tileTransSpd\":";
+  json += String(tileTransSpeed);
+  for (int i = 0; i < TRSPD_COUNT; i++) {
+    json += ",\"tileTransSpd";
+    json += TRSPD_KEYS[i];
+    json += "\":";
+    json += String(tileTransSpd[i]);
+  }
   json += ",\"timerDurationSec\":";
   json += String(timerDurationSec);
   json += ",\"timerPreset\":";
   json += String(timerPreset);
+  json += ",\"alarms\":[";
+  for (int i = 0; i < ALARM_COUNT; i++) {
+    if (i > 0) json += ",";
+    json += "{\"h\":";
+    json += String(alarms[i].hour);
+    json += ",\"m\":";
+    json += String(alarms[i].minute);
+    json += ",\"d\":";
+    json += String(alarms[i].days);
+    json += ",\"en\":";
+    json += (alarms[i].enabled ? "true" : "false");
+    json += ",\"p\":";
+    json += (alarms[i].present ? "true" : "false");
+    json += ",\"tone\":\"";
+    json += jsonEscape(String(alarms[i].tone));
+    json += "\"}";
+  }
+  json += "]";
   json += ",\"pressureHpa\":";
   json += String((int)round(lastPressureHpa));
   json += ",\"pressureTrend\":";
@@ -14417,6 +8605,9 @@ void handleState() {
   json += ",\"evSndWifi\":\"";
   json += jsonEscape(String(eventSoundWifi));
   json += "\"";
+  json += ",\"evSndWeb\":\"";
+  json += jsonEscape(String(eventSoundWeb));
+  json += "\"";
   json += ",\"evSndNotif\":\"";
   json += jsonEscape(String(eventSoundNotif));
   json += "\"";
@@ -14433,13 +8624,512 @@ void handleState() {
   json += String(touchTapAction);
   json += ",\"touchDoubleTapAction\":";
   json += String(touchDoubleTapAction);
+  json += ",\"uiShape\":";
+  json += String(webUiShape);
+  json += ",\"uiColors\":\"";
+  json += String(webUiColors);
+  json += "\"";
   json += ",\"accentColor\":\"";
   json += jsonEscape(String(accentColor));
   json += "\"";
   json += ",\"ssAnim\":";
   json += String(ssAnimSelected);
   json += "}";
-  server.send(200, "application/json", json);
+  uint32_t _stBuild = micros() - _st0;
+  if (_stBuild > hwStateBuildUs) hwStateBuildUs = _stBuild;
+  json.end();
+  { uint32_t d = micros() - _st0; if (d > hwStateUs) hwStateUs = d; }
+  // Headers are already on the wire by this point, so a truncated body cannot be
+  // turned into an error status - but it can at least be reported instead of
+  // looking like an unexplained portal failure.
+  if (json.truncated) {
+    Serial.printf("[state] response truncated - out of memory (free heap %u, largest block %u)\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  }
+}
+
+// HARDWARE MONITOR
+//
+// On-die temperature. Not every ESP32 variant has a usable internal sensor -
+// the original ESP32 reports a constant 53.33 regardless of reality - so this
+// is gated at compile time on the targets that do, and the reading is then
+// range-checked before being trusted. When it is unavailable the field is
+// reported as absent and the UI drops the gauge, the same way it does for a
+// board with no PSRAM.
+static bool readChipTemp(float& out) {
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2) || \
+    defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+  float t = temperatureRead();
+  if (isnan(t) || t < -40.0f || t > 125.0f) return false;
+  out = t;
+  return true;
+#else
+  (void)out;
+  return false;
+#endif
+}
+
+// Small enough (~380 bytes) to go out in one send(); no need for the chunked
+// path /state uses. Every value here is measured: read straight from the SDK,
+// or counted by hwMonitorTick(). Nothing is estimated.
+void handleHwReset() {
+  if (!checkAuth()) return;
+  hwResetPeaks();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleHwState() {
+  if (!checkAuth()) return;
+  String j;
+  j.reserve(512);
+  j = "{\"cpuFreqMhz\":";
+  j += String(ESP.getCpuFreqMHz());
+  j += ",\"cores\":";
+  j += String(ESP.getChipCores());
+  j += ",\"chip\":\"";
+  j += String(ESP.getChipModel());
+  j += "\"";
+  j += ",\"loopsPerSec\":";
+  j += String(hwLoopsPerSec);
+  j += ",\"loopMaxUs\":";
+  j += String(hwLoopMaxUsLast);
+  j += ",\"loopMaxUsEver\":";
+  j += String(hwLoopMaxUsEver);
+  j += ",\"httpMaxUs\":";
+  j += String(hwHttpMaxUs);
+  j += ",\"httpMaxUri\":\"";
+  j += jsonEscape(String(hwHttpMaxUri));
+  j += "\"";
+  j += ",\"pageUs\":";
+  j += String(hwPageUs);
+  j += ",\"stateUs\":";
+  j += String(hwStateUs);
+  j += ",\"stateBuildUs\":";
+  j += String(hwStateBuildUs);
+  j += ",\"pageFull\":";
+  j += String(hwPageFull);
+  j += ",\"page304\":";
+  j += String(hwPage304);
+  j += ",\"heapFree\":";
+  j += String(ESP.getFreeHeap());
+  j += ",\"heapSize\":";
+  j += String(ESP.getHeapSize());
+  j += ",\"heapMinFree\":";
+  j += String(ESP.getMinFreeHeap());
+  j += ",\"heapMaxAlloc\":";
+  j += String(ESP.getMaxAllocHeap());
+  j += ",\"psramSize\":";
+  j += String(ESP.getPsramSize());
+  j += ",\"psramFree\":";
+  j += String(ESP.getFreePsram());
+  j += ",\"sketchSize\":";
+  j += String(ESP.getSketchSize());
+  j += ",\"sketchFree\":";
+  j += String(ESP.getFreeSketchSpace());
+  j += ",\"flashSize\":";
+  j += String(ESP.getFlashChipSize());
+  j += ",\"uptime\":";
+  j += String(millis() / 1000);
+  float chipTempC = 0.0f;
+  bool hasTemp = readChipTemp(chipTempC);
+  j += ",\"hasTemp\":";
+  j += String(hasTemp ? "true" : "false");
+  j += ",\"tempC\":";
+  j += String(hasTemp ? chipTempC : 0.0f, 1);
+  j += ",\"tempUnit\":";
+  j += String(tempUnit);
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+// BACKUP AND RESTORE
+//
+// There is no single existing endpoint that accepts a full settings object,
+// so this handler mirrors the field-by-field approach already used by
+// handleSettings()/loadSettings()/saveSettings() - it sets the same globals
+// those functions use, then reuses saveSettings() to persist everything in
+// one go instead of writing to Preferences directly. Fields that /state
+// (and therefore a backup produced by the web UI) never exposes - wifi
+// credentials, auth credentials, the weather API key - are simply absent
+// from the payload and are left untouched here as well.
+void handleBackupRestore() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"Lipseste corpul cererii\"}");
+    return;
+  }
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err || !doc.is<JsonObject>()) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"JSON invalid\"}");
+    return;
+  }
+  JsonObject s = doc.as<JsonObject>();
+
+  if (s.containsKey("buzzer"))        buzzerOn     = s["buzzer"].as<bool>();
+  if (s.containsKey("buzzerVolume")) {
+    int v = s["buzzerVolume"].as<int>();
+    if (v >= 0 && v <= 100) buzzerVolume = buzzVolNotif = buzzVolAuto = buzzVolAlarm = buzzVolTouch = (uint8_t)v;
+  }
+  // A backup from before the categories carries only the one volume, set above.
+  if (s.containsKey("buzzerVolNotif")) { int v = s["buzzerVolNotif"].as<int>(); if (v >= 0 && v <= 100) buzzVolNotif = (uint8_t)v; }
+  if (s.containsKey("buzzerVolAuto"))  { int v = s["buzzerVolAuto"].as<int>();  if (v >= 0 && v <= 100) buzzVolAuto  = (uint8_t)v; }
+  if (s.containsKey("buzzerVolAlarm")) { int v = s["buzzerVolAlarm"].as<int>(); if (v >= 0 && v <= 100) buzzVolAlarm = (uint8_t)v; }
+  if (s.containsKey("buzzerVolTouch")) { int v = s["buzzerVolTouch"].as<int>(); if (v >= 0 && v <= 100) buzzVolTouch = (uint8_t)v; }
+  if (s.containsKey("buzzerPreset")) {
+    const char* v = s["buzzerPreset"] | "";
+    if (strlen(v) > 0) strncpy(buzzerPreset, v, sizeof(buzzerPreset) - 1), buzzerPreset[sizeof(buzzerPreset) - 1] = '\0';
+  }
+
+  if (s.containsKey("items") && s["items"].is<JsonArray>()) {
+    JsonArray arr = s["items"];
+    for (JsonObject it : arr) {
+      if (!it.containsKey("id")) continue;
+      uint8_t id = it["id"].as<uint8_t>();
+      for (int i = 0; i < NUM_ITEMS; i++) {
+        if (items[i].id == id) {
+          if (it.containsKey("enabled")) items[i].enabled = it["enabled"].as<bool>();
+          if (it.containsKey("dur")) {
+            int d = it["dur"].as<int>();
+            if (d > 0 && d <= 65535) items[i].durationSec = (uint16_t)d;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (s.containsKey("bright")) {
+    int v = s["bright"].as<int>();
+    if (v >= 0 && v <= 255) curBrightness = (uint8_t)v;
+  }
+  if (s.containsKey("dimAuto"))  dimAutoOn = s["dimAuto"].as<bool>();
+  if (s.containsKey("dimFrom")) {
+    const char* v = s["dimFrom"] | "";
+    int h, m;
+    if (sscanf(v, "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) { dimFromH = h; dimFromM = m; }
+  }
+  if (s.containsKey("dimTo")) {
+    const char* v = s["dimTo"] | "";
+    int h, m;
+    if (sscanf(v, "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) { dimToH = h; dimToM = m; }
+  }
+  if (s.containsKey("dimLevel")) {
+    int v = s["dimLevel"].as<int>();
+    if (v >= 0 && v <= 255) dimLevel = (uint8_t)v;
+  }
+
+  if (s.containsKey("wxPreset"))   { int v = s["wxPreset"].as<int>();   if (v >= 1 && v <= WX_SHOW_ALL) wxPreset = (uint8_t)v; }
+  if (s.containsKey("tempunit"))   { int v = s["tempunit"].as<int>();   if (v == 0 || v == 1) tempUnit = (uint8_t)v; }
+  if (s.containsKey("hourLeadingZero")) hourLeadingZero = s["hourLeadingZero"].as<bool>();
+  if (s.containsKey("netTimeSync")) netTimeSync = s["netTimeSync"].as<bool>();
+  if (s.containsKey("showGrayed")) showGrayedContent = s["showGrayed"].as<bool>();
+  if (s.containsKey("autoSleep")) autoSleepOn = s["autoSleep"].as<bool>();
+  if (s.containsKey("autoSleepSec")) {
+    long v = s["autoSleepSec"].as<long>();
+    if (v >= 60 && v <= 86400) autoSleepSec = (uint32_t)v;
+  }
+  if (s.containsKey("liveHl")) liveTileHighlight = s["liveHl"].as<bool>();
+  if (s.containsKey("uiDark")) webUiDark = s["uiDark"].as<bool>();
+  if (s.containsKey("uiLang")) {
+    const char* v = s["uiLang"] | "";
+    if (strcmp(v, "en") == 0 || strcmp(v, "ro") == 0) strcpy(webUiLang, v);
+  }
+  // Restored before the item list below, so applyTileHiddenMask() at the end of
+  // this function judges the masks against the items the backup actually holds.
+  if (s.containsKey("tileHidden")) {
+    long v = s["tileHidden"].as<long>();
+    if (v >= 0 && v <= 0xFFFF) tileHiddenMask = (uint16_t)v;
+  }
+  if (s.containsKey("prioHidden")) {
+    long v = s["prioHidden"].as<long>();
+    if (v >= 0 && v <= 0xFF) prioHiddenMask = (uint8_t)v;
+  }
+  // Spelled out rather than via restoreRange(): that lambda is declared
+  // further down this function, well after this line.
+  if (s.containsKey("defaultStartMode")) {
+    int v = s["defaultStartMode"].as<int>();
+    if (v >= START_MODE_WIFI && v <= START_MODE_AP) defaultStartMode = (uint8_t)v;
+  }
+  if (s.containsKey("hourformat")) { int v = s["hourformat"].as<int>(); if (v == 0 || v == 1) hourFormat = (uint8_t)v; }
+  if (s.containsKey("hwFormat"))   { int v = s["hwFormat"].as<int>();   if (v == 0 || v == 1) hwFormat = (uint8_t)v; }
+  if (s.containsKey("hwLeadZero")) hwLeadZero = s["hwLeadZero"].as<bool>();
+  if (s.containsKey("hwBarMode"))  { int v = s["hwBarMode"].as<int>();  if (v == 0 || v == 1) hwBarMode = (uint8_t)v; }
+  if (s.containsKey("hwBarPos"))   { int v = s["hwBarPos"].as<int>();   if (v == 0 || v == 1) hwBarPos = (uint8_t)v; }
+  if (s.containsKey("hwSwap"))     hwSwap = s["hwSwap"].as<bool>();
+  if (s.containsKey("dateformat")) { int v = s["dateformat"].as<int>(); if (v >= 0 && v <= 5) dateFormat = (uint8_t)v; }
+  if (s.containsKey("datelang"))   { int v = s["datelang"].as<int>();   if (v >= 0) dateLang = (uint8_t)v; }
+  if (s.containsKey("customdatefmt")) {
+    const char* v = s["customdatefmt"] | "";
+    strncpy(customDateFmt, v, sizeof(customDateFmt) - 1); customDateFmt[sizeof(customDateFmt) - 1] = '\0';
+  }
+
+  if (s.containsKey("wxCity")) {
+    const char* v = s["wxCity"] | "";
+    strncpy(weatherCity, v, sizeof(weatherCity) - 1); weatherCity[sizeof(weatherCity) - 1] = '\0';
+  }
+  if (s.containsKey("wxLang")) {
+    const char* v = s["wxLang"] | "";
+    strncpy(weatherLang, v, sizeof(weatherLang) - 1); weatherLang[sizeof(weatherLang) - 1] = '\0';
+  }
+  // Notă: cheia API meteo (weatherApiKey) nu e inclusă în /state din motive
+  // de securitate, deci nu poate fi nici restaurată - trebuie reintrodusa manual.
+
+  if (s.containsKey("currencyBase")) {
+    const char* v = s["currencyBase"] | "";
+    if (strlen(v) > 0 && strlen(v) < sizeof(currencyBase)) strcpy(currencyBase, v);
+  }
+  if (s.containsKey("currencyQuote")) {
+    const char* v = s["currencyQuote"] | "";
+    if (strlen(v) > 0 && strlen(v) < sizeof(currencyQuote)) strcpy(currencyQuote, v);
+  }
+  if (s.containsKey("currencyCompare")) currencyCompareEnabled = s["currencyCompare"].as<bool>();
+
+  if (s.containsKey("notifEnabled"))      notifEnabled = s["notifEnabled"].as<bool>();
+  if (s.containsKey("webEnabled"))        webAccessEnabled = s["webEnabled"].as<bool>();
+  if (s.containsKey("ets2Enabled"))       ets2Enabled = s["ets2Enabled"].as<bool>();
+  if (s.containsKey("ets2OrderFirst"))    ets2OrderFirst = s["ets2OrderFirst"].as<bool>();
+  if (s.containsKey("nowPlayingIsPriority")) nowPlayingIsPriority = s["nowPlayingIsPriority"].as<bool>();
+
+  if (s.containsKey("priorityOrder")) {
+    String ord = s["priorityOrder"].as<String>();
+    uint8_t newOrder[NUM_PRIORITY_IDS];
+    int count = 0;
+    bool sawNowPlaying = false, sawStopwatch = false, sawTimer = false, sawWeb = false, sawAlarm = false;
+    int startIdx = 0;
+    for (int i = 0; i <= (int)ord.length() && count < NUM_PRIORITY_IDS; i++) {
+      if (i == (int)ord.length() || ord[i] == ',') {
+        String tok = ord.substring(startIdx, i);
+        tok.trim();
+        if (tok == "notif")           newOrder[count++] = PRIORITY_ID_NOTIF;
+        else if (tok == "ets2")       newOrder[count++] = PRIORITY_ID_ETS2;
+        else if (tok == "nowplaying") { newOrder[count++] = PRIORITY_ID_NOWPLAYING; sawNowPlaying = true; }
+        else if (tok == "stopwatch")  { newOrder[count++] = PRIORITY_ID_STOPWATCH; sawStopwatch = true; }
+        else if (tok == "timer")      { newOrder[count++] = PRIORITY_ID_TIMER; sawTimer = true; }
+        else if (tok == "webaccess")  { newOrder[count++] = PRIORITY_ID_WEB; sawWeb = true; }
+        else if (tok == "alarm")      { newOrder[count++] = PRIORITY_ID_ALARM; sawAlarm = true; }
+        startIdx = i + 1;
+      }
+    }
+    // Restored from a backup taken before the alarm existed. It goes back in at
+    // the top, not the bottom, for the reason the default order has it there.
+    if (!sawAlarm && count < NUM_PRIORITY_IDS) {
+      for (int i = count; i > 0; i--) newOrder[i] = newOrder[i - 1];
+      newOrder[0] = PRIORITY_ID_ALARM;
+      count++;
+    }
+    if (!sawNowPlaying && count < NUM_PRIORITY_IDS) newOrder[count++] = PRIORITY_ID_NOWPLAYING;
+    if (!sawStopwatch  && count < NUM_PRIORITY_IDS) newOrder[count++] = PRIORITY_ID_STOPWATCH;
+    if (!sawTimer      && count < NUM_PRIORITY_IDS) newOrder[count++] = PRIORITY_ID_TIMER;
+    if (!sawWeb        && count < NUM_PRIORITY_IDS) newOrder[count++] = PRIORITY_ID_WEB;
+    if (count == NUM_PRIORITY_IDS) {
+      for (int i = 0; i < NUM_PRIORITY_IDS; i++) priorityOrder[i] = newOrder[i];
+    }
+  }
+
+  if (s.containsKey("hideIcons"))           hideTileIcons      = s["hideIcons"].as<bool>();
+  if (s.containsKey("hideIconDate"))        hideIconDate       = s["hideIconDate"].as<bool>();
+  if (s.containsKey("hideIconTemp"))        hideIconTemp       = s["hideIconTemp"].as<bool>();
+  if (s.containsKey("hideIconReminder"))    hideIconReminder   = s["hideIconReminder"].as<bool>();
+  if (s.containsKey("hideIconWeather"))     hideIconWeather    = s["hideIconWeather"].as<bool>();
+  if (s.containsKey("hideIconNotif"))       hideIconNotif      = s["hideIconNotif"].as<bool>();
+  if (s.containsKey("hideIconNowPlaying"))  hideIconNowPlaying = s["hideIconNowPlaying"].as<bool>();
+  if (s.containsKey("hideIconPressure"))    hideIconPressure   = s["hideIconPressure"].as<bool>();
+  if (s.containsKey("hideIconCurrency"))    hideIconCurrency   = s["hideIconCurrency"].as<bool>();
+  if (s.containsKey("hideIconYoutube"))     hideIconYoutube    = s["hideIconYoutube"].as<bool>();
+  if (s.containsKey("hideIconWebAccess"))   hideIconWebAccess  = s["hideIconWebAccess"].as<bool>();
+  if (s.containsKey("hideIconIp"))          hideIconIp         = s["hideIconIp"].as<bool>();
+  if (s.containsKey("npAdaptiveIcon"))      npAdaptiveIcon     = s["npAdaptiveIcon"].as<bool>();
+
+  auto restoreIcon = [&](const char* key, uint8_t &target) {
+    if (s.containsKey(key)) {
+      int v = s[key].as<int>();
+      if (v >= 0 && v <= (int)ICON_CATALOG_COUNT) target = (uint8_t)v;
+    }
+  };
+  restoreIcon("iconSelDate",     iconSelDate);
+  restoreIcon("iconSelTemp",     iconSelTemp);
+  restoreIcon("iconSelReminder", iconSelReminder);
+  restoreIcon("iconSelNotif",    iconSelNotif);
+  restoreIcon("iconSelNpMusic",  iconSelNpMusic);
+  restoreIcon("iconSelNpVideo",  iconSelNpVideo);
+  restoreIcon("iconSelPressure", iconSelPressure);
+  restoreIcon("iconSelCurrency", iconSelCurrency);
+  restoreIcon("iconSelIp",       iconSelIp);
+  restoreIcon("iconWxSunny",     iconWxSunny);
+  restoreIcon("iconWxCloud",     iconWxCloud);
+  restoreIcon("iconWxRain",      iconWxRain);
+  restoreIcon("iconWxStorm",     iconWxStorm);
+  restoreIcon("iconWxSnow",      iconWxSnow);
+  restoreIcon("iconWxWind",      iconWxWind);
+  restoreIcon("iconWxNight",     iconWxNight);
+
+  auto restoreRange = [&](const char* key, uint8_t &target, int lo, int hi) {
+    if (s.containsKey(key)) {
+      int v = s[key].as<int>();
+      if (v >= lo && v <= hi) target = (uint8_t)v;
+    }
+  };
+  restoreRange("scrollType",          scrollType,           0, 3);
+  restoreRange("scrollTypeDate",      scrollTypeDate,       0, 3);
+  restoreRange("scrollTypeTemp",      scrollTypeTemp,       0, 3);
+  restoreRange("scrollTypeReminder",  scrollTypeReminder,   0, 3);
+  restoreRange("scrollTypeWeather",   scrollTypeWeather,    0, 3);
+  restoreRange("scrollTypeNotif",     scrollTypeNotif,      0, 3);
+  restoreRange("scrollTypeNowPlaying",scrollTypeNowPlaying, 0, 3);
+  restoreRange("scrollTypePressure",  scrollTypePressure,   0, 3);
+  restoreRange("scrollTypeStopwatch", scrollTypeStopwatch,  0, 3);
+  restoreRange("scrollTypeCurrency",  scrollTypeCurrency,   0, 3);
+  restoreRange("scrollTypeYoutube",   scrollTypeYoutube,    0, 3);
+  restoreRange("scrollTypeWebAccess", scrollTypeWebAccess,  0, 3);
+  restoreRange("scrollTypeTimer",     scrollTypeTimer,      0, 3);
+  restoreRange("scrollTypeIp",        scrollTypeIp,         0, 3);
+  restoreRange("scrollSpeed", scrollSpeed, SCROLL_SPEED_MIN, SCROLL_SPEED_MAX);
+  for (int i = 0; i < SCROLL_SPEED_COUNT; i++) {
+    String k = String("scrollSpeed") + SPD_KEYS[i];
+    if (s.containsKey(k)) {
+      int v = s[k].as<int>();
+      if (v >= SCROLL_SPEED_MIN && v <= SCROLL_SPEED_MAX) scrollSpeedTile[i] = (uint8_t)v;
+    }
+  }
+
+  restoreRange("fontType",         fontType,           0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeDate",     fontTypeDate,       0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeTemp",     fontTypeTemp,       0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeReminder", fontTypeReminder,   0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeWeather",  fontTypeWeather,    0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeNotif",    fontTypeNotif,      0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeNowPlaying",fontTypeNowPlaying,0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypePressure", fontTypePressure,   0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeStopwatch",fontTypeStopwatch,  0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeCurrency", fontTypeCurrency,   0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeYoutube",  fontTypeYoutube,    0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeWebAccess", fontTypeWebAccess, 0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeTimer",    fontTypeTimer,      0, FONT_MODE_COUNT - 1);
+  restoreRange("fontTypeIp",       fontTypeIp,         0, FONT_MODE_COUNT - 1);
+
+  restoreRange("tileTransGlobal", tileTransGlobal, 0, 255);
+  restoreRange("tileTransHour",   tileTransHour,   0, 255);
+  restoreRange("tileTransDate",   tileTransDate,   0, 255);
+  restoreRange("tileTransTemp",   tileTransTemp,   0, 255);
+  restoreRange("tileTransNp",     tileTransNp,     0, 255);
+  restoreRange("tileTransWx",     tileTransWx,     0, 255);
+  restoreRange("tileTransRem",    tileTransRem,    0, 255);
+  restoreRange("tileTransCanvas", tileTransCanvas, 0, 255);
+  restoreRange("tileTransPress",  tileTransPress,  0, 255);
+  restoreRange("tileTransSs",     tileTransSs,     0, 255);
+  restoreRange("tileTransCurr",   tileTransCurr,   0, 255);
+  restoreRange("tileTransYt",     tileTransYt,     0, 255);
+  restoreRange("tileTransHw",     tileTransHw,     0, 255);
+  restoreRange("tileTransWeb",    tileTransWeb,    0, 255);
+  restoreRange("tileTransNotif",  tileTransNotif,  0, 255);
+  restoreRange("tileTransEts2",   tileTransEts2,   0, 255);
+  restoreRange("tileTransSw",     tileTransSw,     0, 255);
+  restoreRange("tileTransTmr",    tileTransTmr,    0, 255);
+  restoreRange("tileTransAlarm",  tileTransAlarm,  0, 255);
+  restoreRange("tileTransIp",     tileTransIp,     0, 255);
+  restoreRange("tileTransC2P",    tileTransC2P,    0, 255);
+  restoreRange("tileTransP2C",    tileTransP2C,    0, 255);
+  restoreRange("tileTransSpd",    tileTransSpeed,  TRSPD_MIN, TRSPD_MAX);
+  for (int i = 0; i < TRSPD_COUNT; i++) {
+    String k = String("tileTransSpd") + TRSPD_KEYS[i];
+    if (s.containsKey(k)) {
+      int v = s[k].as<int>();
+      if (v >= TRSPD_MIN && v <= TRSPD_MAX) tileTransSpd[i] = (uint8_t)v;
+    }
+  }
+
+  if (s.containsKey("timerDurationSec")) {
+    long v = s["timerDurationSec"].as<long>();
+    if (v > 0 && v <= 359999) timerDurationSec = (uint32_t)v;
+  }
+  if (s.containsKey("timerPreset")) timerPreset = s["timerPreset"].as<uint8_t>();
+
+  // Every field is range-checked on the way back in: a backup is a file the user
+  // can edit, and an hour of 40 would be an alarm that never rings again.
+  if (s.containsKey("alarms") && s["alarms"].is<JsonArray>()) {
+    JsonArray arr = s["alarms"];
+    int i = 0;
+    for (JsonObject a : arr) {
+      if (i >= ALARM_COUNT) break;
+      int h = a["h"] | -1, m = a["m"] | -1, d = a["d"] | -1;
+      if (h >= 0 && h <= 23)  alarms[i].hour   = (uint8_t)h;
+      if (m >= 0 && m <= 59)  alarms[i].minute = (uint8_t)m;
+      if (d >= 0 && d <= 127) alarms[i].days   = (uint8_t)d;
+      if (a.containsKey("en")) alarms[i].enabled = a["en"].as<bool>();
+      // A backup taken before alarms could be added carries no "p"; the alarms
+      // in it are the ones its owner had, so they come back.
+      alarms[i].present = a.containsKey("p") ? a["p"].as<bool>() : alarms[i].enabled;
+      const char* t = a["tone"] | "";
+      if (strlen(t) > 0 && strlen(t) < sizeof(alarms[i].tone)) strcpy(alarms[i].tone, t);
+      i++;
+    }
+  }
+
+  if (s.containsKey("mementoText")) {
+    const char* v = s["mementoText"] | "";
+    strncpy(mementoBuf, v, sizeof(mementoBuf) - 1); mementoBuf[sizeof(mementoBuf) - 1] = '\0';
+  }
+  if (s.containsKey("canvasBmp")) {
+    const char* v = s["canvasBmp"] | "";
+    canvasBitmapFromHex(String(v));
+  }
+
+  if (s.containsKey("evSndTile"))  { const char* v = s["evSndTile"]  | ""; if (strlen(v)) { strncpy(eventSoundTile,  v, sizeof(eventSoundTile)  - 1); eventSoundTile[sizeof(eventSoundTile) - 1]   = '\0'; } }
+  if (s.containsKey("evSndWifi"))  { const char* v = s["evSndWifi"]  | ""; if (strlen(v)) { strncpy(eventSoundWifi,  v, sizeof(eventSoundWifi)  - 1); eventSoundWifi[sizeof(eventSoundWifi) - 1]   = '\0'; } }
+  if (s.containsKey("evSndNotif")) { const char* v = s["evSndNotif"] | ""; if (strlen(v)) { strncpy(eventSoundNotif, v, sizeof(eventSoundNotif) - 1); eventSoundNotif[sizeof(eventSoundNotif) - 1] = '\0'; } }
+  if (s.containsKey("evSndWeb")) { const char* v = s["evSndWeb"] | ""; if (strlen(v)) { strncpy(eventSoundWeb, v, sizeof(eventSoundWeb) - 1); eventSoundWeb[sizeof(eventSoundWeb) - 1] = '\0'; } }
+  if (s.containsKey("evSndEts2"))  { const char* v = s["evSndEts2"]  | ""; if (strlen(v)) { strncpy(eventSoundEts2,  v, sizeof(eventSoundEts2)  - 1); eventSoundEts2[sizeof(eventSoundEts2) - 1]   = '\0'; } }
+  if (s.containsKey("evSndTouch")) { const char* v = s["evSndTouch"] | ""; if (strlen(v)) { strncpy(eventSoundTouch, v, sizeof(eventSoundTouch) - 1); eventSoundTouch[sizeof(eventSoundTouch) - 1] = '\0'; } }
+  if (s.containsKey("evSndTimer")) { const char* v = s["evSndTimer"] | ""; if (strlen(v)) { strncpy(eventSoundTimer, v, sizeof(eventSoundTimer) - 1); eventSoundTimer[sizeof(eventSoundTimer) - 1] = '\0'; } }
+
+  if (s.containsKey("touchTapAction"))       touchTapAction       = s["touchTapAction"].as<uint8_t>();
+  if (s.containsKey("touchDoubleTapAction")) touchDoubleTapAction = s["touchDoubleTapAction"].as<uint8_t>();
+
+  if (s.containsKey("accentColor")) {
+    const char* v = s["accentColor"] | "";
+    if (strlen(v) >= 4 && strlen(v) < sizeof(accentColor) && v[0] == '#') strcpy(accentColor, v);
+  }
+  if (s.containsKey("uiShape")) {
+    uint8_t v = s["uiShape"].as<uint8_t>();
+    if (v <= 3) webUiShape = v;
+  }
+  if (s.containsKey("uiColors")) {
+    const char* v = s["uiColors"] | "";
+    if (isValidUiColors(String(v))) strcpy(webUiColors, v);
+  }
+  if (s.containsKey("ssAnim")) ssAnimSelected = s["ssAnim"].as<uint8_t>();
+
+  // The item list and the masks both came out of the same backup; this is where
+  // they are finally judged against each other.
+  applyTileHiddenMask();
+
+  saveSettings();
+
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(500);
+  ESP.restart();
+}
+
+// FACTORY RESET
+//
+// Wipes every Preferences namespace the project uses ("settings", "wifi",
+// "auth", "apcfg") so the device comes back up exactly as it would out of
+// the box: no saved WiFi network -> setup() falls through to
+// startProvisionMode() on the next boot, and loadAuth()/loadSettings() will
+// re-populate their in-memory defaults from the (now empty) namespaces.
+void handleFactoryReset() {
+  if (!checkAuth()) return;
+  const char* namespacesToWipe[] = { "settings", "wifi", "auth", "apcfg" };
+  for (size_t i = 0; i < sizeof(namespacesToWipe) / sizeof(namespacesToWipe[0]); i++) {
+    prefs.begin(namespacesToWipe[i], false);
+    prefs.clear();
+    prefs.end();
+  }
+  saveSettingsCancel();
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(500);
+  ESP.restart();
 }
 
 // MEMENTO HANDLER
@@ -14451,7 +9141,7 @@ void handleMementoSett() {
 
     if (txt.length() > 120) txt = txt.substring(0, 120);
     txt.toCharArray(mementoBuf, sizeof(mementoBuf));
-    saveSettings();
+    saveSettingsDeferred();
 
     if (items[currentSlot].id == ITEM_MEMENTO) mementoInit();
     server.send(200, "text/plain", "OK");
@@ -14483,9 +9173,19 @@ void handleCanvasSett() {
 void handleWeatherSett() {
   if (!checkAuth()) return;
   bool changed = false;
-  if (server.hasArg("apikey") && server.arg("apikey").length() > 0) {
-    server.arg("apikey").toCharArray(weatherApiKey, sizeof(weatherApiKey));
-    changed = true;
+  if (server.hasArg("apikey")) {
+    String k = server.arg("apikey");
+    k.trim();
+    if (k.length() > 0) {
+      // Refuse loudly rather than store something that will silently fail every
+      // fetch from here on.
+      if (!wxKeyLooksValid(k)) {
+        server.send(400, "text/plain", "Cheie API invalida");
+        return;
+      }
+      k.toCharArray(weatherApiKey, sizeof(weatherApiKey));
+      changed = true;
+    }
   }
   if (server.hasArg("lat") && server.hasArg("lon") && server.hasArg("name")) {
     weatherLat = server.arg("lat").toFloat();
@@ -14493,8 +9193,18 @@ void handleWeatherSett() {
     server.arg("name").toCharArray(weatherCity, sizeof(weatherCity));
     changed = true;
   }
+  if (server.hasArg("preset")) {
+    int p = server.arg("preset").toInt();
+    if (p >= 1 && p <= WX_SHOW_ALL) {
+      wxPreset = (uint8_t)p;
+      changed = true;
+      // Redraw straight away if the tile is the one on screen, so the change is
+      // visible without waiting for the next fetch or slot.
+      if (items[currentSlot].id == ITEM_WEATHER) weatherInit();
+    }
+  }
   if (changed) {
-    saveSettings();
+    saveSettingsDeferred();
     lastWeatherFetch = 0;
   }
   server.send(200, "text/plain", "OK");
@@ -14566,7 +9276,7 @@ void handleWxLang() {
     l.trim();
     if (l.length() >= 2 && l.length() <= 7) {
       l.toCharArray(weatherLang, sizeof(weatherLang));
-      saveSettings();
+      saveSettingsDeferred();
       lastWeatherFetch = 0;
       server.send(200, "text/plain", "OK");
       return;
@@ -14598,6 +9308,55 @@ void handleWeatherKey() {
 
 // CURRENCY STANDARDS HANDLERS
 
+
+// Settings for one social counter tile. The key is only overwritten when a new
+// one is actually supplied, so re-saving the dialog without retyping it does
+// not wipe a stored key.
+void handleSocialKey() {
+  if (!checkAuth()) return;
+  int i = server.hasArg("i") ? server.arg("i").toInt() : 0;
+  if (i < 0 || i >= SOCIAL_COUNT) {
+    server.send(400, "text/plain", "Index invalid");
+    return;
+  }
+  server.send(200, "application/json",
+              String("{\"key\":\"") + jsonEscape(String(social[i].apiKey)) + "\"}");
+}
+
+void handleSocialSett() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("i")) {
+    server.send(400, "text/plain", "Lipseste i");
+    return;
+  }
+  int i = server.arg("i").toInt();
+  if (i < 0 || i >= SOCIAL_COUNT) {
+    server.send(400, "text/plain", "Index invalid");
+    return;
+  }
+  if (server.hasArg("handle")) {
+    String h = server.arg("handle");
+    h.trim();
+    strncpy(social[i].handle, h.c_str(), sizeof(social[i].handle) - 1);
+    social[i].handle[sizeof(social[i].handle) - 1] = '\0';
+  }
+  if (server.hasArg("key")) {
+    String k = server.arg("key");
+    k.trim();
+    if (k.length() > 0) {
+      strncpy(social[i].apiKey, k.c_str(), sizeof(social[i].apiKey) - 1);
+      social[i].apiKey[sizeof(social[i].apiKey) - 1] = '\0';
+    }
+  }
+  if (server.hasArg("clearkey") && server.arg("clearkey") == "1") social[i].apiKey[0] = '\0';
+  if (server.hasArg("showname")) social[i].showName = (server.arg("showname") == "1");
+
+  saveSettingsDeferred();
+  social[i].valid    = false;
+  lastSocialFetch[i] = 0;          // refetch on the next loop pass
+  server.send(200, "text/plain", "OK");
+}
+
 void handleCurrencySett() {
   if (!checkAuth()) return;
   bool changed = false;
@@ -14616,7 +9375,7 @@ void handleCurrencySett() {
     if (q.length() == 3) { q.toCharArray(currencyQuote, sizeof(currencyQuote)); changed = true; }
   }
   if (changed) {
-    saveSettings();
+    saveSettingsDeferred();
     lastCurrencyFetch = 0;
     currencyValid = false;
 
@@ -14636,11 +9395,17 @@ void handleCurrencyState() {
   server.send(200, "application/json", json);
 }
 
+// WHAT COUNTS AS ACTIVITY
+//
+// Both of these are Octoglow Connect talking to the clock, which is the whole
+// reason sleep keeps the network up: something arriving is a reason to light
+// the panel again.
 void handleNowPlaying() {
+  noteActivity();
   if (!checkAuth()) return;
   bool updated = false;
 
-  // Optional playback-source classification from Octoglow Sender: "video"
+  // Optional playback-source classification from Octoglow Connect: "video"
   // or "music" (anything else / missing => treat as music/unknown).
   if (server.hasArg("kind")) {
     npIsVideoSource = (server.arg("kind") == "video");
@@ -14681,7 +9446,7 @@ void handleNowPlaying() {
 void handleNpState() {
   if (!checkAuth()) return;
   String json = "{\"active\":" + String(nowPlayingActive ? "true" : "false") +
-                ",\"text\":\"" + String(nowPlayingBuf) + "\"" +
+                ",\"text\":\"" + jsonEscape(String(nowPlayingBuf)) + "\"" +
                 ",\"npmode\":" + String(npDisplayMode) +
                 ",\"hourformat\":" + String(hourFormat) +
                 ",\"dateformat\":" + String(dateFormat) +
@@ -14700,7 +9465,7 @@ void handleScreensaverSett() {
     uint8_t a = (uint8_t)server.arg("anim").toInt();
     if (a <= SS_ANIM_COUNT) {
       ssAnimSelected = a;
-      saveSettings();
+      saveSettingsDeferred();
 
       if (items[currentSlot].id == ITEM_SCREENSAVER) ssInit();
     }
@@ -14717,7 +9482,7 @@ void handleNpMode() {
     if (m <= 2) {
       npDisplayMode = m;
       rebuildNowPlayingBuf();
-      saveSettings();
+      saveSettingsDeferred();
 
       if (items[currentSlot].id == ITEM_NOW_PLAYING) npInit();
       else if (nowPlayingIsPriority && nowPlayingActive) npInit();
@@ -14731,6 +9496,7 @@ void handleNpMode() {
 // NOTIFICATION HANDLERS
 
 void handleNotification() {
+  noteActivity();
   if (!checkAuth()) return;
   if (!notifEnabled) {
     server.send(200, "text/plain", "DISABLED");
@@ -14756,12 +9522,32 @@ void handleNotification() {
     notifActive = true;
     beginC2PCapture();
     notifInit();
-    finishC2PTransition();
-    nbPlayPreset(eventSoundNotif);
+    finishC2PTransition(tileTransNotif, tileTransSpd[TRSPD_NOTIF]);
+    nbPlayPreset(eventSoundNotif, BZ_CAT_NOTIF);
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste text");
   }
+}
+
+void handleWebToggle() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("enabled")) {
+    server.send(400, "text/plain", "Lipseste enabled");
+    return;
+  }
+  webAccessEnabled = (server.arg("enabled") == "1");
+  if (!webAccessEnabled && webAccessAlertActive) {
+    // Switching it off while its own alert is on screen clears it, rather than
+    // leaving the message stranded until it finishes scrolling.
+    notifActive = false;
+    notifIconOverride = nullptr;
+    webAccessAlertActive = false;
+    notifBuf[0] = '\0';
+    resumeAfterNotif();
+  }
+  saveSettingsDeferred();
+  server.send(200, "text/plain", "OK");
 }
 
 void handleNotifToggle() {
@@ -14771,16 +9557,19 @@ void handleNotifToggle() {
     if (!notifEnabled && notifActive) {
 
       notifActive = false;
+      notifIconOverride = nullptr;
+      webAccessAlertActive = false;
       notifBuf[0] = '\0';
       beginP2CCapture();
       CycleItem& cur = items[currentSlot];
       if (cur.id == ITEM_NOW_PLAYING) npInit();
       else if (cur.id == ITEM_WEATHER) weatherInit();
       else if (cur.id == ITEM_CURRENCY) currencyInit();
+    else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
       else { gLastStaticDrawMs = 0; gStaticDrawDone = false; }
       finishP2CTransition();
     }
-    saveSettings();
+    saveSettingsDeferred();
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste enabled");
@@ -14812,13 +9601,13 @@ void handleEts2Speed() {
       ets2Active = true;
       beginC2PCapture();
       ets2Init();
-      finishC2PTransition();
+      finishC2PTransition(tileTransEts2, tileTransSpd[TRSPD_ETS2]);
     }
 
     if (spd > ETS2_SPEED_LIMIT) {
       if (!ets2SpeedAlertFired) {
         ets2SpeedAlertFired = true;
-        nbPlayPreset(eventSoundEts2);
+        nbPlayPreset(eventSoundEts2, BZ_CAT_AUTO);
       }
     } else {
       ets2SpeedAlertFired = false;
@@ -14843,10 +9632,11 @@ void handleEts2Toggle() {
       if (cur.id == ITEM_NOW_PLAYING) npInit();
       else if (cur.id == ITEM_WEATHER) weatherInit();
       else if (cur.id == ITEM_CURRENCY) currencyInit();
+    else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
       else { gLastStaticDrawMs = 0; gStaticDrawDone = false; }
       finishP2CTransition();
     }
-    saveSettings();
+    saveSettingsDeferred();
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste enabled");
@@ -14865,7 +9655,7 @@ void handleEts2Order() {
   if (!checkAuth()) return;
   if (server.hasArg("first")) {
     ets2OrderFirst = (server.arg("first") == "1");
-    saveSettings();
+    saveSettingsDeferred();
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste first");
@@ -14893,6 +9683,7 @@ void handleSwStop() {
     if (cur.id == ITEM_NOW_PLAYING) npInit();
     else if (cur.id == ITEM_WEATHER) weatherInit();
     else if (cur.id == ITEM_CURRENCY) currencyInit();
+    else if (socialIndexForItem(cur.id) >= 0) socialInit(cur.id);
     else { gLastStaticDrawMs = 0; gStaticDrawDone = false; }
   }
   char txt[16];
@@ -14931,7 +9722,7 @@ void handleTimerSett() {
     uint8_t st = (uint8_t)server.arg("scrollType").toInt();
     if (st <= 3) scrollTypeTimer = st;
   }
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
@@ -14952,6 +9743,103 @@ void handleTimerPause() {
   }
   timerWasActive = false;
   server.send(200, "text/plain", "OK");
+}
+
+// ALARM HANDLERS
+
+void handleAlarmSett() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("idx")) { server.send(400, "text/plain", "Lipseste indexul alarmei"); return; }
+  int idx = server.arg("idx").toInt();
+  if (idx < 0 || idx >= ALARM_COUNT) { server.send(400, "text/plain", "Index invalid"); return; }
+  AlarmCfg& a = alarms[idx];
+  bool wasEnabled = a.enabled;
+  bool timeChanged = false;
+
+  if (server.hasArg("hour")) {
+    int v = server.arg("hour").toInt();
+    if (v < 0 || v > 23) { server.send(400, "text/plain", "Ora invalida"); return; }
+    if ((uint8_t)v != a.hour) timeChanged = true;
+    a.hour = (uint8_t)v;
+  }
+  if (server.hasArg("minute")) {
+    int v = server.arg("minute").toInt();
+    if (v < 0 || v > 59) { server.send(400, "text/plain", "Minut invalid"); return; }
+    if ((uint8_t)v != a.minute) timeChanged = true;
+    a.minute = (uint8_t)v;
+  }
+  if (server.hasArg("days")) {
+    int v = server.arg("days").toInt();
+    if (v < 0 || v > 127) { server.send(400, "text/plain", "Zile invalide"); return; }
+    if ((uint8_t)v != a.days) timeChanged = true;
+    a.days = (uint8_t)v;
+  }
+  if (server.hasArg("enabled")) a.enabled = (server.arg("enabled") == "1");
+  if (server.hasArg("present")) a.present = (server.arg("present") == "1");
+  if (server.hasArg("tone")) {
+    String t = server.arg("tone");
+    if (t.length() > 0 && t.length() < sizeof(a.tone)) t.toCharArray(a.tone, sizeof(a.tone));
+  }
+
+  // The latch has no meaning once the time it was latched against has changed,
+  // and none either for an alarm that was off. Setting it when the new time is
+  // the minute it already is happens on purpose: entering 07:30 while it is
+  // 07:30 should not set the thing off under your fingers. It rings next time.
+  if (timeChanged || (!wasEnabled && a.enabled)) {
+    // A newly added alarm has no history either; the same suppression applies,
+    // so adding one at 07:30 while it is 07:30 does not go off under your hand.
+    alarmFired[idx] = false;
+    struct tm ti;
+    if (readLocalTime(ti) && ti.tm_hour == a.hour && ti.tm_min == a.minute &&
+        (a.days & ALARM_WDAY_BIT(ti.tm_wday))) {
+      alarmFired[idx] = true;
+    }
+  }
+  // Switching off the alarm that is ringing stops it, and so does deleting it.
+  // Changing its tone or its days does not: it is still the alarm that woke you.
+  if (alarmRinging && alarmRingingIdx == idx && (!a.enabled || !a.present)) alarmStopRinging();
+
+  // Alarm tones run for seconds rather than the fraction of a second an event
+  // beep does, so there is a way to hear one before committing to being woken
+  // by it. Never while an alarm is actually ringing - that queue is spoken for.
+  if (server.arg("preview") == "1" && buzzerOn && !alarmRinging) {
+    nbStop();
+    alarmEnqueueTone(a.tone);
+  }
+
+  saveSettingsDeferred();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleAlarmStop() {
+  if (!checkAuth()) return;
+  alarmStopRinging();
+  server.send(200, "text/plain", "OK");
+}
+
+// Polled while the Tile Manager is open, so it stays small. The countdown is
+// computed here rather than in the browser because the alarm fires on this
+// clock, and the phone looking at the page may not be on the same one.
+void handleAlarmState() {
+  if (!checkAuth()) return;
+  int nextIdx = -1;
+  int mins = alarmMinutesUntilNext(&nextIdx);
+  String j = "{\"ringing\":";
+  j += (alarmRinging ? "true" : "false");
+  j += ",\"idx\":";
+  j += String((int)alarmRingingIdx);
+  j += ",\"nextMin\":";
+  j += String(mins);
+  j += ",\"nextIdx\":";
+  j += String(nextIdx);
+  j += ",\"nextTime\":\"";
+  if (nextIdx >= 0) {
+    char t[8];
+    snprintf(t, sizeof(t), "%02u:%02u", (unsigned)alarms[nextIdx].hour, (unsigned)alarms[nextIdx].minute);
+    j += t;
+  }
+  j += "\"}";
+  server.send(200, "application/json", j);
 }
 
 void handleTimerState() {
@@ -14980,6 +9868,8 @@ void handlePriorityOrder() {
   bool sawNowPlaying = false;
   bool sawStopwatch = false;
   bool sawTimer = false;
+  bool sawWeb = false;
+  bool sawAlarm = false;
   int startIdx = 0;
   for (int i = 0; i <= (int)ord.length() && count < NUM_PRIORITY_IDS; i++) {
     if (i == (int)ord.length() || ord[i] == ',') {
@@ -14990,8 +9880,19 @@ void handlePriorityOrder() {
       else if (tok == "nowplaying") { newOrder[count++] = PRIORITY_ID_NOWPLAYING; sawNowPlaying = true; }
       else if (tok == "stopwatch")  { newOrder[count++] = PRIORITY_ID_STOPWATCH; sawStopwatch = true; }
       else if (tok == "timer")      { newOrder[count++] = PRIORITY_ID_TIMER; sawTimer = true; }
+      else if (tok == "webaccess")  { newOrder[count++] = PRIORITY_ID_WEB; sawWeb = true; }
+      else if (tok == "alarm")      { newOrder[count++] = PRIORITY_ID_ALARM; sawAlarm = true; }
       startIdx = i + 1;
     }
+  }
+
+  // A client cached from before the alarm existed leaves it out of the order.
+  // Filled in first, and at the top rather than the bottom, for the reason the
+  // default order has it there.
+  if (!sawAlarm && count < NUM_PRIORITY_IDS) {
+    for (int i = count; i > 0; i--) newOrder[i] = newOrder[i - 1];
+    newOrder[0] = PRIORITY_ID_ALARM;
+    count++;
   }
 
   if (!sawNowPlaying && count < NUM_PRIORITY_IDS) {
@@ -15004,6 +9905,10 @@ void handlePriorityOrder() {
 
   if (!sawTimer && count < NUM_PRIORITY_IDS) {
     newOrder[count++] = PRIORITY_ID_TIMER;
+  }
+
+  if (!sawWeb && count < NUM_PRIORITY_IDS) {
+    newOrder[count++] = PRIORITY_ID_WEB;
   }
   if (count != NUM_PRIORITY_IDS) {
     server.send(400, "text/plain", "Ordine invalida");
@@ -15032,22 +9937,47 @@ void handlePriorityOrder() {
     if (priorityOrder[i] == PRIORITY_ID_ETS2)  ets2Rank  = i;
   }
   ets2OrderFirst = (ets2Rank < notifRank);
-  saveSettings();
+  saveSettingsDeferred();
   server.send(200, "text/plain", "OK");
 }
 
 void handleHourFormat() {
   if (!checkAuth()) return;
+  if (server.hasArg("leadzero")) {
+    hourLeadingZero = (server.arg("leadzero") == "1");
+    saveSettingsDeferred();
+    // The hour tile redraws itself every 200 ms, so it picks this up on its own.
+    server.send(200, "text/plain", "OK");
+    return;
+  }
   if (server.hasArg("fmt")) {
     uint8_t f = (uint8_t)server.arg("fmt").toInt();
     if (f <= 1) {
       hourFormat = f;
-      saveSettings();
+      saveSettingsDeferred();
     }
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Lipseste fmt");
   }
+}
+
+// Takes any of fmt / leadzero / barmode / barpos / swap. The tile redraws itself every
+// 200 ms, so the panel picks the change up on its own.
+void handleHourWeekSett() {
+  if (!checkAuth()) return;
+  bool any = false;
+  if (server.hasArg("fmt"))      { int v = server.arg("fmt").toInt();     if (v == 0 || v == 1) { hwFormat  = (uint8_t)v; any = true; } }
+  if (server.hasArg("leadzero")) { hwLeadZero = (server.arg("leadzero") == "1"); any = true; }
+  if (server.hasArg("barmode"))  { int v = server.arg("barmode").toInt(); if (v == 0 || v == 1) { hwBarMode = (uint8_t)v; any = true; } }
+  if (server.hasArg("barpos"))   { int v = server.arg("barpos").toInt();  if (v == 0 || v == 1) { hwBarPos  = (uint8_t)v; any = true; } }
+  if (server.hasArg("swap"))     { hwSwap = (server.arg("swap") == "1"); any = true; }
+  if (!any) {
+    server.send(400, "text/plain", "Lipsesc setarile");
+    return;
+  }
+  saveSettingsDeferred();
+  server.send(200, "text/plain", "OK");
 }
 
 void handleDateFormat() {
@@ -15056,7 +9986,7 @@ void handleDateFormat() {
     uint8_t f = (uint8_t)server.arg("fmt").toInt();
     if (f <= 5) {
       dateFormat = f;
-      saveSettings();
+      saveSettingsDeferred();
 
       if (items[currentSlot].id == ITEM_DATE) {
         dateInit();
@@ -15074,7 +10004,7 @@ void handleDateLang() {
     uint8_t l = (uint8_t)server.arg("lang").toInt();
     if (l <= 1) {
       dateLang = l;
-      saveSettings();
+      saveSettingsDeferred();
 
       if (items[currentSlot].id == ITEM_DATE) {
         dateInit();
@@ -15102,7 +10032,7 @@ void handleDateCustomFmt() {
   }
   p.toCharArray(customDateFmt, sizeof(customDateFmt));
   dateFormat = 5;
-  saveSettings();
+  saveSettingsDeferred();
 
   if (items[currentSlot].id == ITEM_DATE) {
     dateInit();
@@ -15116,7 +10046,7 @@ void handleTempUnit() {
     uint8_t u = (uint8_t)server.arg("unit").toInt();
     if (u <= 1) {
       tempUnit = u;
-      saveSettings();
+      saveSettingsDeferred();
     }
     server.send(200, "text/plain", "OK");
   } else {
@@ -15128,13 +10058,35 @@ void handleTempUnit() {
 void startProvisionMode() {
   Serial.println("==> Pornire mod Provisioning");
   provisionMode = true;
+  // Nothing here will ever reach an NTP server, so if the clock has never been
+  // set it never will be while we are in this mode. Give it a plausible date:
+  // every getLocalTime() below returns straight away instead of spinning, and
+  // session cookies stay verifiable. A clock that is already right is left
+  // alone - seedManualClock() only fills in an invalid one.
+  seedManualClock();
+  // Same reason: the clock has just been made valid, so the schedule can be
+  // applied before the access point badge goes up.
+  applyBrightness();
   WiFi.disconnect(true);
   delay(200);
+  // With AP as the start mode the badge is an announcement and the spinner
+  // covers the handover to the tile loop. Otherwise the badge IS the screen
+  // from here on, so it goes up once and stays - no hold, no spinner, none of
+  // the badge/spinner/badge flicker that bought nothing.
+  const bool apIsHome = (defaultStartMode == START_MODE_AP);
   drawApScreen();
+  if (apIsHome) {
+    delay(AP_SCREEN_HOLD_MS);
+    // softAP() and the route table below both block, so the spinner turns
+    // either side of them rather than through them - same as the Wi-Fi path,
+    // where the frames only advance between WiFi.status() polls.
+    loadAnimWait(400);
+  }
   WiFi.mode(WIFI_AP);
   String apSsid = getApSsid();
   String apPass = getApPass();
   WiFi.softAP(apSsid.c_str(), apPass.length() > 0 ? apPass.c_str() : "");
+  if (apIsHome) loadAnimWait(400);
   Serial.print("AP pornit: ");
   Serial.print(apSsid);
   Serial.print(" - IP: ");
@@ -15143,15 +10095,26 @@ void startProvisionMode() {
   server.on("/scan",       HTTP_GET,  handleScan);
   server.on("/connect",    HTTP_POST, handleConnect);
   server.on("/settings",   HTTP_POST, handleSettings);
+  server.on("/restorebackup", HTTP_POST, handleBackupRestore);
+  server.on("/factoryreset", HTTP_POST, handleFactoryReset);
   server.on("/brightness",  HTTP_POST, handleBrightness);
   server.on("/buzzersett", HTTP_POST, handleBuzzerSett);
   server.on("/state",      HTTP_GET,  handleState);
+  server.on("/hwstate",    HTTP_GET,  handleHwState);
+  server.on("/hwreset",    HTTP_POST, handleHwReset);
+  server.on("/livetile",   HTTP_GET,  handleLiveTile);
+  server.on("/getscreen",  HTTP_GET,  handleGetScreen);
+  server.on("/screensub",  HTTP_GET,  handleScreenSub);
+  server.on("/tilehidden", HTTP_POST, handleTileHidden);
+  server.on("/socialsett", HTTP_POST, handleSocialSett);
+  server.on("/socialkey",  HTTP_GET,  handleSocialKey);
   server.on("/nowplaying", HTTP_POST, handleNowPlaying);
   server.on("/npstate",    HTTP_GET,  handleNpState);
   server.on("/npmode",     HTTP_POST, handleNpMode);
   server.on("/screensaversett", HTTP_POST, handleScreensaverSett);
   server.on("/tempunit",   HTTP_POST, handleTempUnit);
   server.on("/hourformat",  HTTP_POST, handleHourFormat);
+  server.on("/hwsett",      HTTP_POST, handleHourWeekSett);
   server.on("/dateformat",  HTTP_POST, handleDateFormat);
   server.on("/datelang",    HTTP_POST, handleDateLang);
   server.on("/datecustomfmt", HTTP_POST, handleDateCustomFmt);
@@ -15164,6 +10127,7 @@ void startProvisionMode() {
   server.on("/currencystate", HTTP_GET,  handleCurrencyState);
   server.on("/notification", HTTP_POST, handleNotification);
   server.on("/notiftoggle",  HTTP_POST, handleNotifToggle);
+  server.on("/webtoggle",    HTTP_POST, handleWebToggle);
   server.on("/notifstate",   HTTP_GET,  handleNotifState);
   server.on("/ets2speed",    HTTP_POST, handleEts2Speed);
   server.on("/ets2toggle",   HTTP_POST, handleEts2Toggle);
@@ -15177,6 +10141,9 @@ void startProvisionMode() {
   server.on("/timerstart",    HTTP_POST, handleTimerStart);
   server.on("/timerpause",    HTTP_POST, handleTimerPause);
   server.on("/timerstate",    HTTP_GET,  handleTimerState);
+  server.on("/alarmsett",     HTTP_POST, handleAlarmSett);
+  server.on("/alarmstop",     HTTP_POST, handleAlarmStop);
+  server.on("/alarmstate",    HTTP_GET,  handleAlarmState);
   server.on("/mementosett",   HTTP_POST, handleMementoSett);
   server.on("/canvassett",    HTTP_POST, handleCanvasSett);
   server.on("/eventsoundsett", HTTP_POST, handleEventSoundSett);
@@ -15184,7 +10151,10 @@ void startProvisionMode() {
   server.on("/accentsett",    HTTP_POST, handleAccentSett);
   server.on("/startap",       HTTP_POST, handleStartAp);
   server.on("/apstate",       HTTP_GET,  handleApState);
+  server.on("/wifiinfo",      HTTP_GET,  handleWifiInfo);
+  server.on("/power",         HTTP_POST, handlePower);
   server.on("/apsett",        HTTP_POST, handleApSett);
+  server.on("/timesett",      HTTP_POST, handleTimeSett);
   server.on("/appass",        HTTP_GET,  handleApPass);
   server.on("/stopap",        HTTP_POST, handleStopAp);
   // AUTH
@@ -15196,28 +10166,135 @@ void startProvisionMode() {
   server.on("/whoami",     HTTP_GET,  handleWhoami);
   server.on("/dashboard",  HTTP_GET,  handleDashboard);
   server.on("/swupdateupload", HTTP_POST, handleSwUpdateUploadDone, handleSwUpdateUpload);
-  const char* hdrs[] = {"Cookie"};
-  server.collectHeaders(hdrs, 1);
+  const char* hdrs[] = {"Cookie", "If-None-Match"};
+  server.collectHeaders(hdrs, 2);
   server.begin();
+
+  if (apIsHome) {
+    loadAnimWait(400);
+    // The tile loop takes the panel from here. Hand the current slot a fresh
+    // timer rather than let it inherit a stale one from before the switch and
+    // flip straight away.
+    slotStartMs = millis();
+  }
 }
+
+// Switching the radio from inside an HTTP handler tears the interface down
+// while handleClient() is still on the stack holding a socket on it. Flag the
+// switch and let loop() perform it once the response has gone out.
+// 0 = nothing pending, 1 = go to AP, 2 = go back to Wi-Fi.
+static uint8_t pendingModeSwitch = 0;
 
 void handleStartAp() {
   if (!checkAuth()) return;
   server.send(200, "text/plain", "ok");
-  delay(100);
+  pendingModeSwitch = 1;
+}
 
-  WiFi.disconnect(true);
-  delay(300);
-  startProvisionMode();
+// What the station connection actually is. There is no call on this chip that
+// reports the rate a frame just went out at, so "speed" here is the ceiling of
+// the mode that was negotiated - said as much in the interface, next to the
+// RSSI, which is the number that actually moves.
+void handleWifiInfo() {
+  if (!checkAuth()) return;
+  bool conn = (WiFi.status() == WL_CONNECTED);
+  String j = "{\"connected\":";
+  j += (conn ? "true" : "false");
+  if (conn) {
+    j += ",\"ssid\":\"";
+    j += jsonEscape(WiFi.SSID());
+    j += "\",\"bssid\":\"";
+    j += WiFi.BSSIDstr();
+    j += "\",\"rssi\":";
+    j += String(WiFi.RSSI());
+    j += ",\"channel\":";
+    j += String(WiFi.channel());
+    j += ",\"ip\":\"";
+    j += WiFi.localIP().toString();
+    j += "\",\"gw\":\"";
+    j += WiFi.gatewayIP().toString();
+    j += "\",\"mask\":\"";
+    j += WiFi.subnetMask().toString();
+    j += "\",\"dns\":\"";
+    j += WiFi.dnsIP().toString();
+    j += "\",\"mac\":\"";
+    j += WiFi.macAddress();
+    j += "\"";
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+      const char* phy = ap.phy_11ax ? "Wi-Fi 6 (802.11ax)"
+                      : ap.phy_11n  ? "Wi-Fi 4 (802.11n)"
+                      : ap.phy_11g  ? "802.11g"
+                      : ap.phy_11b  ? "802.11b"
+                                    : "802.11";
+      bool ht40 = (ap.bandwidth == WIFI_BW_HT40);
+      // One spatial stream, which is all this radio has. HT20 tops out at 72,
+      // HT40 at 150; g and b have no channel width to speak of.
+      int mbps = ap.phy_11n ? (ht40 ? 150 : 72) : ap.phy_11g ? 54 : ap.phy_11b ? 11 : 0;
+      j += ",\"phy\":\"";
+      j += phy;
+      j += "\",\"bw\":";
+      j += String(ht40 ? 40 : 20);
+      j += ",\"maxMbps\":";
+      j += String(mbps);
+    }
+  }
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+// The three power options. Each answers before it acts, because acting means
+// the connection this request came in on is about to go away.
+void handlePower() {
+  if (!checkAuth()) return;
+  String a = server.arg("action");
+  if (a == "sleep") {
+    sleepEnter();
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+  if (a == "wake") {
+    sleepWake();
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+  if (a == "reboot") {
+    server.send(200, "text/plain", "OK");
+    saveSettingsFlush();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+  if (a == "off") {
+    // Checked before answering, not after: going dark with no armed wake source
+    // would leave the USB cable as the only way to switch the clock back on.
+    if (esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH_PIN, 1) != ESP_OK) {
+      server.send(500, "text/plain", "Senzorul tactil nu poate porni ceasul inapoi");
+      return;
+    }
+    server.send(200, "text/plain", "OK");
+    delay(500);
+    powerOffNow();
+    return;
+  }
+  server.send(400, "text/plain", "Actiune necunoscuta");
 }
 
 void handleApState() {
   if (!checkAuth()) return;
   String ssid = getApSsid();
   String pass = getApPass();
+  // The time block rides along with the AP state because that is the one screen
+  // showing it - one request instead of two every time the screen opens.
+  struct tm lt;
+  char nowBuf[24] = "";
+  if (readLocalTime(lt)) strftime(nowBuf, sizeof(nowBuf), "%Y-%m-%dT%H:%M:%S", &lt);
   String json = "{\"ssid\":\"" + ssid + "\"" +
                 ",\"hasPass\":" + String(pass.length() > 0 ? "true" : "false") +
                 ",\"passLen\":" + String(pass.length()) +
+                ",\"netTime\":" + String(netTimeSync ? "true" : "false") +
+                ",\"devTime\":\"" + String(nowBuf) + "\"" +
+                ",\"timeValid\":" + String(TIME_LOOKS_VALID(time(nullptr)) ? "true" : "false") +
                 ",\"mode\":\"" + String(provisionMode ? "ap" : "sta") + "\"}";
   server.send(200, "application/json", json);
 }
@@ -15239,11 +10316,48 @@ void handleStopAp() {
     return;
   }
   server.send(200, "application/json", "{\"ok\":true}");
-  delay(500);
-  if (provisionMode) {
-    stopProvisionMode();
+  pendingModeSwitch = 2;
+}
+
+void handleTimeSett() {
+  if (!checkAuth()) return;
+
+  if (server.hasArg("netsync")) {
+    bool on = (server.arg("netsync") == "1");
+    if (on != netTimeSync) {
+      netTimeSync = on;
+      saveSettingsDeferred();
+      if (on) {
+        // Go and fetch the real time now rather than making the user reboot.
+        if (WiFi.status() == WL_CONNECTED) {
+          configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+          setenv("TZ", "UTC0", 1); tzset();
+          tzDetectAsync();
+        }
+      } else {
+        stopNtp();
+        seedManualClock();
+      }
+    }
   }
-  connectToWiFi(ssid.c_str(), pass.c_str());
+
+  if (server.hasArg("y")) {
+    if (netTimeSync) {
+      server.send(400, "application/json",
+                  "{\"ok\":false,\"err\":\"Opriti mai intai preluarea orei de pe retea\"}");
+      return;
+    }
+    if (!applyManualTime(server.arg("y").toInt(),  server.arg("mo").toInt(),
+                         server.arg("d").toInt(),  server.arg("h").toInt(),
+                         server.arg("mi").toInt(),
+                         server.hasArg("s") ? server.arg("s").toInt() : 0)) {
+      server.send(400, "application/json",
+                  "{\"ok\":false,\"err\":\"Data sau ora invalida\"}");
+      return;
+    }
+  }
+
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleApSett() {
@@ -15269,6 +10383,7 @@ void handleApSett() {
   }
   prefs.begin("apcfg", false);
   prefs.putString("ssid", newSsid);
+  gWifiSsidCached = newSsid;
   prefs.putString("pass", newPass);
   prefs.end();
 
@@ -15294,14 +10409,11 @@ bool connectToWiFi(const char* ssid, const char* pass) {
   mx.update(MD_MAX72XX::OFF);
   for (int c = 0; c < 32; c++) mx.setColumn(c, 0x00);
 
-  const char* wifiLabel = "Wifi";
-  int wCol = 0;
-  for (int ci = 0; wifiLabel[ci] != '\0'; ci++) {
-    uint8_t tmp[8]; uint8_t n = mx.getChar(wifiLabel[ci], sizeof(tmp), tmp);
-    for (int i = 0; i < n; i++) mx.setColumn(31 - (wCol + i), tmp[i]);
-    wCol += n;
-    mx.setColumn(31 - wCol, 0x00); wCol++;
-  }
+  // In the font picked under Tile Manager -> Font Type, like the tiles, and
+  // kept clear of the logo in columns 24..31.
+  uint8_t lbl[24]; int lblN = 0;
+  for (const char* p = "Wifi"; *p; p++) appendGlyphAuto(lbl, lblN, sizeof(lbl), *p, fontType);
+  for (int i = 0; i < lblN; i++) mx.setColumn(31 - i, lbl[i]);
 
   for (int col = 0; col < 8; col++) {
     uint8_t colVal = 0;
@@ -15314,29 +10426,42 @@ bool connectToWiFi(const char* ssid, const char* pass) {
   Serial.printf("Conectare la: %s\n", ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
+  // Hold the Wi-Fi logo for the first slice of the wait, then hand over to the
+  // spinner, which runs for as long as the connection actually takes.
+  const int logoHold = (WIFI_CONNECT_ATTEMPTS * LOAD_LOGO_HOLD_PCT) / 100;
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500); Serial.print("."); attempts++;
+  while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS) {
+    if (attempts < logoHold) delay(500);   // logo stays on screen
+    else                     loadAnimWait(500);
+    Serial.print("."); attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nConectat! IP: " + WiFi.localIP().toString());
-    P.setTextAlignment(PA_CENTER);
-    P.print("OK");
-    delay(1000);
 
     server.on("/",           HTTP_GET,  handleRoot);
     server.on("/scan",       HTTP_GET,  handleScan);
     server.on("/connect",    HTTP_POST, handleConnect);
     server.on("/settings",   HTTP_POST, handleSettings);
+    server.on("/restorebackup", HTTP_POST, handleBackupRestore);
+    server.on("/factoryreset", HTTP_POST, handleFactoryReset);
   server.on("/brightness",  HTTP_POST, handleBrightness);
     server.on("/buzzersett", HTTP_POST, handleBuzzerSett);
     server.on("/state",      HTTP_GET,  handleState);
+    server.on("/hwstate",    HTTP_GET,  handleHwState);
+    server.on("/hwreset",    HTTP_POST, handleHwReset);
+    server.on("/livetile",   HTTP_GET,  handleLiveTile);
+    server.on("/getscreen",  HTTP_GET,  handleGetScreen);
+    server.on("/screensub",  HTTP_GET,  handleScreenSub);
+    server.on("/tilehidden", HTTP_POST, handleTileHidden);
+    server.on("/socialsett", HTTP_POST, handleSocialSett);
+    server.on("/socialkey",  HTTP_GET,  handleSocialKey);
     server.on("/nowplaying", HTTP_POST, handleNowPlaying);
     server.on("/npstate",    HTTP_GET,  handleNpState);
     server.on("/npmode",     HTTP_POST, handleNpMode);
     server.on("/screensaversett", HTTP_POST, handleScreensaverSett);
     server.on("/tempunit",   HTTP_POST, handleTempUnit);
     server.on("/hourformat",  HTTP_POST, handleHourFormat);
+    server.on("/hwsett",      HTTP_POST, handleHourWeekSett);
     server.on("/dateformat",  HTTP_POST, handleDateFormat);
     server.on("/datelang",    HTTP_POST, handleDateLang);
     server.on("/datecustomfmt", HTTP_POST, handleDateCustomFmt);
@@ -15349,6 +10474,7 @@ bool connectToWiFi(const char* ssid, const char* pass) {
   server.on("/currencystate", HTTP_GET,  handleCurrencyState);
     server.on("/notification", HTTP_POST, handleNotification);
     server.on("/notiftoggle",  HTTP_POST, handleNotifToggle);
+    server.on("/webtoggle",    HTTP_POST, handleWebToggle);
     server.on("/notifstate",   HTTP_GET,  handleNotifState);
     server.on("/ets2speed",    HTTP_POST, handleEts2Speed);
     server.on("/ets2toggle",   HTTP_POST, handleEts2Toggle);
@@ -15362,6 +10488,9 @@ bool connectToWiFi(const char* ssid, const char* pass) {
     server.on("/timerstart",    HTTP_POST, handleTimerStart);
     server.on("/timerpause",    HTTP_POST, handleTimerPause);
     server.on("/timerstate",    HTTP_GET,  handleTimerState);
+    server.on("/alarmsett",     HTTP_POST, handleAlarmSett);
+    server.on("/alarmstop",     HTTP_POST, handleAlarmStop);
+    server.on("/alarmstate",    HTTP_GET,  handleAlarmState);
     server.on("/mementosett",   HTTP_POST, handleMementoSett);
     server.on("/canvassett",    HTTP_POST, handleCanvasSett);
     server.on("/eventsoundsett", HTTP_POST, handleEventSoundSett);
@@ -15369,7 +10498,10 @@ bool connectToWiFi(const char* ssid, const char* pass) {
     server.on("/accentsett",    HTTP_POST, handleAccentSett);
     server.on("/startap",       HTTP_POST, handleStartAp);
     server.on("/apstate",       HTTP_GET,  handleApState);
+    server.on("/wifiinfo",      HTTP_GET,  handleWifiInfo);
+    server.on("/power",         HTTP_POST, handlePower);
     server.on("/apsett",        HTTP_POST, handleApSett);
+    server.on("/timesett",      HTTP_POST, handleTimeSett);
   server.on("/appass",        HTTP_GET,  handleApPass);
   server.on("/stopap",        HTTP_POST, handleStopAp);
     // AUTH
@@ -15381,16 +10513,28 @@ bool connectToWiFi(const char* ssid, const char* pass) {
     server.on("/whoami",     HTTP_GET,  handleWhoami);
     server.on("/dashboard",  HTTP_GET,  handleDashboard);
     server.on("/swupdateupload", HTTP_POST, handleSwUpdateUploadDone, handleSwUpdateUpload);
-    const char* hdrs2[] = {"Cookie"};
-    server.collectHeaders(hdrs2, 1);
+    const char* hdrs2[] = {"Cookie", "If-None-Match"};
+    server.collectHeaders(hdrs2, 2);
     server.begin();
 
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    setenv("TZ", "UTC0", 1); tzset();
-    autoDetectTimezone();
-    struct tm ti_init;
-    int retry = 0;
-    while (!getLocalTime(&ti_init) && retry < 10) { delay(500); retry++; }
+    if (netTimeSync) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      setenv("TZ", "UTC0", 1); tzset();
+      autoDetectTimezoneAnimated();
+      struct tm ti_init;
+      int retry = 0;
+      while (!readLocalTime(ti_init) && retry < 10) { loadAnimWait(500); retry++; }
+    } else {
+      // Manual mode: no NTP poll and no timezone lookup, so the hand-set clock
+      // stays exactly where the user put it. TZ is deliberately left alone -
+      // resetting it here would shift an already-set clock on every reconnect.
+      stopNtp();
+      seedManualClock();
+    }
+    // Whichever branch ran, there is a clock now where there may not have been
+    // one before - and the dim schedule is a function of the clock. Waiting for
+    // loop()'s next tick would show a bright frame first.
+    applyBrightness();
     slotStartMs = millis();
     return true;
   } else {
@@ -15402,9 +10546,95 @@ bool connectToWiFi(const char* ssid, const char* pass) {
   }
 }
 
+// POWER
+//
+// Sleeping only darkens the panel - the tile loop, the web server and the
+// station connection all carry on, which is what lets a notification wake it.
+// The MAX7219's own shutdown is what applyBrightness() already reaches for at
+// level 0, so there is nothing new here to turn the display off with.
+void sleepEnter() {
+  if (sleepActive) return;
+  sleepActive = true;
+  applyBrightness();
+}
+
+void sleepWake() {
+  lastActivityMs = millis();
+  if (!sleepActive) return;
+  sleepActive = false;
+  applyBrightness();
+  // No redraw: the loop never stopped writing frames, so the panel lights up on
+  // whatever it was already showing rather than on a stale one.
+}
+
+// Anything that means somebody, or something, is using the clock. Called from
+// the touch sensor and from every route Octoglow Connect comes in on.
+void noteActivity() {
+  lastActivityMs = millis();
+  if (sleepActive) sleepWake();
+}
+
+static void autoSleepTick() {
+  if (!autoSleepOn || autoSleepSec == 0 || sleepActive) return;
+  // An alarm mid-ring is not an idle clock.
+  if (alarmRinging) { lastActivityMs = millis(); return; }
+  if (millis() - lastActivityMs >= (unsigned long)autoSleepSec * 1000UL) sleepEnter();
+}
+
+// True once the wake source is armed. Checked rather than assumed: without it
+// the device would go to sleep with no way back short of unplugging it.
+static bool armTouchWake() {
+  return esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH_PIN, 1) == ESP_OK;
+}
+
+// Deep sleep. Everything stops - no display, no WiFi, no web server - and only
+// a held touch brings it back. setup() is where that hold is checked.
+bool powerOffNow() {
+  if (!armTouchWake()) return false;
+  saveSettingsFlush();
+  buzzOff();
+  applyMaxBrightness(0);
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  // A finger still on the pad would be read as the wake it is waiting for, and
+  // the device would come straight back up.
+  unsigned long t0 = millis();
+  while (digitalRead(TOUCH_PIN) == HIGH && millis() - t0 < 5000UL) delay(20);
+  delay(80);
+  esp_deep_sleep_start();
+  return true;  // never reached
+}
+
+// Called from setup() before anything is brought up. A wake that is not a
+// deliberate hold goes straight back to sleep, so brushing the pad does
+// nothing.
+static void powerOnHoldGate() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0) return;
+  pinMode(TOUCH_PIN, INPUT);
+  unsigned long t0 = millis();
+  while (millis() - t0 < POWER_ON_HOLD_MS) {
+    if (digitalRead(TOUCH_PIN) != HIGH) {
+      // Released too early. Back to sleep - but only if the wake source arms
+      // again, because a device that cannot wake is a device that is bricked
+      // until somebody unplugs it. If it will not arm, carry on booting.
+      if (!armTouchWake()) return;
+      delay(120);
+      esp_deep_sleep_start();
+    }
+    delay(10);
+  }
+}
+
 // TOUCH
 
 void executeTouchAction(uint8_t action) {
+  // In provisioning mode the AP badge is the only thing on the panel - loop()
+  // returns before any tile or IP renderer runs. Moving through the slots or
+  // starting the IP display would leave a frame that nothing ever advances,
+  // which is how "Show IP Address" used to freeze the display after a switch to
+  // AP mode. The rest only change brightness or the buzzer, so they pass.
+  if (provisionMode && (action == 1 || action == 2 || action == 8)) return;
+
   switch (action) {
     case 1:
       retreatSlot();
@@ -15419,19 +10649,20 @@ void executeTouchAction(uint8_t action) {
       touchScreenOff = false;
       curBrightness = (uint8_t)constrain((int)curBrightness + 1, 0, 16);
       applyBrightness();
-      saveSettings();
+      saveSettingsDeferred();
       break;
     case 5:
       touchScreenOff = false;
       curBrightness = (uint8_t)constrain((int)curBrightness - 1, 0, 16);
       applyBrightness();
-      saveSettings();
+      saveSettingsDeferred();
       break;
     case 6:
       buzzerOn = !buzzerOn;
-      saveSettings();
+      saveSettingsDeferred();
       break;
     case 7:
+      saveSettingsFlush();
       ESP.restart();
       break;
     case 8:
@@ -15469,6 +10700,25 @@ void handleTouch() {
   bool touched = (digitalRead(TOUCH_PIN) == HIGH);
   if (touched && !touchActive) {
     touchActive = true; touchStartMs = millis(); touchShortFired = false;
+    // A ringing alarm owns the touch sensor. Stopping it happens on the press,
+    // not on the release, so it is instant - and touchShortFired swallows that
+    // whole press: the configured tap action does not also run, and holding
+    // the finger down afterwards does not fall into the access point switch.
+    // tapPending is cleared as well, or a tap from just before the alarm rang
+    // could still fire behind it. The next press behaves normally.
+    if (alarmRinging) {
+      alarmStopRinging();
+      touchShortFired = true;
+      tapPending = false;
+    } else if (sleepActive) {
+      // Waking is what this press is for, the same way stopping the alarm is.
+      // The configured action does not also run; the next press is normal.
+      sleepWake();
+      touchShortFired = true;
+      tapPending = false;
+    } else {
+      noteActivity();
+    }
   } else if (!touched && touchActive) {
     if (!touchShortFired) {
       beepTouch();
@@ -15477,8 +10727,12 @@ void handleTouch() {
     touchActive = false; touchShortFired = false;
   }
   if (touchActive && !touchShortFired && (millis() - touchStartMs >= TOUCH_HOLD_MS)) {
+    // touchActive deliberately stays true: clearing it here re-armed the
+    // detector while the finger was still down, so one long press fired the
+    // mode switch again a second later, and the release that followed counted
+    // as a fresh tap. touchShortFired alone suppresses both until a real
+    // release is seen.
     touchShortFired = true;
-    touchActive = false;
     if (!provisionMode) {
       startProvisionMode();
     } else {
@@ -15496,33 +10750,46 @@ void handleTouch() {
 // SETUP
 void setup() {
   Serial.begin(115200);
+  // Before anything is powered up: a wake from Power Off that was not a
+  // deliberate hold goes straight back to sleep.
+  powerOnHoldGate();
   loadAuth();
   pinMode(TOUCH_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
+  buzzOff();
+  buzzStartTask();
   Wire.begin(BMP_SDA, BMP_SCL);
   mx.begin();
   P.begin();
-  bool bmpFound = bmp.begin(0x76) || bmp.begin(0x77);
-  if (!bmpFound) {
-    Serial.println("BMP280 negasit!");
+  if (!bmpInitSensor()) {
+    // Not fatal any more: bmpHealthTick() keeps retrying while the clock runs,
+    // so a sensor that lost the power-up race comes back on its own instead of
+    // needing a reboot.
+    Serial.println("BMP280 negasit - se va reincerca automat");
   } else {
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,
-                    Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_500);
     delay(50);
     tempSampleTick();
     pressureSampleTick();
   }
   loadSettings();
-  applyMaxBrightness(curBrightness);
+  // Before WiFi, so the fallback is in place even when the board never leaves
+  // provisioning mode and connectToWiFi() is never reached.
+  if (!netTimeSync) seedManualClock();
+  // applyBrightness(), not applyMaxBrightness(curBrightness): the raw level
+  // ignores the dim schedule, so everything drawn between here and the first
+  // pass through loop() - the whole connection sequence - used to run at full
+  // brightness however late at night it was. In manual-time mode the clock was
+  // just seeded above, so the schedule already has a time to work from.
+  applyBrightness();
+  refreshWifiSsidCache();
   prefs.begin("wifi", true);
   String savedSSID = prefs.getString("ssid", "");
   String savedPass = prefs.getString("pass", "");
   prefs.end();
-  if (savedSSID.length() > 0) {
+  // Default Start Mode decides what comes up after a power cut. The Wi-Fi path
+  // still falls back to the access point when there is nothing to connect to.
+  if (defaultStartMode == START_MODE_AP) {
+    startProvisionMode();
+  } else if (savedSSID.length() > 0) {
     if (!connectToWiFi(savedSSID.c_str(), savedPass.c_str())) startProvisionMode();
   } else {
     startProvisionMode();
@@ -15540,13 +10807,13 @@ void setup() {
 void applyBrightness() {
   static uint8_t lastApplied = 255;
   uint8_t target;
-  if (touchScreenOff) {
+  if (sleepActive || touchScreenOff) {
     target = 0;
   } else if (!dimAutoOn) {
     target = curBrightness;
   } else {
     struct tm ti;
-    if (!getLocalTime(&ti)) {
+    if (!readLocalTime(ti)) {
       target = curBrightness;
     } else {
       int nowMins  = ti.tm_hour * 60 + ti.tm_min;
@@ -15567,21 +10834,81 @@ void applyBrightness() {
   }
 }
 
+// Runs from the top of loop(), so handleClient() has finished with the client
+// and closed it before the interface underneath goes away.
+static void doPendingModeSwitch() {
+  uint8_t m = pendingModeSwitch;
+  pendingModeSwitch = 0;
+  if (m == 1) {
+    WiFi.disconnect(true);
+    delay(300);
+    startProvisionMode();
+  } else if (m == 2) {
+    if (provisionMode) stopProvisionMode();
+    prefs.begin("wifi", true);
+    String s = prefs.getString("ssid", "");
+    String p = prefs.getString("pass", "");
+    prefs.end();
+    connectToWiFi(s.c_str(), p.c_str());
+  }
+}
+
 void loop() {
-  tickBuzzer();
+  hwMonitorTick();
+  hwClearPeaksAfterBoot();
+  screenStreamTick();
   handleTouch();
 
-  if (provisionMode) {
-    server.handleClient();
+  if (pendingModeSwitch) {
+    doPendingModeSwitch();
     return;
   }
 
-  // WiFi Connection Lost detects the connected > disconnected transition
-  bool wifiNowConnected = (WiFi.status() == WL_CONNECTED);
-  if (wifiWasConnected && !wifiNowConnected) {
-    nbPlayPreset(eventSoundWifi);
+  // Changing Default Start Mode while the access point is already up flips this
+  // without going through startProvisionMode(), so the badge has to be put back
+  // by hand - otherwise the panel keeps whatever tile frame was drawn last.
+  static bool tileLoopWasSuspended = false;
+  bool tileLoopNowSuspended = tileLoopSuspended();
+  if (tileLoopNowSuspended && !tileLoopWasSuspended) drawApScreen();
+  tileLoopWasSuspended = tileLoopNowSuspended;
+
+  // Ahead of the early return below: an alarm goes off at its time whether or
+  // not the access point happens to be up. The panel belongs to the AP badge
+  // while that is showing, so in AP mode the alarm is heard rather than seen -
+  // and the touch sensor still stops it.
+  alarmTick();
+  alarmToneTick();
+  autoSleepTick();
+
+  if (tileLoopNowSuspended) {
+    // The access point badge is not a tile, so nothing in the manager is live.
+    gLiveTileId = -1;
+    gLivePrio   = "";
+    serviceHttp();
+    // settingsFlushTick() sits near the bottom of loop(), behind this return -
+    // so for as long as this branch was taken, nothing changed in AP mode ever
+    // reached NVS. Deferred writes have to be flushed here too.
+    settingsFlushTick();
+    return;
   }
-  wifiWasConnected = wifiNowConnected;
+
+  // WiFi Connection Lost detects the connected > disconnected transition.
+  // There is no station connection to lose while the access point is up, and
+  // wifiWasConnected starts out true - so without this the first iteration
+  // after booting into AP announced a drop that never happened. Holding it
+  // false also means reconnecting later reads as a clean false -> true, with no
+  // spurious alert on the way back.
+  if (provisionMode) {
+    wifiWasConnected = false;
+  } else {
+    bool wifiNowConnected = (WiFi.status() == WL_CONNECTED);
+    if (wifiWasConnected && !wifiNowConnected) {
+      nbPlayPreset(eventSoundWifi, BZ_CAT_AUTO);
+      // Something the owner would want to see, so it counts as activity.
+      noteActivity();
+    }
+    wifiWasConnected = wifiNowConnected;
+  }
 
   if (nowPlayingActive && (millis() - lastNowPlayingMs > NOW_PLAYING_TIMEOUT_MS)) {
     nowPlayingActive = false;
@@ -15590,8 +10917,8 @@ void loop() {
 
     if (!nowPlayingIsPriority && items[currentSlot].id == ITEM_NOW_PLAYING) {
       advanceSlot();
-      server.handleClient();
-      if (provisionMode) return;
+      serviceHttp();
+      if (tileLoopSuspended()) return;
       return;
     }
   }
@@ -15600,8 +10927,11 @@ void loop() {
   // short, user-triggered, one-shot display and is not part of the reorderable
   // Priority Tiles order.
   if (ipTick()) {
-    server.handleClient();
-    if (provisionMode) return;
+    // Show IP Address is a touch action, not a row in the manager.
+    gLiveTileId = -1;
+    gLivePrio   = "";
+    serviceHttp();
+    if (tileLoopSuspended()) return;
     return;
   }
 
@@ -15609,26 +10939,34 @@ void loop() {
   for (int pi = 0; pi < NUM_PRIORITY_IDS; pi++) {
     bool handled = false;
     switch (priorityOrder[pi]) {
-      case PRIORITY_ID_NOTIF:      handled = notifTick();      break;
+      // Both slots run the same renderer; webAccessAlertActive decides which
+      // one the message on screen belongs to, so each gets its own rank.
+      case PRIORITY_ID_NOTIF:      handled = !webAccessAlertActive && notifTick(); break;
+      case PRIORITY_ID_WEB:        handled =  webAccessAlertActive && notifTick(); break;
       case PRIORITY_ID_ETS2:       handled = ets2Tick();       break;
       case PRIORITY_ID_NOWPLAYING: handled = npPriorityTick(); break;
       case PRIORITY_ID_STOPWATCH:  handled = swPriorityTick(); break;
       case PRIORITY_ID_TIMER:      handled = timerPriorityTick(); break;
+      case PRIORITY_ID_ALARM:      handled = alarmPriorityTick(); break;
     }
     if (handled) {
-      server.handleClient();
-      if (provisionMode) return;
+      gLiveTileId = -1;
+      gLivePrio   = priorityIdName(priorityOrder[pi]);
+      serviceHttp();
+      if (tileLoopSuspended()) return;
       return;
     }
   }
 
   CycleItem& cur = items[currentSlot];
+  gLiveTileId = (int8_t)cur.id;
+  gLivePrio   = "";
 
   if (cur.id == ITEM_NOW_PLAYING) {
 
     if (notifActive) {
-      server.handleClient();
-      if (provisionMode) return;
+      serviceHttp();
+      if (tileLoopSuspended()) return;
       return;
     }
     unsigned long now = millis();
@@ -15651,15 +10989,15 @@ void loop() {
         break;
 
       case NP_SCROLL_WRAP: {
-        if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
           npLastScrollMs = now;
           npScrollPos++;
           if (npScrollPos >= npColCount) {
             npWrapPass++;
             if (npWrapPass >= SCROLL_WRAP_PASSES) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             npScrollPos = -((hideIconNowPlaying || scrollIconInBuffer(scrollTypeNowPlaying)) ? 32 : NP_TEXT_COLS);
@@ -15676,7 +11014,7 @@ void loop() {
           npPauseStartMs = now;
           break;
         }
-        if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
           npLastScrollMs = now;
           npScrollPos++;
           npDrawAtPos(npScrollPos);
@@ -15697,7 +11035,7 @@ void loop() {
         break;
 
       case NP_SCROLL_LEFT:
-        if (now - npLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - npLastScrollMs >= spd(SPD_NOWPLAYING)) {
           npLastScrollMs = now;
           npScrollPos--;
           if (npScrollPos <= 0) {
@@ -15714,8 +11052,8 @@ void loop() {
       case NP_PAUSE_BEFORE_NEXT:
         if (now - npPauseStartMs >= NP_PAUSE_MS) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
@@ -15723,15 +11061,15 @@ void loop() {
       case NP_PAUSE_SHORT:
         if (now - npPauseStartMs >= 4000UL) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
     }
 
-    server.handleClient();
-    if (provisionMode) return;
+    serviceHttp();
+    if (tileLoopSuspended()) return;
     return;
   }
 
@@ -15754,15 +11092,15 @@ void loop() {
         }
         break;
       case NP_SCROLL_WRAP: {
-        if (now - wxLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - wxLastScrollMs >= spd(SPD_WEATHER)) {
           wxLastScrollMs = now;
           wxScrollPos++;
           if (wxScrollPos >= wxColCount) {
             wxWrapPass++;
             if (wxWrapPass >= SCROLL_WRAP_PASSES) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             wxScrollPos = -((hideIconWeather || scrollIconInBuffer(scrollTypeWeather)) ? 32 : NP_TEXT_COLS);
@@ -15778,7 +11116,7 @@ void loop() {
           wxPauseStartMs = now;
           break;
         }
-        if (now - wxLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - wxLastScrollMs >= spd(SPD_WEATHER)) {
           wxLastScrollMs = now;
           wxScrollPos++;
           weatherDrawAtPos(wxScrollPos);
@@ -15797,7 +11135,7 @@ void loop() {
         }
         break;
       case NP_SCROLL_LEFT:
-        if (now - wxLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - wxLastScrollMs >= spd(SPD_WEATHER)) {
           wxLastScrollMs = now;
           wxScrollPos--;
           if (wxScrollPos <= 0) {
@@ -15813,22 +11151,22 @@ void loop() {
       case NP_PAUSE_BEFORE_NEXT:
         if (now - wxPauseStartMs >= NP_PAUSE_MS) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
       case NP_PAUSE_SHORT:
         if (now - wxPauseStartMs >= 4000UL) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
     }
-    server.handleClient();
-    if (provisionMode) return;
+    serviceHttp();
+    if (tileLoopSuspended()) return;
     return;
   }
 
@@ -15851,15 +11189,15 @@ void loop() {
         }
         break;
       case NP_SCROLL_WRAP: {
-        if (now - currLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - currLastScrollMs >= spd(SPD_CURRENCY)) {
           currLastScrollMs = now;
           currScrollPos++;
           if (currScrollPos >= currColCount) {
             currWrapPass++;
             if (currWrapPass >= SCROLL_WRAP_PASSES) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             currScrollPos = -((hideIconCurrency || scrollIconInBuffer(scrollTypeCurrency)) ? 32 : PRESSURE_TEXT_COLS);
@@ -15875,7 +11213,7 @@ void loop() {
           currPauseMs = now;
           break;
         }
-        if (now - currLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - currLastScrollMs >= spd(SPD_CURRENCY)) {
           currLastScrollMs = now;
           currScrollPos++;
           currencyDrawAtPos(currScrollPos);
@@ -15894,7 +11232,7 @@ void loop() {
         }
         break;
       case NP_SCROLL_LEFT:
-        if (now - currLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - currLastScrollMs >= spd(SPD_CURRENCY)) {
           currLastScrollMs = now;
           currScrollPos--;
           if (currScrollPos <= 0) {
@@ -15910,24 +11248,124 @@ void loop() {
       case NP_PAUSE_BEFORE_NEXT:
         if (now - currPauseMs >= NP_PAUSE_MS) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
       case NP_PAUSE_SHORT:
         if (now - currPauseMs >= 4000UL) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
     }
-    server.handleClient();
-    if (provisionMode) return;
+    serviceHttp();
+    if (tileLoopSuspended()) return;
     return;
   }
+  // SOCIAL COUNTER TILES - same scroll behaviour as the currency tile
+  // When the text already fits, nothing below runs: the tile falls through to
+  // the generic slot timer at the end of loop(), so it honours its configured
+  // display time instead of the scroll machine's own pauses.
+  if (socialIndexForItem(cur.id) >= 0 && socNeedsScroll) {
+    unsigned long now = millis();
+    switch (socState) {
+      case NP_SHOW_START:
+        break;
+      case NP_PAUSE_BEFORE_RIGHT:
+        if (now - socPauseMs >= NP_PAUSE_MS) {
+          if (scrollIsWrap(scrollTypeYoutube)) {
+            socWrapPass = 0;
+            socScrollPos = 0;
+            socState = NP_SCROLL_WRAP;
+          } else {
+            socState = NP_SCROLL_RIGHT;
+          }
+          socLastScrollMs = now;
+        }
+        break;
+      case NP_SCROLL_WRAP: {
+        if (now - socLastScrollMs >= spd(SPD_YOUTUBE)) {
+          socLastScrollMs = now;
+          socScrollPos++;
+          if (socScrollPos >= socColCount) {
+            socWrapPass++;
+            if (socWrapPass >= SCROLL_WRAP_PASSES) {
+              advanceSlot();
+              serviceHttp();
+              if (tileLoopSuspended()) return;
+              return;
+            }
+            socScrollPos = -((hideIconYoutube || scrollIconInBuffer(scrollTypeYoutube)) ? 32 : PRESSURE_TEXT_COLS);
+          }
+          socialDrawAtPos(socScrollPos);
+        }
+        break;
+      }
+      case NP_SCROLL_RIGHT: {
+        int maxPos = socColCount - ((hideIconYoutube || scrollIconInBuffer(scrollTypeYoutube)) ? 32 : PRESSURE_TEXT_COLS);
+        if (maxPos <= 0) {
+          socState = NP_PAUSE_SHORT;
+          socPauseMs = now;
+          break;
+        }
+        if (now - socLastScrollMs >= spd(SPD_YOUTUBE)) {
+          socLastScrollMs = now;
+          socScrollPos++;
+          socialDrawAtPos(socScrollPos);
+          if (socScrollPos >= maxPos) {
+            socScrollPos = maxPos;
+            socState = NP_PAUSE_AFTER_RIGHT;
+            socPauseMs = now;
+          }
+        }
+        break;
+      }
+      case NP_PAUSE_AFTER_RIGHT:
+        if (now - socPauseMs >= NP_PAUSE_MS) {
+          socState = NP_SCROLL_LEFT;
+          socLastScrollMs = now;
+        }
+        break;
+      case NP_SCROLL_LEFT:
+        if (now - socLastScrollMs >= spd(SPD_YOUTUBE)) {
+          socLastScrollMs = now;
+          socScrollPos--;
+          if (socScrollPos <= 0) {
+            socScrollPos = 0;
+            socialDrawAtPos(0);
+            socState = NP_PAUSE_BEFORE_NEXT;
+            socPauseMs = now;
+          } else {
+            socialDrawAtPos(socScrollPos);
+          }
+        }
+        break;
+      case NP_PAUSE_BEFORE_NEXT:
+        if (now - socPauseMs >= NP_PAUSE_MS) {
+          advanceSlot();
+          serviceHttp();
+          if (tileLoopSuspended()) return;
+          return;
+        }
+        break;
+      case NP_PAUSE_SHORT:
+        if (now - socPauseMs >= 4000UL) {
+          advanceSlot();
+          serviceHttp();
+          if (tileLoopSuspended()) return;
+          return;
+        }
+        break;
+    }
+    serviceHttp();
+    if (tileLoopSuspended()) return;
+    return;
+  }
+
 
   // MEMENTO 
   if (cur.id == ITEM_MEMENTO) {
@@ -15948,15 +11386,15 @@ void loop() {
         }
         break;
       case NP_SCROLL_WRAP: {
-        if (now - mementoLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - mementoLastScrollMs >= spd(SPD_REMINDER)) {
           mementoLastScrollMs = now;
           mementoScrollPos++;
           if (mementoScrollPos >= mementoColCount) {
             mementoWrapPass++;
             if (mementoWrapPass >= SCROLL_WRAP_PASSES) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             mementoScrollPos = -((hideIconReminder || scrollIconInBuffer(scrollTypeReminder)) ? 32 : NP_TEXT_COLS);
@@ -15972,7 +11410,7 @@ void loop() {
           mementoPauseMs = now;
           break;
         }
-        if (now - mementoLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - mementoLastScrollMs >= spd(SPD_REMINDER)) {
           mementoLastScrollMs = now;
           mementoScrollPos++;
           mementoDrawAtPos(mementoScrollPos);
@@ -15991,7 +11429,7 @@ void loop() {
         }
         break;
       case NP_SCROLL_LEFT:
-        if (now - mementoLastScrollMs >= NP_SCROLL_SPEED_MS) {
+        if (now - mementoLastScrollMs >= spd(SPD_REMINDER)) {
           mementoLastScrollMs = now;
           mementoScrollPos--;
           if (mementoScrollPos <= 0) {
@@ -16007,27 +11445,27 @@ void loop() {
       case NP_PAUSE_BEFORE_NEXT:
         if (now - mementoPauseMs >= NP_PAUSE_MS) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
       case NP_PAUSE_SHORT:
         if (now - mementoPauseMs >= 4000UL) {
           advanceSlot();
-          server.handleClient();
-          if (provisionMode) return;
+          serviceHttp();
+          if (tileLoopSuspended()) return;
           return;
         }
         break;
     }
-    server.handleClient();
-    if (provisionMode) return;
+    serviceHttp();
+    if (tileLoopSuspended()) return;
     return;
   }
 
-  server.handleClient();
-  if (provisionMode) return;
+  serviceHttp();
+  if (tileLoopSuspended()) return;
 
   unsigned long nowMs = millis();
 
@@ -16040,17 +11478,27 @@ void loop() {
   // Both fetches below only kick off a background task and return
   // immediately (see weatherFetch()/currencyFetch() definitions) - they
   // no longer block loop() while the HTTP request is in flight.
-  if (strlen(weatherApiKey) > 0 &&
+  // Both are gated on the tile still being in the manager: a removed tile has
+  // no row to show the answer on, and each refresh is an HTTPS request plus an
+  // 8 KB task. The poll calls stay unconditional so a fetch already in flight
+  // when the tile was removed still gets collected instead of leaking its flag.
+  if (tileInManager(ITEM_WEATHER) && strlen(weatherApiKey) > 0 &&
       (lastWeatherFetch == 0 || nowMs - lastWeatherFetch >= WEATHER_FETCH_INTERVAL_MS)) {
     weatherFetch();
   }
   weatherFetchPoll();
 
-  if (lastCurrencyFetch == 0 || nowMs - lastCurrencyFetch >= CURRENCY_FETCH_INTERVAL_MS) {
+  if (tileInManager(ITEM_CURRENCY) &&
+      (lastCurrencyFetch == 0 || nowMs - lastCurrencyFetch >= CURRENCY_FETCH_INTERVAL_MS)) {
     currencyFetch();
   }
   currencyFetchPoll();
 
+  socialTickFetch();
+  socialFetchPoll();
+
+  settingsFlushTick();
+  bmpHealthTick();
   tempSampleTick();
   pressureSampleTick();
 
@@ -16064,14 +11512,26 @@ void loop() {
         drawHour();
       }
       break;
+    case ITEM_HOURWEEK:
+      if (nowMs - gLastStaticDrawMs >= 200) {
+        gLastStaticDrawMs = nowMs;
+        drawHourWeekday();
+      }
+      break;
     case ITEM_DATE: {
 
       if (!gStaticDrawDone) {
-        gStaticDrawDone = true;
-        dateInit();
+        gStaticDrawDone = dateInit();
       }
 
-      if (dateNeedsScroll) {
+      // dateState stays NP_SHOW_START until dateInit() starts the scroll, and
+      // dateNeedsScroll survives from the previous time this tile was shown -
+      // so the two can disagree. Entering the state machine on that combination
+      // lands on `default:` and returns out of loop() on every pass, without
+      // ever reaching the slot-duration check below: the tile could never hand
+      // over. Falling through instead keeps the rotation going whatever
+      // happened to the draw.
+      if (dateNeedsScroll && dateState != NP_SHOW_START) {
         unsigned long now = millis();
         unsigned long halfSlot = (unsigned long)(cur.durationSec / 2) * 1000UL;
         if (halfSlot < 1000UL) halfSlot = 1000UL;
@@ -16093,15 +11553,15 @@ void loop() {
             }
             break;
           case NP_SCROLL_WRAP:
-            if (now - dateLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - dateLastScrollMs >= spd(SPD_DATE)) {
               dateLastScrollMs = now;
               dateScrollPos++;
               if (dateScrollPos >= dateColCount) {
                 dateWrapPass++;
                 if (dateWrapPass >= SCROLL_WRAP_PASSES) {
                   advanceSlot();
-                  server.handleClient();
-                  if (provisionMode) return;
+                  serviceHttp();
+                  if (tileLoopSuspended()) return;
                   return;
                 }
                 dateScrollPos = -dateEffTextCols;
@@ -16110,7 +11570,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_RIGHT:
-            if (now - dateLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - dateLastScrollMs >= spd(SPD_DATE)) {
               dateLastScrollMs = now;
               dateScrollPos++;
               dateDrawAtPos(dateScrollPos);
@@ -16128,7 +11588,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_LEFT:
-            if (now - dateLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - dateLastScrollMs >= spd(SPD_DATE)) {
               dateLastScrollMs = now;
               dateScrollPos--;
               if (dateScrollPos <= 0) {
@@ -16145,16 +11605,16 @@ void loop() {
 
             if (now - datePauseMs >= halfSlot) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             break;
           default: break;
         }
 
-        server.handleClient();
-        if (provisionMode) return;
+        serviceHttp();
+        if (tileLoopSuspended()) return;
         return;
       }
       break;
@@ -16162,12 +11622,17 @@ void loop() {
     case ITEM_TEMP: {
 
       if (!gStaticDrawDone) {
-        float tf = bmp.readTemperature();
-        if (tf >= -40 && tf <= 85) {
-          lastTemp = (int)round(tf);
-          gStaticDrawDone = true;
-          tempInit(lastTemp);
-        }
+        float tf;
+        if (bmpReadTempC(tf)) lastTemp = (int)round(tf);
+        gStaticDrawDone = true;
+        gTempShownValue = lastTemp;
+        tempInit(lastTemp);
+      } else if (gTempShownValue == TEMP_NO_READING && lastTemp != TEMP_NO_READING) {
+        // The "--" placeholder is on screen and the sensor just answered.
+        // Only re-init in this direction, so a normal reading changing by a
+        // degree never restarts a scroll that is already running.
+        gTempShownValue = lastTemp;
+        tempInit(lastTemp);
       }
 
       if (tempNeedsScroll) {
@@ -16192,15 +11657,15 @@ void loop() {
             }
             break;
           case NP_SCROLL_WRAP:
-            if (now - tempLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - tempLastScrollMs >= spd(SPD_TEMP)) {
               tempLastScrollMs = now;
               tempScrollPos++;
               if (tempScrollPos >= tempColCount) {
                 tempWrapPass++;
                 if (tempWrapPass >= SCROLL_WRAP_PASSES) {
                   advanceSlot();
-                  server.handleClient();
-                  if (provisionMode) return;
+                  serviceHttp();
+                  if (tileLoopSuspended()) return;
                   return;
                 }
                 tempScrollPos = -tempEffTextCols;
@@ -16209,7 +11674,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_RIGHT:
-            if (now - tempLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - tempLastScrollMs >= spd(SPD_TEMP)) {
               tempLastScrollMs = now;
               tempScrollPos++;
               tempDrawAtPos(tempScrollPos);
@@ -16227,7 +11692,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_LEFT:
-            if (now - tempLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - tempLastScrollMs >= spd(SPD_TEMP)) {
               tempLastScrollMs = now;
               tempScrollPos--;
               if (tempScrollPos <= 0) {
@@ -16244,16 +11709,16 @@ void loop() {
 
             if (now - tempPauseMs >= halfSlot) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             break;
           default: break;
         }
 
-        server.handleClient();
-        if (provisionMode) return;
+        serviceHttp();
+        if (tileLoopSuspended()) return;
         return;
       }
       break;
@@ -16287,15 +11752,15 @@ void loop() {
             }
             break;
           case NP_SCROLL_WRAP:
-            if (now - pressureLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - pressureLastScrollMs >= spd(SPD_PRESSURE)) {
               pressureLastScrollMs = now;
               pressureScrollPos++;
               if (pressureScrollPos >= pressureColCount) {
                 pressureWrapPass++;
                 if (pressureWrapPass >= SCROLL_WRAP_PASSES) {
                   advanceSlot();
-                  server.handleClient();
-                  if (provisionMode) return;
+                  serviceHttp();
+                  if (tileLoopSuspended()) return;
                   return;
                 }
                 pressureScrollPos = -pressureEffTextCols;
@@ -16304,7 +11769,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_RIGHT:
-            if (now - pressureLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - pressureLastScrollMs >= spd(SPD_PRESSURE)) {
               pressureLastScrollMs = now;
               pressureScrollPos++;
               pressureDrawAtPos(pressureScrollPos);
@@ -16322,7 +11787,7 @@ void loop() {
             }
             break;
           case NP_SCROLL_LEFT:
-            if (now - pressureLastScrollMs >= NP_SCROLL_SPEED_MS) {
+            if (now - pressureLastScrollMs >= spd(SPD_PRESSURE)) {
               pressureLastScrollMs = now;
               pressureScrollPos--;
               if (pressureScrollPos <= 0) {
@@ -16338,15 +11803,15 @@ void loop() {
           case NP_PAUSE_BEFORE_NEXT:
             if (now - pressurePauseMs >= halfSlot) {
               advanceSlot();
-              server.handleClient();
-              if (provisionMode) return;
+              serviceHttp();
+              if (tileLoopSuspended()) return;
               return;
             }
             break;
           default: break;
         }
-        server.handleClient();
-        if (provisionMode) return;
+        serviceHttp();
+        if (tileLoopSuspended()) return;
         return;
       }
       break;

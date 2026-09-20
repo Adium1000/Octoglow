@@ -1,0 +1,555 @@
+
+<!doctype html>
+<html lang=ro>
+<meta charset=UTF-8>
+<meta content="width=device-width,initial-scale=1,viewport-fit=cover" name=viewport>
+<title>Octoglow</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Ccircle cx='128' cy='128' r='128' fill='%23EADDFF' opacity='.137'/%3E%3Ccircle cx='128' cy='128' r='107.52' fill='%23EADDFF' opacity='.255'/%3E%3Ccircle cx='128' cy='128' r='92.16' fill='%23EADDFF' opacity='.392'/%3E%3Ccircle cx='128' cy='25.6' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='230.4' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='200.41' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='230.4' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='200.41' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='25.6' cy='128' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='55.59' cy='55.59' r='11.52' fill='%236750A4'/%3E%3Ccircle cx='128' cy='128' r='71.68' fill='%236750A4'/%3E%3Ccircle cx='99.328' cy='99.328' r='23.04' fill='%23FFFFFF'/%3E%3C/svg%3E">
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500&family=Roboto:wght@400;500&display=swap" rel=stylesheet>
+<style>
+  :root {
+    --pri: #d0bcff;
+    --on-pri: #381e72;
+    --pri-con: #4f378b;
+    --on-pri-con: #eaddff;
+    --sec: #ccc2dc;
+    --sec-con: #4a4458;
+    --on-sec-con: #e8def8;
+    --bg: #1c1b1f;
+    --on-bg: #e6e1e5;
+    --surf: #1c1b1f;
+    --on-surf: #e6e1e5;
+    --surf-var: #49454f;
+    --on-surf-var: #cac4d0;
+    --surf-high: #2b2930;
+    --outline: #938f99;
+    --err: #f2b8b5;
+    --err-con: #8c1d18;
+    --grn: #6dd7a1;
+    --grn-con: #003824
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--on-bg);
+    font-family: Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    padding: 24px
+  }
+
+  .auth-card {
+    background: var(--surf-high);
+    border-radius: 28px;
+    padding: 40px 28px 32px;
+    width: 100%;
+    max-width: 460px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0
+  }
+
+  .auth-title {
+    font-family: Google Sans, sans-serif;
+    font-size: 24px;
+    color: var(--on-surf);
+    font-weight: 500;
+    margin-bottom: 4px;
+    padding-bottom: 12px;
+    text-align: center;
+    line-height: 1.3
+  }
+
+  .wave-hand {
+    display: inline-block;
+    vertical-align: -4px;
+    margin-left: 6px;
+    transform-origin: 50% 82%;
+    animation: wave-once 1.4s ease-in-out infinite
+  }
+
+  @keyframes wave-once {
+    0% {
+      transform: rotate(0deg)
+    }
+
+    10% {
+      transform: rotate(14deg)
+    }
+
+    20% {
+      transform: rotate(-8deg)
+    }
+
+    30% {
+      transform: rotate(14deg)
+    }
+
+    40% {
+      transform: rotate(-4deg)
+    }
+
+    50% {
+      transform: rotate(10deg)
+    }
+
+    60%,
+    100% {
+      transform: rotate(0deg)
+    }
+  }
+
+  .tf {
+    background: var(--surf-var);
+    border-bottom: 2px solid var(--outline);
+    border-radius: 4px 4px 0 0;
+    padding: 0 16px;
+    margin-bottom: 12px;
+    width: 100%
+  }
+
+  .tf:focus-within {
+    border-bottom-color: var(--pri)
+  }
+
+  .tf label {
+    display: block;
+    font-size: 11px;
+    letter-spacing: .4px;
+    font-weight: 500;
+    color: var(--on-surf-var);
+    padding-top: 8px
+  }
+
+  .tf:focus-within label {
+    color: var(--pri)
+  }
+
+  .tf input {
+    width: 100%;
+    background: 0 0;
+    border: none;
+    outline: none;
+    color: var(--on-surf);
+    font-family: Roboto, sans-serif;
+    font-size: 16px;
+    padding: 6px 0 10px
+  }
+
+  .mbtn {
+    cursor: pointer;
+    border: none;
+    border-radius: 100px;
+    width: 100%;
+    height: 44px;
+    font-family: Google Sans, sans-serif;
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: .1px;
+    background: var(--pri);
+    color: var(--on-pri);
+    margin-top: 8px;
+    transition: opacity .15s, transform .1s
+  }
+
+  .mbtn:active {
+    transform: scale(.97)
+  }
+
+  .mbtn:disabled {
+    opacity: .38;
+    pointer-events: none
+  }
+
+  .auth-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    width: 100%
+  }
+
+  .auth-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1 1 220px;
+    min-width: 220px
+  }
+
+  .auth-avatar {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: var(--pri-con);
+    color: var(--pri);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: Google Sans, sans-serif;
+    font-size: 19px;
+    font-weight: 500;
+    text-transform: uppercase
+  }
+
+  .auth-fields {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column
+  }
+
+  .auth-arrow-btn {
+    cursor: pointer;
+    border: none;
+    border-radius: 50%;
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+    background: var(--pri);
+    color: var(--on-pri);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity .15s, transform .1s
+  }
+
+  .auth-arrow-btn:active {
+    transform: scale(.97)
+  }
+
+  .auth-arrow-btn:disabled {
+    opacity: .38;
+    pointer-events: none
+  }
+
+  .btn-spin {
+    width: 18px;
+    height: 18px;
+    border: 2.5px solid color-mix(in srgb, var(--on-pri) 30%, transparent);
+    border-top-color: var(--on-pri);
+    border-radius: 50%;
+    display: inline-block;
+    animation: btn-spin-rot .7s linear infinite
+  }
+
+  @keyframes btn-spin-rot {
+    to {
+      transform: rotate(360deg)
+    }
+  }
+
+  .toast-wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 24px;
+    display: flex;
+    justify-content: center;
+    z-index: 500;
+    pointer-events: none
+  }
+
+  .toast {
+    background: var(--surf-high);
+    color: var(--on-surf);
+    font-family: "Google Sans", sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 10px 20px 10px 14px;
+    border-radius: 100px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
+    max-width: 90vw;
+    text-align: center;
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity .2s ease, transform .2s ease;
+    display: flex;
+    align-items: center;
+    gap: 10px
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0)
+  }
+
+  .toast-icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--err);
+    color: var(--err-con);
+    display: flex;
+    align-items: center;
+    justify-content: center
+  }
+
+  .toast-icon svg {
+    width: 14px;
+    height: 14px
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px)
+    }
+
+    to {
+      opacity: 1;
+      transform: none
+    }
+  }
+
+  .auth-card {
+    animation: .3s cubic-bezier(.2, 0, 0, 1) fade-in
+  }
+
+  @media (max-width: 480px) {
+    body {
+      padding: 16px
+    }
+
+    .auth-card {
+      padding: 32px 20px 24px;
+      border-radius: 24px
+    }
+
+    .auth-title {
+      font-size: 20px;
+      padding-bottom: 0
+    }
+
+    .auth-row {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 2px
+    }
+
+    .auth-main {
+      width: 100%;
+      min-width: 0
+    }
+
+    .auth-fields {
+      width: 100%
+    }
+
+    .auth-arrow-btn {
+      align-self: flex-end
+    }
+  }
+</style>
+
+<body>
+  <div class=auth-card id=auth-card>
+    <div class=auth-title id=auth-title>Octoglow</div>
+    <div id=auth-form style="width:100%;display:none">
+      <div class=auth-row>
+        <div class=auth-main>
+          <div class=auth-avatar id=auth-avatar><svg viewBox="0 0 24 24" fill=currentColor width=28 height=28>
+              <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z" />
+            </svg></div>
+          <div class=auth-fields>
+            <div class=tf id=tf-user><label>Utilizator</label><input id=inp-user type=text autocomplete=username placeholder="ex: admin" maxlength=32 oninput=updateAvatarInitials()></div>
+            <div class=tf><label>Parola</label><input id=inp-pass type=password autocomplete=current-password placeholder="Parola" maxlength=64></div>
+          </div>
+        </div>
+        <button class=auth-arrow-btn id=auth-btn onclick=doAuth()><svg viewBox="0 0 24 24" fill=currentColor width=20 height=20>
+            <path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11H4z" />
+          </svg></button>
+      </div>
+    </div>
+  </div>
+  <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewBox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
+  <script>
+    var isSetup = false;
+
+    var AVATAR_ICON_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>';
+
+    function roUpper(ch) {
+      var map = {
+        'ă': 'Ă',
+        'â': 'Â',
+        'î': 'Î',
+        'ș': 'Ș',
+        'ş': 'Ș',
+        'ț': 'Ț',
+        'ţ': 'Ț'
+      };
+      return map[ch] || ch.toUpperCase()
+    }
+
+    function getInitials(name) {
+      var parts = (name || '').trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) return '';
+      if (parts.length === 1) return roUpper(parts[0].charAt(0));
+      return roUpper(parts[0].charAt(0)) + roUpper(parts[1].charAt(0))
+    }
+
+    function updateAvatarInitials() {
+      var el = document.getElementById('auth-avatar');
+      var inp = document.getElementById('inp-user');
+      if (!el || !inp) return;
+      var initials = getInitials(inp.value);
+      el.innerHTML = initials ? initials : AVATAR_ICON_SVG
+    }
+
+    function init() {
+      fetch('/whoami').then(function(r) {
+        if (r.ok) {
+          window.location.replace('/dashboard');
+          return null
+        }
+        return fetch('/authstate').then(function(r2) {
+          return r2.json()
+        })
+      }).then(function(d) {
+        if (!d) return;
+        isSetup = !d.configured;
+        var form = document.getElementById('auth-form');
+        var title = document.getElementById('auth-title');
+        if (isSetup) {
+          title.textContent = T('Bine ați venit, configurați un cont');
+          document.getElementById('tf-user').style.display = ''
+        } else {
+          title.innerHTML = T('Bine ați revenit pe Octoglow!') + ' <svg class="wave-hand" xmlns="http://www.w3.org/2000/svg" height="22px" viewBox="0 -960 960 960" width="22px" fill="currentColor"><path d="M880-759q0-51-35-86t-86-35v-60q75 0 128 53t53 128h-60ZM240-40q-83 0-141.5-58.5T40-240h60q0 58 41 99t99 41v60Zm162 0q-30 0-56-13.5T303-92L48-465l24-23q19-19 45-22t47 12l116 81v-383q0-17 11.5-28.5T320-840q17 0 28.5 11.5T360-800v537L212-367l157 229q5 8 14 13t19 5h278q33 0 56.5-23.5T760-200v-560q0-17 11.5-28.5T800-800q17 0 28.5 11.5T840-760v560q0 66-47 113T680-40H402Zm38-440v-400q0-17 11.5-28.5T480-920q17 0 28.5 11.5T520-880v400h-80Zm160 0v-360q0-17 11.5-28.5T640-880q17 0 28.5 11.5T680-840v360h-80ZM486-300Z"/></svg>';
+          document.getElementById('tf-user').style.display = ''
+        }
+        form.style.display = '';
+        updateAvatarInitials();
+        document.getElementById('inp-user').focus()
+      }).catch(function() {
+        showErr(T('Eroare de conexiune. Încercați din nou.'))
+      })
+    }
+
+    function doAuth() {
+      var u = document.getElementById('inp-user').value.trim();
+      var p = document.getElementById('inp-pass').value;
+      var btn = document.getElementById('auth-btn');
+      if (isSetup && u.length < 1) {
+        showErr(T('Introduceți un nume de utilizator.'));
+        return
+      }
+      if (p.length < 4) {
+        showErr(T('Parola trebuie să aibă cel puțin 4 caractere.'));
+        return
+      }
+      var origLabel = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="btn-spin"></span>';
+      var url = isSetup ? '/authsetup' : '/login';
+      var body = 'user=' + encodeURIComponent(u) + '&pass=' + encodeURIComponent(p);
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: body
+      }).then(function(r) {
+        // /login answers in JSON, /authsetup reports a refusal as plain text.
+        // r.json() threw on the second, so a real reason ("account already
+        // exists") reached the user as the catch below's "connection error".
+        return r.text().then(function(body) {
+          try {
+            return JSON.parse(body)
+          } catch (e) {
+            return { ok: r.ok, err: body.trim() }
+          }
+        })
+      }).then(function(d) {
+        if (d.ok) {
+          window.location.href = '/dashboard'
+        } else {
+          showErr(d.err ? T(d.err) : T('Eroare'));
+          btn.disabled = false;
+          btn.innerHTML = origLabel
+        }
+      }).catch(function() {
+        showErr(T('Eroare de conexiune.'));
+        btn.disabled = false;
+        btn.innerHTML = origLabel
+      })
+    }
+
+    var toastTimer = null;
+
+    // Same storage key the dashboard writes in i18nSetLang(), and the same
+    // origin, so the login page follows whatever language was picked there.
+    var AUTH_LANG = (function() {
+      try {
+        return localStorage.getItem('octoglowUiLang') === 'en' ? 'en' : 'ro';
+      } catch (e) {
+        return 'ro';
+      }
+    })();
+    var AUTH_TR = {
+      'Utilizator': 'Username',
+      'Parola': 'Password',
+      'ex: admin': 'e.g. admin',
+      'Bine ați venit, configurați un cont': 'Welcome, set up an account',
+      'Bine ați revenit pe Octoglow!': 'Welcome back to Octoglow!',
+      'Eroare de conexiune. Încercați din nou.': 'Connection error. Please try again.',
+      'Introduceți un nume de utilizator.': 'Enter a username.',
+      'Parola trebuie să aibă cel puțin 4 caractere.': 'The password must be at least 4 characters.',
+      'Eroare': 'Error',
+      'Eroare de conexiune.': 'Connection error.',
+      // What the device itself answers with. It replies in Romanian, and these
+      // went into the toast untouched - the reason every failed sign-in stayed
+      // Romanian however the interface was set.
+      'Credentiale incorecte': 'Incorrect credentials',
+      'Cont deja existent': 'An account already exists',
+      'Lipsesc campuri': 'Missing fields',
+      'Date invalide': 'Invalid details'
+    };
+
+    function T(s) {
+      return (AUTH_LANG === 'en' && AUTH_TR[s]) ? AUTH_TR[s] : s;
+    }
+
+    // Static markup: labels and placeholders.
+    function applyAuthLang() {
+      document.documentElement.lang = AUTH_LANG;
+      if (AUTH_LANG !== 'en') return;
+      var labels = document.querySelectorAll('.tf label');
+      for (var i = 0; i < labels.length; i++) labels[i].textContent = T(labels[i].textContent.trim());
+      var ins = document.querySelectorAll('.tf input[placeholder]');
+      for (var j = 0; j < ins.length; j++) ins[j].placeholder = T(ins[j].placeholder);
+    }
+
+    applyAuthLang();
+
+    function showErr(msg) {
+      var el = document.getElementById('toast-el');
+      var txt = document.getElementById('toast-txt');
+      if (!el || !txt) return;
+      if (toastTimer) clearTimeout(toastTimer);
+      txt.textContent = msg;
+      el.classList.add('show');
+      toastTimer = setTimeout(function() {
+        el.classList.remove('show')
+      }, 2600)
+    }
+    var authUser = '';
+    init()
+  </script>

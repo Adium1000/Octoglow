@@ -1,0 +1,17 @@
+<Page x:Class="OctoglowSender.DeskClockPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <NavigationView x:Name="ClockNavigation"
+                    PaneDisplayMode="Top"
+                    IsSettingsVisible="False"
+                    IsBackButtonVisible="Collapsed"
+                    AlwaysShowHeader="False"
+                    SelectionChanged="ClockNavigation_SelectionChanged">
+        <NavigationView.MenuItems>
+            <NavigationViewItem x:Name="OverviewItem" Tag="overview" Icon="ContactInfo" />
+            <NavigationViewItem x:Name="IntegrationsItem" Tag="integrations" Icon="Repair" />
+            <NavigationViewItem x:Name="ActivityItem" Tag="activity" Icon="Document" />
+        </NavigationView.MenuItems>
+        <Frame x:Name="ClockContentFrame" />
+    </NavigationView>
+</Page>

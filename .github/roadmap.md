@@ -156,3 +156,30 @@ Released the new **Octoglow Website**! This page makes the Octoglow setup and in
 * **Custom Date Formatting:** You can now customize the date format however you want using:
   **W, Y, M, D, /, , and .**
 
+
+
+
+Connector App + App Patch
+
+1. Released Octoglow Connect -  A remade version of Octoglow Sender but in C# 
+
+- This app should be more stable, also this app provides more options like:
+  - System Default Language Detector
+  - System Default Theme Detector
+  - Euro Truck Simulator truck Handbrake Detector
+  - Now Playing Pause Detector
+  - Now Playing Video Player Detecor (Avalabile in the last Python Version of Sender if you compile it by yourself)
+  - Backdrop Material 
+
+2. /state bugs fix
+
+In the last patch of thre Octoglow Firmware, I tryed to patch the most reasons why the state command will fail to reach back the server, that may make the web experience smoother and more reliable 
+
+3. Released Demo on the site 
+
+Great news! If you want to test a Demo version of the web interface before flashing you can now try it
+
+4. Fixed Schematics
+
+Before the buzzer was connected on pin 7, now it is indeed conected in the pin 12
+Maked the picture text more readable

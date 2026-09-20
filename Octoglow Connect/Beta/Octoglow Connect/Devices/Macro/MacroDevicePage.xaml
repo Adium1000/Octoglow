@@ -1,0 +1,120 @@
+<Page
+    x:Class="OctoglowSender.Devices.Macro.MacroDevicePage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Page.Resources>
+        <Style x:Key="MacroKeyStyle" TargetType="Border">
+            <Setter Property="Width" Value="88" />
+            <Setter Property="Height" Value="88" />
+            <Setter Property="CornerRadius" Value="16" />
+            <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+            <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+        </Style>
+        <Style x:Key="MacroKeyLabelStyle" TargetType="TextBlock">
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="FontSize" Value="16" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+        </Style>
+        <Style x:Key="MacroPinLabelStyle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Opacity" Value="0.58" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+        </Style>
+    </Page.Resources>
+
+    <ScrollViewer Padding="32,0,32,0">
+        <StackPanel HorizontalAlignment="Stretch"
+                    Spacing="22"
+                    Margin="0,24,0,0">
+            <Grid ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="PageTitle" Style="{ThemeResource TitleTextBlockStyle}" />
+                <Border x:Name="StatusPill" Grid.Column="1" CornerRadius="14" Padding="12,6"
+                        Background="{ThemeResource ControlFillColorSecondaryBrush}" VerticalAlignment="Top">
+                    <StackPanel Orientation="Horizontal" Spacing="7">
+                        <FontIcon x:Name="StatusIcon"
+                                  FontFamily="Segoe Fluent Icons"
+                                  FontSize="14"
+                                  VerticalAlignment="Center" />
+                        <TextBlock x:Name="StatusText" FontWeight="SemiBold" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Viewbox Stretch="Uniform" StretchDirection="DownOnly" HorizontalAlignment="Center" MaxWidth="620">
+                <Border x:Name="MacropadCase" CornerRadius="26" Padding="30,26"
+                        Background="{ThemeResource LayerFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1.5"
+                        Translation="0,0,24">
+                    <Border.Shadow><ThemeShadow /></Border.Shadow>
+                    <StackPanel Spacing="20">
+                        <Rectangle Width="38" Height="5" RadiusX="3" RadiusY="3"
+                                   Fill="{ThemeResource ControlStrokeColorDefaultBrush}" HorizontalAlignment="Center" />
+                        <Grid ColumnSpacing="14" RowSpacing="14">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <Border x:Name="KeyB1" Grid.Row="0" Grid.Column="0" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B1"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B1" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 3" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="KeyB2" Grid.Row="0" Grid.Column="1" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B2"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B2" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 4" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="KeyB3" Grid.Row="0" Grid.Column="2" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B3"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B3" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 5" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="EncoderBorder" Grid.Row="0" Grid.Column="3" Width="88" Height="88" CornerRadius="44"
+                                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1"
+                                    AutomationProperties.Name="K1 encoder">
+                                <Grid>
+                                    <Rectangle Width="4" Height="11" RadiusX="2" RadiusY="2"
+                                               Fill="{ThemeResource TextFillColorSecondaryBrush}"
+                                               HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,11,0,0"
+                                               RenderTransformOrigin="0.5,3.5">
+                                        <Rectangle.RenderTransform><RotateTransform x:Name="EncoderNotchRotation" /></Rectangle.RenderTransform>
+                                    </Rectangle>
+                                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                                        <TextBlock Text="K1" Style="{StaticResource MacroKeyLabelStyle}" />
+                                        <TextBlock Text="GPIO 15" Style="{StaticResource MacroPinLabelStyle}" />
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                            <Border x:Name="KeyB4" Grid.Row="1" Grid.Column="0" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B4"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B4" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 6" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="KeyB5" Grid.Row="1" Grid.Column="1" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B5"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B5" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 7" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="KeyB6" Grid.Row="1" Grid.Column="2" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B6"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B6" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 8" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                            <Border x:Name="KeyB7" Grid.Row="1" Grid.Column="3" Style="{StaticResource MacroKeyStyle}" AutomationProperties.Name="B7"><StackPanel VerticalAlignment="Center" Spacing="2"><TextBlock Text="B7" Style="{StaticResource MacroKeyLabelStyle}" /><TextBlock Text="GPIO 14" Style="{StaticResource MacroPinLabelStyle}" /></StackPanel></Border>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Viewbox>
+
+            <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1"
+                    CornerRadius="12" Padding="18" Margin="0,4,0,16">
+                <StackPanel Spacing="10">
+                    <TextBlock x:Name="MappingsTitle" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <TextBlock x:Name="MappingsDescription" Opacity="0.65" TextWrapping="Wrap" />
+                    <Grid ColumnSpacing="24" RowSpacing="7">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="7">
+                            <TextBlock Text="B1  ·  Previous track" /><TextBlock Text="B2  ·  Play / Pause" />
+                            <TextBlock Text="B3  ·  Next track" /><TextBlock Text="B4  ·  Win + L" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="7">
+                            <TextBlock Text="B5  ·  Win + Print Screen" /><TextBlock Text="B6  ·  Task Manager" />
+                            <TextBlock Text="B7  ·  Win + D" /><TextBlock Text="K1  ·  Volume / Mute" />
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

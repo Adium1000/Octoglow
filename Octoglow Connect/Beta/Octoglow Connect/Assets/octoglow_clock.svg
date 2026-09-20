@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="title desc">
+  <title id="title">Octoglow Clock</title>
+  <desc id="desc">Polished front view of the Octoglow LED desk clock on a transparent canvas.</desc>
+  <defs>
+    <linearGradient id="clock-shell" x1="0" y1="0" x2="0.92" y2="1">
+      <stop offset="0" stop-color="#34313b"/>
+      <stop offset="0.42" stop-color="#17171e"/>
+      <stop offset="1" stop-color="#090a0f"/>
+    </linearGradient>
+    <linearGradient id="clock-edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#18181f"/>
+      <stop offset="1" stop-color="#050609"/>
+    </linearGradient>
+    <linearGradient id="clock-lip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#faf9ff"/>
+      <stop offset="0.52" stop-color="#e9e8ee"/>
+      <stop offset="1" stop-color="#c8c8d0"/>
+    </linearGradient>
+    <linearGradient id="clock-glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d8d9dc"/>
+      <stop offset="0.48" stop-color="#bfc1c4"/>
+      <stop offset="1" stop-color="#a9abad"/>
+    </linearGradient>
+    <linearGradient id="clock-shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.48"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="clock-led" cx="38%" cy="32%" r="68%">
+      <stop offset="0" stop-color="#fff5f7"/>
+      <stop offset="0.2" stop-color="#ff8a9e"/>
+      <stop offset="0.47" stop-color="#ff2149"/>
+      <stop offset="1" stop-color="#d80027"/>
+    </radialGradient>
+    <pattern id="clock-matrix" width="20.5" height="16" patternUnits="userSpaceOnUse">
+      <circle cx="10.25" cy="8" r="3.25" fill="#5d6064" opacity="0.43"/>
+      <circle cx="9.35" cy="7.05" r="1.1" fill="#ffffff" opacity="0.13"/>
+    </pattern>
+    <pattern id="clock-texture" width="9" height="9" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="0.8" fill="#ffffff" opacity="0.08"/>
+      <circle cx="7" cy="5" r="0.7" fill="#000000" opacity="0.22"/>
+      <path d="M0 8 8 0" stroke="#ffffff" stroke-width="0.45" opacity="0.035"/>
+    </pattern>
+    <clipPath id="clock-screen-clip">
+      <rect x="143" y="188" width="674" height="130" rx="11"/>
+    </clipPath>
+    <g id="clock-led-on">
+      <circle r="9.2" fill="#ff1746" opacity="0.13"/>
+      <circle r="6.4" fill="#ff153f" opacity="0.30"/>
+      <circle r="4.6" fill="url(#clock-led)"/>
+      <circle cx="-1.25" cy="-1.35" r="1.35" fill="#ffffff" opacity="0.76"/>
+    </g>
+  </defs>
+
+  <!-- The canvas is intentionally transparent; this soft contact shadow belongs to the product. -->
+  <ellipse cx="480" cy="445" rx="372" ry="27" fill="#070811" opacity="0.22"/>
+
+  <!-- Lower shell depth and feet. -->
+  <path d="M103 367h754v53c0 19-16 34-35 34H138c-19 0-35-15-35-34Z" fill="url(#clock-edge)"/>
+  <path d="M144 426h112l-13 24c-4 7-10 10-18 10h-64c-9 0-15-5-17-13Z" fill="#07080c"/>
+  <path d="M704 426h112l-8 21c-3 8-10 13-19 13h-65c-8 0-14-4-17-11Z" fill="#07080c"/>
+  <path d="M116 397c77 20 647 20 728 0v26c-156 24-572 24-728 0Z" fill="#000000" opacity="0.24"/>
+
+  <!-- Main enclosure. -->
+  <rect x="62" y="105" width="836" height="310" rx="62" fill="url(#clock-shell)" stroke="#05060a" stroke-width="4"/>
+  <rect x="68" y="111" width="824" height="298" rx="57" fill="url(#clock-texture)" opacity="0.92"/>
+  <path d="M121 125h718c22 0 38 7 48 24-11-26-31-38-59-38H132c-29 0-48 13-59 39 13-17 28-25 48-25Z" fill="#ffffff" opacity="0.09"/>
+  <rect x="86" y="134" width="788" height="252" rx="44" fill="#08090e" stroke="#3c3947" stroke-width="3"/>
+
+  <!-- Diffuser surround and LED window. -->
+  <rect x="102" y="150" width="756" height="220" rx="32" fill="url(#clock-lip)" stroke="#0b0c12" stroke-opacity="0.35" stroke-width="2"/>
+  <rect x="117" y="166" width="726" height="174" rx="21" fill="url(#clock-glass)" stroke="#ffffff" stroke-opacity="0.46" stroke-width="2"/>
+  <rect x="143" y="188" width="674" height="130" rx="11" fill="#a9abad" stroke="#8f9296" stroke-width="2"/>
+  <rect x="143" y="188" width="674" height="130" rx="11" fill="url(#clock-matrix)"/>
+  <path d="M130 178h700c-18 10-26 19-30 34H160c-4-14-14-25-30-34Z" fill="url(#clock-shine)" opacity="0.55" clip-path="url(#clock-screen-clip)"/>
+
+  <!-- SAT 22:34, reconstructed as real dot-matrix pixels. -->
+  <g transform="translate(155 209.5)">
+    <!-- S -->
+    <use href="#clock-led-on" x="0" y="0"/><use href="#clock-led-on" x="20.5" y="0"/><use href="#clock-led-on" x="41" y="0"/>
+    <use href="#clock-led-on" x="0" y="21"/>
+    <use href="#clock-led-on" x="0" y="42"/><use href="#clock-led-on" x="20.5" y="42"/><use href="#clock-led-on" x="41" y="42"/>
+    <use href="#clock-led-on" x="41" y="63"/>
+    <use href="#clock-led-on" x="0" y="84"/><use href="#clock-led-on" x="20.5" y="84"/><use href="#clock-led-on" x="41" y="84"/>
+    <!-- A -->
+    <use href="#clock-led-on" x="102.5" y="0"/>
+    <use href="#clock-led-on" x="82" y="21"/><use href="#clock-led-on" x="123" y="21"/>
+    <use href="#clock-led-on" x="82" y="42"/><use href="#clock-led-on" x="102.5" y="42"/><use href="#clock-led-on" x="123" y="42"/>
+    <use href="#clock-led-on" x="82" y="63"/><use href="#clock-led-on" x="123" y="63"/>
+    <use href="#clock-led-on" x="82" y="84"/><use href="#clock-led-on" x="123" y="84"/>
+    <!-- T -->
+    <use href="#clock-led-on" x="164" y="0"/><use href="#clock-led-on" x="184.5" y="0"/><use href="#clock-led-on" x="205" y="0"/>
+    <use href="#clock-led-on" x="184.5" y="21"/><use href="#clock-led-on" x="184.5" y="42"/><use href="#clock-led-on" x="184.5" y="63"/><use href="#clock-led-on" x="184.5" y="84"/>
+    <!-- 2 -->
+    <use href="#clock-led-on" x="266.5" y="0"/><use href="#clock-led-on" x="287" y="0"/><use href="#clock-led-on" x="307.5" y="0"/>
+    <use href="#clock-led-on" x="307.5" y="21"/>
+    <use href="#clock-led-on" x="266.5" y="42"/><use href="#clock-led-on" x="287" y="42"/><use href="#clock-led-on" x="307.5" y="42"/>
+    <use href="#clock-led-on" x="266.5" y="63"/>
+    <use href="#clock-led-on" x="266.5" y="84"/><use href="#clock-led-on" x="287" y="84"/><use href="#clock-led-on" x="307.5" y="84"/>
+    <!-- 2 -->
+    <use href="#clock-led-on" x="348.5" y="0"/><use href="#clock-led-on" x="369" y="0"/><use href="#clock-led-on" x="389.5" y="0"/>
+    <use href="#clock-led-on" x="389.5" y="21"/>
+    <use href="#clock-led-on" x="348.5" y="42"/><use href="#clock-led-on" x="369" y="42"/><use href="#clock-led-on" x="389.5" y="42"/>
+    <use href="#clock-led-on" x="348.5" y="63"/>
+    <use href="#clock-led-on" x="348.5" y="84"/><use href="#clock-led-on" x="369" y="84"/><use href="#clock-led-on" x="389.5" y="84"/>
+    <!-- colon -->
+    <use href="#clock-led-on" x="420" y="21"/><use href="#clock-led-on" x="420" y="63"/>
+    <!-- 3 -->
+    <use href="#clock-led-on" x="451" y="0"/><use href="#clock-led-on" x="471.5" y="0"/><use href="#clock-led-on" x="492" y="0"/>
+    <use href="#clock-led-on" x="492" y="21"/>
+    <use href="#clock-led-on" x="451" y="42"/><use href="#clock-led-on" x="471.5" y="42"/><use href="#clock-led-on" x="492" y="42"/>
+    <use href="#clock-led-on" x="492" y="63"/>
+    <use href="#clock-led-on" x="451" y="84"/><use href="#clock-led-on" x="471.5" y="84"/><use href="#clock-led-on" x="492" y="84"/>
+    <!-- 4 -->
+    <use href="#clock-led-on" x="553.5" y="0"/><use href="#clock-led-on" x="594.5" y="0"/>
+    <use href="#clock-led-on" x="553.5" y="21"/><use href="#clock-led-on" x="594.5" y="21"/>
+    <use href="#clock-led-on" x="553.5" y="42"/><use href="#clock-led-on" x="574" y="42"/><use href="#clock-led-on" x="594.5" y="42"/>
+    <use href="#clock-led-on" x="594.5" y="63"/><use href="#clock-led-on" x="594.5" y="84"/>
+  </g>
+
+  <!-- Subtle Octoglow signature mark. -->
+  <g transform="translate(480 392)" fill="#a38bd8" opacity="0.58">
+    <circle r="3.6"/>
+    <circle cx="0" cy="-10" r="1.8"/><circle cx="7.1" cy="-7.1" r="1.8"/>
+    <circle cx="10" cy="0" r="1.8"/><circle cx="7.1" cy="7.1" r="1.8"/>
+    <circle cx="0" cy="10" r="1.8"/><circle cx="-7.1" cy="7.1" r="1.8"/>
+    <circle cx="-10" cy="0" r="1.8"/><circle cx="-7.1" cy="-7.1" r="1.8"/>
+  </g>
+</svg>

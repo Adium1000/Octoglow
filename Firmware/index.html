@@ -2853,14 +2853,7 @@
   </div>
   <div class=toast-wrap id=toast-wrap><div class=toast id=toast-el><span class=toast-icon><svg viewbox="0 0 24 24" fill=currentColor><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></span><span id=toast-txt></span></div></div>
   <script>
-    // --- Demo /state emulation --------------------------------------------
-    // This build has no live ESP32 backend, so every fetch('/state') call in
-    // the page (initial load, the About screen, the Wi-Fi "connecting…"
-    // poll, the currency-settings refresh, etc.) is answered here instead of
-    // going over the network. DEMO_STATE_DATA is the fixed snapshot returned
-    // every time; edit it to change what the demo reports. Everything else
-    // keeps calling fetch('/state') exactly like it would against a real
-    // device - only this one endpoint is intercepted.
+    // Demo /state emulation
     var DEMO_STATE_DATA = {
       buzzer: !1,
       buzzerVolume: 80,
@@ -2870,8 +2863,6 @@
       ap: !1,
       apSsid: `Octoglow Demo`,
       version: `0.3`,
-      // Real firmware sends a number of seconds here; `Err` simulates the
-      // device failing to report an uptime (same idea as ip:"Err" above).
       uptime: `Err`,
       lastTemp: 26,
       items: [{
@@ -3040,9 +3031,6 @@
         return realFetch(input, init)
       }
     })();
-    // Never persist Tile Manager data before the complete /state response has
-    // arrived. A failed response used to leave the UI with a short fallback
-    // list, which the next save could overwrite into persistent settings.
     var stateLoadComplete = !1,
       EXPECTED_CIRCUIT_TILE_COUNT = 10,
       apSsidCache = ``,
@@ -3504,8 +3492,6 @@
         bootUptimeSec = s.uptime;
         uptimeFetchedAt = Date.now();
         var upEl = document.getElementById(`about-uptime`);
-        // Non-numeric uptime (e.g. "Err") means the device couldn't report
-        // it - show it as-is instead of formatting into "NaNh NaNm NaNs".
         if (upEl) upEl.textContent = Number.isFinite(bootUptimeSec) ? formatUptime(bootUptimeSec) : String(bootUptimeSec)
       }
     }
@@ -3517,19 +3503,11 @@
       }).then(function(s) {
         applyAboutState(s)
       }).catch(function() {
-        // Previously an empty catch: on failure the "-" placeholders in the
-        // HTML just stayed forever, with no retry and no feedback. Retry a
-        // few times with backoff instead - this endpoint is the same /state
-        // this page depends on everywhere else, so a transient failure here
-        // shouldn't be a dead end.
         if (attempt < 3) setTimeout(function() { fetchAboutState(attempt + 1) }, 500 * (attempt + 1))
       })
     }
 
     function refreshAboutState() {
-      // Paint instantly from the dashboard's own already-loaded state if we
-      // have it (no need to wait on a second network round trip), then still
-      // do our own fetch so Uptime keeps ticking from a fresh value.
       withInitialState(function(s) {
         applyAboutState(s)
       });
@@ -3561,7 +3539,6 @@
       SW_BIN_URL = SW_REPO_BASE + `Update.bin`,
       swServerVersion = ``,
       swUpdating = !1;
-
     function swCompareVersions(a, b) {
       var pa = String(a).trim().split(`.`).map(function(x) {
         return parseInt(x, 10) || 0
@@ -4098,10 +4075,6 @@
       fetch(`/scan`).then(function(r) {
         return r.json()
       }).then(function(res) {
-        // Backend now returns {scanning, networks} instead of a bare array,
-        // since the scan itself runs async on-device. While scanning is
-        // still true, poll again shortly instead of reading this as "0
-        // networks" - a scan in progress is not the same as an empty result.
         if (res.scanning && attempt < 10) {
           setTimeout(function() { doScanSilent(attempt + 1) }, 800);
           return
@@ -4565,7 +4538,7 @@
       saveSettings()
     }
 
-    // ===================== ICON SETTINGS =====================
+    // ICON SETTINGS 
     var ICON_SETTINGS_TILES = [{
         key: `reminder`,
         label: `Reminder`,
@@ -4985,9 +4958,6 @@
       }).then(function(r) {
         if (!r.ok) throw new Error(`save failed`)
       }).catch(function() {
-        // Previously fire-and-forget: a rejected save left the UI showing
-        // the user's change while the device kept its old order. Tell the
-        // user and resync from the server instead of drifting silently.
         showToast(`Could not save the order. Reload the page.`);
         loadHomeState()
       })
@@ -5009,11 +4979,6 @@
         headers: {
           "Content-Type": `application/x-www-form-urlencoded`
         },
-        // npPriority is sent explicitly (rather than letting the backend
-        // infer it from whether "nowplaying" happens to appear in `order`)
-        // so an unrelated reorder can never silently flip Now Playing back
-        // into Circuit Tiles just because this particular save's snapshot
-        // of priorityItems didn't include it.
         body: `order=` + encodeURIComponent(ord) + `&npPriority=` + (npIsPriority() ? 1 : 0)
       }).then(function(r) {
         if (!r.ok) throw new Error(`save failed`)
@@ -5547,11 +5512,6 @@
       }).then(function(r) {
         if (!r.ok) throw new Error(`save failed`)
       }).catch(function() {
-        // This POST used to be fire-and-forget. The backend legitimately
-        // rejects (400) an incomplete/invalid tile list rather than persist
-        // it - which is correct - but nothing told the frontend, so the UI
-        // kept showing the just-made change as if it had saved. Tell the
-        // user and pull the real, currently-persisted state back in.
         showToast(`Could not save the tile settings. Reload the page.`);
         loadHomeState()
       })
@@ -7023,8 +6983,6 @@
       })
     }
 
-    // Demo build: "out of range" and "Loading: User Settings" popups
-    // removed. Kept as no-ops so existing call sites don't break.
     function openOorDialog() {}
 
     function closeOorDialog() {}
@@ -7177,10 +7135,6 @@
           setupGreeting()
         }
       });
-      // Top bar elevation on scroll
-      // Demo build: no ESP32 backend exists, but fetch('/state') is
-      // transparently emulated (see DEMO_STATE_DATA near the top of the
-      // previous script block), so the real call stays here unchanged.
       function loadHomeState() {
       openUsLoadDialog();
       setUsLoadStatus(stateLoadAttempt === 0 ? `Loading user settings from the device…` : `Retry ` + (stateLoadAttempt + 1) + ` of 5 - loading user settings…`);
@@ -7397,9 +7351,6 @@
         if (s.evSndTouch) evSndTouch = s.evSndTouch;
         if (s.touchTapAction !== void 0) touchTapAction = s.touchTapAction;
         if (s.touchDoubleTapAction !== void 0) touchDoubleTapAction = s.touchDoubleTapAction;
-        // Rebuild only after both the circuit and priority state are known.
-        // The previous early build could briefly retain the default priority
-        // list while the circuit list came from the server.
         buildGrid();
         buildPriorityGrid();
         stateLoadComplete = !0;
@@ -7411,11 +7362,6 @@
         closeUsLoadDialog();
         document.body.classList.remove(`boot-hide`)
       }).catch(function(err) {
-        // Previously silent about *why* a load failed - network error, JSON
-        // parse failure, and the hasCompleteCircuitState throw all looked
-        // identical from here, which is a big part of why this was hard to
-        // pin down. Logging the real cause costs nothing and doesn't change
-        // the retry/toast behavior the user sees.
         console.error(`[octoglow] /state load attempt`, stateLoadAttempt + 1, `failed:`, err && err.message ? err.message : err);
         if (stateLoadAttempt < 4) {
           setUsLoadStatus(`Loading error (` + (err && err.message ? err.message : `necunoscuta`) + `). Retrying…`, !0);
@@ -8056,8 +8002,6 @@
           row.innerHTML = transRowHtml(meta.cls, meta.svg, meta.name, sel);
           c.appendChild(row);
         });
-        // Show IP Address is treated as a priority tile for transitions,
-        // but it is a one-shot touch action, not part of the reorderable list.
         if (indivTransPriority.ip === undefined) indivTransPriority.ip = tileTransitionGlobal;
         var ipRow = document.createElement("div");
         ipRow.className = "li static";
@@ -8092,7 +8036,6 @@
 
       function buildTileTransitionScreen() {
         buildTransitionCircuitList();
-        // buildTransitionPriorityList(); // Priority Tiles category removed from Tile Transition UI (kept for later restore)
         buildTransitionSpecialList();
       }
       var _origGo2 = go;
