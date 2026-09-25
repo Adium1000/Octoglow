@@ -1,0 +1,1 @@
+Good news, the v1.0 fixes a lot of bugs and adds a new exciting look to the software and firmware side
